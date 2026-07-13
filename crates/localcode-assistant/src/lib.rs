@@ -36,16 +36,22 @@ pub struct Assistant {
 
 impl Assistant {
     pub fn new(cfg: AssistantConfig) -> Self {
-        Self {
-            cfg,
-            http: reqwest::Client::new(),
-        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_default();
+        Self { cfg, http }
     }
 
+    /// Hosted providers (openrouter, openai, …) need an API key; the default
+    /// base_url is always non-empty so it must not count as "configured".
+    /// Self-hosted / custom endpoints only need a base_url.
     pub fn is_configured(&self, api_key: Option<&str>) -> bool {
+        let has_key = api_key.map(|k| !k.is_empty()).unwrap_or(false);
         match self.cfg.provider.as_str() {
-            "self_hosted" => !self.cfg.base_url.is_empty(),
-            _ => api_key.map(|k| !k.is_empty()).unwrap_or(false) || !self.cfg.base_url.is_empty(),
+            "self_hosted" | "openai_compatible" | "custom" => !self.cfg.base_url.is_empty(),
+            _ => has_key,
         }
     }
 
@@ -155,18 +161,13 @@ fn extract_proposed_fixes(message: &str) -> Vec<ProposedFix> {
     message
         .lines()
         .filter_map(|l| {
-            let l = l.trim();
-            if let Some(rest) = l.strip_prefix("FIX:") {
-                Some(ProposedFix {
-                    title: rest.trim().chars().take(60).collect(),
-                    description: rest.trim().to_string(),
-                    risk: "low".into(),
-                    auto_applyable: false,
-                    action: serde_json::json!({ "type": "manual" }),
-                })
-            } else {
-                None
-            }
+            l.trim().strip_prefix("FIX:").map(|rest| ProposedFix {
+                title: rest.trim().chars().take(60).collect(),
+                description: rest.trim().to_string(),
+                risk: "low".into(),
+                auto_applyable: false,
+                action: serde_json::json!({ "type": "manual" }),
+            })
         })
         .collect()
 }

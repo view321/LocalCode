@@ -1,11 +1,12 @@
 use crate::{
-    BackendKind, DetectReport, Health, InferenceBackend, ModelDeploySpec, RunningEndpoint,
+    port_in_use, probe_client, spawn_io_drain, BackendKind, DetectReport, Health,
+    InferenceBackend, ModelDeploySpec, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::LlamaCppConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
+use localcode_core::events::{AppEvent, EventBus};
 use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
-use std::net::TcpListener;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -13,7 +14,8 @@ use tracing::info;
 pub struct LlamaCppBackend {
     cfg: LlamaCppConfig,
     http: reqwest::Client,
-    /// Track child processes by runtime id
+    /// Track child processes by runtime id. kill_on_drop: managed runtimes
+    /// stop when LocalCode exits (the quit dialog says so).
     children: Arc<Mutex<Vec<(String, tokio::process::Child)>>>,
 }
 
@@ -21,13 +23,9 @@ impl LlamaCppBackend {
     pub fn new(cfg: LlamaCppConfig) -> Self {
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            http: probe_client(),
             children: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    fn port_in_use(port: u16) -> bool {
-        TcpListener::bind(("127.0.0.1", port)).is_err()
     }
 }
 
@@ -78,12 +76,16 @@ impl InferenceBackend for LlamaCppBackend {
         Ok(vec![])
     }
 
-    async fn deploy(&self, spec: ModelDeploySpec) -> Result<RunningEndpoint, LocalCodeError> {
+    async fn deploy(
+        &self,
+        spec: ModelDeploySpec,
+        events: &EventBus,
+    ) -> Result<RunningEndpoint, LocalCodeError> {
         self.ensure_ready().await?;
         let cid = localcode_core::CorrelationId::new();
         let port = spec.port.unwrap_or(self.cfg.port);
 
-        if Self::port_in_use(port) {
+        if port_in_use(port) {
             return Err(LocalCodeError::new(
                 ErrorCode::BackendPortInUse,
                 format!("Port {port} is already in use"),
@@ -100,7 +102,7 @@ impl InferenceBackend for LlamaCppBackend {
                 "llama.cpp deploy requires a local GGUF path",
             )
             .with_correlation(cid)
-            .with_hint("Download a GGUF quant first, or use Ollama for library pulls")
+            .with_hint("Pick a quantization with GGUF files so LocalCode can download it")
             .with_cause("No local_path in deploy spec")
         })?;
 
@@ -121,6 +123,11 @@ impl InferenceBackend for LlamaCppBackend {
             })?;
 
         info!(%cid, %model_path, port, "starting llama-server");
+        events.publish(AppEvent::DeployProgress {
+            job_id: spec.job_id.clone(),
+            percent: 50,
+            message: "Starting llama-server".into(),
+        });
 
         let mut child = tokio::process::Command::new(&bin)
             .args([
@@ -134,6 +141,7 @@ impl InferenceBackend for LlamaCppBackend {
                 &spec.context_length.to_string(),
             ])
             .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -144,10 +152,13 @@ impl InferenceBackend for LlamaCppBackend {
                     .with_hint("Check CUDA/driver compatibility if using GPU build")
                     .retryable(true)
             })?;
+        // Drain output into tracing; llama-server logs every request and an
+        // undrained pipe would eventually block the whole server.
+        spawn_io_drain("llama-server".into(), &mut child);
 
         let base_url = format!("http://{}:{}", self.cfg.host, port);
-        // Health poll
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let mut last_progress = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() > deadline {
                 let _ = child.kill().await;
@@ -166,7 +177,6 @@ impl InferenceBackend for LlamaCppBackend {
                     break;
                 }
             }
-            // Check if process died
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
@@ -175,6 +185,14 @@ impl InferenceBackend for LlamaCppBackend {
                 .with_correlation(cid)
                 .with_cause("Invalid GGUF or missing shared libraries")
                 .retryable(true));
+            }
+            if last_progress.elapsed() > tokio::time::Duration::from_secs(5) {
+                last_progress = tokio::time::Instant::now();
+                events.publish(AppEvent::DeployProgress {
+                    job_id: spec.job_id.clone(),
+                    percent: 60,
+                    message: "Loading model (llama-server)…".into(),
+                });
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }

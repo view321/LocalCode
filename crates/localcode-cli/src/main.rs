@@ -63,6 +63,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
+    /// Check for a new version and install it (git pull + rebuild + swap)
+    Update {
+        /// Only check and report; do not install
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -124,12 +130,19 @@ async fn main() {
 
 async fn real_main() -> Result<(), LocalCodeError> {
     let cli = Cli::parse();
+    // Remove `.old`/`.new` binaries a previous self-update left behind.
+    localcode_upgrade::cleanup_stale_artifacts();
     let paths = AppPaths::resolve()?;
     paths.ensure_dirs()?;
     let config = Config::load(&paths)?;
-    let _log_guard = localcode_log::init(&paths, &config.logging)?;
 
-    match cli.command.unwrap_or(Commands::Tui) {
+    let command = cli.command.unwrap_or(Commands::Tui);
+    // In TUI mode logs go to file only — a stderr layer would write straight
+    // over the raw-mode alternate screen and corrupt the display.
+    let is_tui = matches!(command, Commands::Tui);
+    let _log_guard = localcode_log::init(&paths, &config.logging, !is_tui)?;
+
+    match command {
         Commands::Tui => {
             info!("launching TUI");
             run_tui(paths, config).await
@@ -137,9 +150,9 @@ async fn real_main() -> Result<(), LocalCodeError> {
         Commands::Doctor { json } => {
             let report = run_doctor(&paths, &config).await;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
             } else {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                print_doctor_human(&report);
             }
             Ok(())
         }
@@ -202,13 +215,64 @@ async fn real_main() -> Result<(), LocalCodeError> {
             });
             let registry = Arc::new(BackendRegistry::from_config(&config));
             let events = EventBus::new();
-            let svc = DeployService::new(registry, events, gpu);
+            let svc = DeployService::new(
+                registry,
+                events.clone(),
+                gpu,
+                paths.models_cache.clone(),
+                config.hf_token(),
+            );
+
+            // Enrich HF ids with quant metadata so fit prediction has real
+            // sizes and llama.cpp deploys can download weights.
+            let mut quantization = quant;
+            let mut weight_bytes = 0u64;
+            let mut weight_files: Vec<String> = vec![];
+            let mut download_urls: Vec<String> = vec![];
+            if model.contains('/') && path.is_none() {
+                if let Ok(hf) = HfClient::new(
+                    &config.registry,
+                    config.hf_token(),
+                    paths.models_cache.clone(),
+                ) {
+                    if let Ok(detail) = hf.model_info(&model).await {
+                        let group = match &quantization {
+                            Some(q) => detail
+                                .quants
+                                .iter()
+                                .find(|g| g.label.eq_ignore_ascii_case(q)),
+                            None => detail.quants.first(),
+                        };
+                        if let Some(g) = group {
+                            quantization = Some(g.label.clone());
+                            weight_bytes = g.total_size;
+                            weight_files =
+                                g.files.iter().map(|f| f.filename.clone()).collect();
+                            download_urls = weight_files
+                                .iter()
+                                .map(|f| hf.download_url(&model, f))
+                                .collect();
+                        }
+                    }
+                }
+            }
+
+            // Print deploy progress as it happens.
+            events.subscribe(|ev| {
+                if let localcode_core::events::AppEvent::DeployProgress {
+                    percent, message, ..
+                } = ev
+                {
+                    eprintln!("[{percent:>3}%] {message}");
+                }
+            });
+
             let req = DeployRequest {
                 model_id: model,
-                quantization: quant,
-                weight_bytes: 0,
-                weight_files: vec![],
-                download_urls: vec![],
+                quantization,
+                weight_bytes,
+                weight_files,
+                download_urls,
                 local_path: path,
                 backend: kind,
                 port: None,
@@ -246,7 +310,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
                 let result = runner
                     .run(&suite_obj, subject, &endpoint, None, &model)
                     .await?;
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
                 Ok(())
             }
         },
@@ -260,32 +324,140 @@ async fn real_main() -> Result<(), LocalCodeError> {
                 let workspace = workspace.unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
-                let endpoint =
-                    endpoint.unwrap_or_else(|| config.assistant.base_url.clone());
+                // Local-first default: talk to the local Ollama OpenAI
+                // endpoint unless the user passes --endpoint explicitly.
+                let endpoint = endpoint
+                    .unwrap_or_else(|| format!("{}/v1", config.backends.ollama.base_url));
                 let mut runtime = ActiveRuntime::new(
                     "cli",
                     RuntimeKind::OpenAiCompatible,
                     endpoint,
                 );
-                runtime.model_id = model.or_else(|| {
-                    if config.assistant.model.is_empty() {
-                        None
-                    } else {
-                        Some(config.assistant.model.clone())
-                    }
-                });
-                runtime.api_key = config.assistant_api_key();
+                runtime.model_id = model;
                 let out = localcode_agent::run_headless(
                     &prompt,
                     workspace,
                     &runtime,
                     config.agent.clone(),
-                    runtime.api_key.as_deref(),
+                    None,
                 )
                 .await?;
                 println!("{out}");
                 Ok(())
             }
         },
+        Commands::Update { check } => run_update(&config, check).await,
     }
+}
+
+async fn run_update(config: &Config, check_only: bool) -> Result<(), LocalCodeError> {
+    let checker = localcode_upgrade::UpdateChecker::new(
+        &config.updates.repo_url,
+        &config.updates.branch,
+    )?;
+    println!(
+        "localcode v{} — checking {} ({})",
+        localcode_upgrade::CURRENT_VERSION,
+        config.updates.repo_url,
+        config.updates.branch
+    );
+    match checker.check().await? {
+        None => {
+            println!("Already up to date.");
+            return Ok(());
+        }
+        Some(info) => {
+            println!("Update available: v{} → v{}", info.current, info.latest);
+            if check_only {
+                println!("Run `localcode update` to install.");
+                return Ok(());
+            }
+        }
+    }
+
+    let updater = localcode_upgrade::SelfUpdater::resolve(
+        config.updates.install_dir.as_deref(),
+        &config.updates.repo_url,
+        &config.updates.branch,
+    )?;
+    println!("Updating from checkout at {}", updater.install_dir.display());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let printer = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            eprintln!("==> {line}");
+        }
+    });
+    let report = updater.run(tx).await?;
+    let _ = printer.await;
+    println!(
+        "Installed v{} at {} — restart any running LocalCode to use it.",
+        report.version,
+        report.binary_path.display()
+    );
+    Ok(())
+}
+
+fn print_doctor_human(report: &serde_json::Value) {
+    println!("LocalCode doctor v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(paths) = report.get("paths").and_then(|p| p.as_object()) {
+        println!("\nPaths:");
+        for (k, v) in paths {
+            println!("  {k}: {}", v.as_str().unwrap_or_default());
+        }
+    }
+    if let Some(gpu) = report.get("gpu") {
+        println!("\nGPU ({}):", gpu["detection_method"].as_str().unwrap_or("?"));
+        if let Some(devices) = gpu["devices"].as_array() {
+            if devices.is_empty() {
+                println!("  none detected");
+            }
+            for d in devices {
+                println!(
+                    "  {} — {:.1}/{:.1} GiB free",
+                    d["name"].as_str().unwrap_or("?"),
+                    d["free_vram_bytes"].as_u64().unwrap_or(0) as f64 / 1e9,
+                    d["total_vram_bytes"].as_u64().unwrap_or(0) as f64 / 1e9,
+                );
+            }
+        }
+    }
+    if let Some(backends) = report.get("backends").and_then(|b| b.as_array()) {
+        println!("\nBackends:");
+        for b in backends {
+            let ready = b["ready"].as_bool().unwrap_or(false);
+            let mark = if ready { "✓" } else { "✗" };
+            println!(
+                "  {mark} {} {}",
+                b["kind"].as_str().unwrap_or("?"),
+                b["notes"]
+                    .as_array()
+                    .and_then(|n| n.first())
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+            );
+        }
+    }
+    if let Some(hf) = report.get("huggingface") {
+        println!(
+            "\nHugging Face: reachable={} token_set={}",
+            hf["reachable"].as_bool().unwrap_or(false),
+            hf["token_set"].as_bool().unwrap_or(false)
+        );
+    }
+    if let Some(api) = report.get("api") {
+        println!(
+            "API: {} reachable={}",
+            api["base_url"].as_str().unwrap_or("?"),
+            api["reachable"].as_bool().unwrap_or(false)
+        );
+    }
+    if let Some(a) = report.get("assistant") {
+        println!(
+            "Assistant: provider={} configured={}",
+            a["provider"].as_str().unwrap_or("?"),
+            a["configured"].as_bool().unwrap_or(false)
+        );
+    }
+    println!("\n(Re-run with --json for the full report.)");
 }

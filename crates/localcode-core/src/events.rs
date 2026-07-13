@@ -52,11 +52,13 @@ pub enum Severity {
     Success,
 }
 
+type Listener = Box<dyn Fn(&AppEvent) + Send>;
+
 /// Simple in-process event bus (cloneable, thread-safe).
 #[derive(Clone, Default)]
 pub struct EventBus {
     inner: Arc<Mutex<Vec<AppEvent>>>,
-    listeners: Arc<Mutex<Vec<Box<dyn Fn(&AppEvent) + Send>>>>,
+    listeners: Arc<Mutex<Vec<Listener>>>,
 }
 
 impl EventBus {

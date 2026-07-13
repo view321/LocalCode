@@ -12,6 +12,7 @@ members = [
     "crates/localcode-agent",
     "crates/localcode-assistant",
     "crates/localcode-api-client",
+    "crates/localcode-upgrade",
     "crates/localcode-tui",
     "crates/localcode-cli",
     "server/localcode-server",
@@ -25,6 +26,12 @@ license = "MIT"
 authors = ["LocalCode Contributors"]
 repository = "https://github.com/view321/LocalCode"
 
+[workspace.lints.clippy]
+# LocalCodeError is a deliberately rich (large) error type: structured causes,
+# hints, correlation ids. Boxing every Result to appease this lint would hurt
+# ergonomics across the workspace.
+result_large_err = "allow"
+
 [workspace.dependencies]
 localcode-core = { path = "crates/localcode-core" }
 localcode-log = { path = "crates/localcode-log" }
@@ -37,6 +44,7 @@ localcode-bench = { path = "crates/localcode-bench" }
 localcode-agent = { path = "crates/localcode-agent" }
 localcode-assistant = { path = "crates/localcode-assistant" }
 localcode-api-client = { path = "crates/localcode-api-client" }
+localcode-upgrade = { path = "crates/localcode-upgrade" }
 localcode-tui = { path = "crates/localcode-tui" }
 
 anyhow = "1"

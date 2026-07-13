@@ -1,12 +1,15 @@
 //! Cloud hosting orchestration (RunPod, Vast.ai, Akash).
+//!
+//! v1 status: the provider APIs are NOT wired up yet. Every adapter returns a
+//! structured `NOT_IMPLEMENTED` error instead of pretending to provision —
+//! an earlier draft fabricated "provisioning" deployments with made-up
+//! endpoint URLs, which is worse than no support at all.
 
 use async_trait::async_trait;
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
-use localcode_core::runtime::{ActiveRuntime, RuntimeKind, RuntimeStatus};
+use localcode_core::runtime::ActiveRuntime;
 use serde::{Deserialize, Serialize};
-use tracing::info;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,20 +64,20 @@ pub struct CloudOrchestrator {
 
 impl CloudOrchestrator {
     pub fn from_config(cfg: &Config) -> Self {
-        let mut adapters: Vec<Box<dyn CloudAdapter>> = vec![];
-        adapters.push(Box::new(RunpodAdapter::new(
-            env_key(&cfg.cloud.runpod.api_key_env, "RUNPOD_API_KEY"),
-            cfg.cloud.runpod.enabled,
-        )));
-        adapters.push(Box::new(VastAdapter::new(
-            env_key(&cfg.cloud.vast.api_key_env, "VAST_API_KEY"),
-            cfg.cloud.vast.enabled,
-        )));
-        adapters.push(Box::new(AkashAdapter::new(
-            env_key(&cfg.cloud.akash.api_key_env, "AKASH_API_KEY"),
-            cfg.cloud.akash.enabled,
-            cfg.cloud.akash.managed_account,
-        )));
+        let adapters: Vec<Box<dyn CloudAdapter>> = vec![
+            Box::new(StubAdapter::new(
+                CloudProvider::Runpod,
+                env_key(&cfg.cloud.runpod.api_key_env, "RUNPOD_API_KEY"),
+            )),
+            Box::new(StubAdapter::new(
+                CloudProvider::Vast,
+                env_key(&cfg.cloud.vast.api_key_env, "VAST_API_KEY"),
+            )),
+            Box::new(StubAdapter::new(
+                CloudProvider::Akash,
+                env_key(&cfg.cloud.akash.api_key_env, "AKASH_API_KEY"),
+            )),
+        ];
         Self { adapters }
     }
 
@@ -105,42 +108,43 @@ fn env_key(configured: &str, fallback: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-// --- RunPod ---
-
-pub struct RunpodAdapter {
-    api_key: Option<String>,
-    enabled: bool,
-    http: reqwest::Client,
+fn not_implemented(provider: CloudProvider) -> LocalCodeError {
+    LocalCodeError::new(
+        ErrorCode::NotImplemented,
+        format!("{} cloud deploys are not implemented yet", provider.as_str()),
+    )
+    .with_cause("The provider adapter is a stub in this build")
+    .with_hint("Provision manually in the provider console, then add the endpoint as an OpenAI-compatible runtime")
+    .with_hint("Track progress in the LocalCode repository issues")
 }
 
-impl RunpodAdapter {
-    pub fn new(api_key: Option<String>, enabled: bool) -> Self {
-        Self {
-            api_key,
-            enabled,
-            http: reqwest::Client::new(),
-        }
+/// Honest placeholder adapter: refuses to deploy rather than fabricating a
+/// deployment. Keeps the key plumbing so real adapters can slot in later.
+struct StubAdapter {
+    provider: CloudProvider,
+    api_key: Option<String>,
+}
+
+impl StubAdapter {
+    fn new(provider: CloudProvider, api_key: Option<String>) -> Self {
+        Self { provider, api_key }
     }
 }
 
 #[async_trait]
-impl CloudAdapter for RunpodAdapter {
+impl CloudAdapter for StubAdapter {
     fn provider(&self) -> CloudProvider {
-        CloudProvider::Runpod
+        self.provider
     }
 
     async fn deploy(&self, req: CloudDeployRequest) -> Result<CloudDeployment, LocalCodeError> {
-        let key = self.api_key.as_ref().ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::CloudKeyMissing, "RunPod API key not configured")
-                .with_cause("RUNPOD_API_KEY env var missing")
-                .with_hint("Open Setup → Cloud keys and set RunPod API key")
-                .with_hint("Or export RUNPOD_API_KEY")
-        })?;
-        if !self.enabled && key.is_empty() {
+        // Key/confirmation validation still applies so early UX is real…
+        if self.api_key.is_none() && self.provider != CloudProvider::Akash {
             return Err(LocalCodeError::new(
                 ErrorCode::CloudKeyMissing,
-                "RunPod disabled",
-            ));
+                format!("{} API key not configured", self.provider.as_str()),
+            )
+            .with_hint("Export the provider API key (see Setup)"));
         }
         if let Some(cost) = req.estimated_usd_per_hour {
             if cost > 0.0 && !req.confirmed {
@@ -151,320 +155,37 @@ impl CloudAdapter for RunpodAdapter {
                 .with_hint("Confirm in the deploy dialog"));
             }
         }
-
-        info!(model = %req.model_id, "RunPod deploy requested");
-        // Minimal REST: create pod (template-based). Real template IDs vary; surface clear errors.
-        let body = serde_json::json!({
-            "name": format!("localcode-{}", req.model_id.replace('/', "-")),
-            "imageName": "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
-            "gpuTypeId": req.gpu_filter.unwrap_or_else(|| "NVIDIA GeForce RTX 3090".into()),
-            "cloudType": "SECURE",
-            "ports": "8000/http",
-        });
-
-        let resp = self
-            .http
-            .post("https://api.runpod.io/graphql")
-            .bearer_auth(key)
-            .json(&serde_json::json!({
-                "query": "mutation { placeholder }"
-            }))
-            .send()
-            .await;
-
-        // Prefer REST pods API if GraphQL schema unknown
-        let _ = body;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(LocalCodeError::new(
-                    ErrorCode::CloudProvisionFailed,
-                    e.to_string(),
-                )
-                .with_cause("Network error reaching RunPod")
-                .with_hint("Check internet connectivity")
-                .with_hint("Verify API key scopes")
-                .retryable(true));
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(map_provider_error("RunPod", status, &text));
-        }
-
-        // Dry success path when API returns 200 but we use a placeholder —
-        // construct a pending deployment for the UI.
-        let id = Uuid::new_v4().to_string();
-        let mut runtime = ActiveRuntime::new(
-            format!("runpod:{}", req.model_id),
-            RuntimeKind::CloudRunpod,
-            format!("https://{id}-8000.proxy.runpod.net/v1"),
-        );
-        runtime.model_id = Some(req.model_id);
-        runtime.quantization = req.quantization;
-        runtime.status = RuntimeStatus::Starting;
-        runtime.api_key = Some(key.clone());
-
-        Ok(CloudDeployment {
-            id: id.clone(),
-            provider: CloudProvider::Runpod,
-            status: "provisioning".into(),
-            endpoint: runtime.base_url.clone().into(),
-            cost_usd_per_hour: req.estimated_usd_per_hour,
-            runtime: Some(runtime),
-            raw_error: None,
-        })
+        // …but provisioning itself is not implemented.
+        Err(not_implemented(self.provider))
     }
 
-    async fn destroy(&self, id: &str) -> Result<(), LocalCodeError> {
-        let key = self.api_key.as_ref().ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::CloudKeyMissing, "RunPod API key missing")
-        })?;
-        info!(%id, "RunPod destroy");
-        let _ = key;
-        Ok(())
+    async fn destroy(&self, _id: &str) -> Result<(), LocalCodeError> {
+        Err(not_implemented(self.provider))
     }
 
-    async fn status(&self, id: &str) -> Result<CloudDeployment, LocalCodeError> {
-        Ok(CloudDeployment {
-            id: id.into(),
-            provider: CloudProvider::Runpod,
-            status: "unknown".into(),
-            endpoint: None,
-            cost_usd_per_hour: None,
-            runtime: None,
-            raw_error: None,
-        })
+    async fn status(&self, _id: &str) -> Result<CloudDeployment, LocalCodeError> {
+        Err(not_implemented(self.provider))
     }
 }
 
-// --- Vast.ai ---
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub struct VastAdapter {
-    api_key: Option<String>,
-    enabled: bool,
-    http: reqwest::Client,
-}
-
-impl VastAdapter {
-    pub fn new(api_key: Option<String>, enabled: bool) -> Self {
-        Self {
-            api_key,
-            enabled,
-            http: reqwest::Client::new(),
-        }
+    #[tokio::test]
+    async fn cloud_deploy_is_honestly_unimplemented() {
+        let orch = CloudOrchestrator::from_config(&Config::default());
+        let err = orch
+            .deploy(CloudDeployRequest {
+                provider: CloudProvider::Akash,
+                model_id: "org/model".into(),
+                quantization: None,
+                gpu_filter: None,
+                estimated_usd_per_hour: None,
+                confirmed: true,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
     }
-}
-
-#[async_trait]
-impl CloudAdapter for VastAdapter {
-    fn provider(&self) -> CloudProvider {
-        CloudProvider::Vast
-    }
-
-    async fn deploy(&self, req: CloudDeployRequest) -> Result<CloudDeployment, LocalCodeError> {
-        let key = self.api_key.as_ref().ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::CloudKeyMissing, "Vast.ai API key not configured")
-                .with_cause("VAST_API_KEY missing")
-                .with_hint("Open Setup → Cloud keys")
-                .with_hint("Create a key at https://cloud.vast.ai")
-        })?;
-        let _ = self.enabled;
-
-        if let Some(cost) = req.estimated_usd_per_hour {
-            if cost > 0.0 && !req.confirmed {
-                return Err(LocalCodeError::new(
-                    ErrorCode::PaymentConfirmRequired,
-                    format!("Confirm Vast.ai spend ~${cost:.2}/hr"),
-                ));
-            }
-        }
-
-        // Search offers
-        let search = self
-            .http
-            .get("https://console.vast.ai/api/v0/bundles/")
-            .query(&[("api_key", key.as_str())])
-            .send()
-            .await;
-
-        match search {
-            Ok(resp) if !resp.status().is_success() => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(map_provider_error("Vast.ai", status, &text));
-            }
-            Err(e) => {
-                return Err(LocalCodeError::new(
-                    ErrorCode::CloudProvisionFailed,
-                    e.to_string(),
-                )
-                .with_cause("Network error reaching Vast.ai")
-                .with_hint("Check API key and network")
-                .retryable(true));
-            }
-            _ => {}
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let mut runtime = ActiveRuntime::new(
-            format!("vast:{}", req.model_id),
-            RuntimeKind::CloudVast,
-            format!("https://vast.example/{id}/v1"),
-        );
-        runtime.model_id = Some(req.model_id);
-        runtime.quantization = req.quantization;
-        runtime.status = RuntimeStatus::Starting;
-
-        Ok(CloudDeployment {
-            id,
-            provider: CloudProvider::Vast,
-            status: "provisioning".into(),
-            endpoint: runtime.base_url.clone().into(),
-            cost_usd_per_hour: req.estimated_usd_per_hour,
-            runtime: Some(runtime),
-            raw_error: None,
-        })
-    }
-
-    async fn destroy(&self, id: &str) -> Result<(), LocalCodeError> {
-        info!(%id, "Vast destroy");
-        Ok(())
-    }
-
-    async fn status(&self, id: &str) -> Result<CloudDeployment, LocalCodeError> {
-        Ok(CloudDeployment {
-            id: id.into(),
-            provider: CloudProvider::Vast,
-            status: "unknown".into(),
-            endpoint: None,
-            cost_usd_per_hour: None,
-            runtime: None,
-            raw_error: None,
-        })
-    }
-}
-
-// --- Akash ---
-
-pub struct AkashAdapter {
-    api_key: Option<String>,
-    enabled: bool,
-    managed_account: bool,
-}
-
-impl AkashAdapter {
-    pub fn new(api_key: Option<String>, enabled: bool, managed_account: bool) -> Self {
-        Self {
-            api_key,
-            enabled,
-            managed_account,
-        }
-    }
-}
-
-#[async_trait]
-impl CloudAdapter for AkashAdapter {
-    fn provider(&self) -> CloudProvider {
-        CloudProvider::Akash
-    }
-
-    async fn deploy(&self, req: CloudDeployRequest) -> Result<CloudDeployment, LocalCodeError> {
-        let _ = self.enabled;
-        if self.managed_account {
-            // Server-mediated path: require LocalCode account balance (checked by payments layer)
-            info!(
-                model = %req.model_id,
-                "Akash managed deploy (custody: server-mediated escrow)"
-            );
-        } else if self.api_key.is_none() {
-            return Err(LocalCodeError::new(
-                ErrorCode::CloudKeyMissing,
-                "Akash credentials missing",
-            )
-            .with_hint("Enable managed account or provide Akash key")
-            .with_cause("No managed account and no API key"));
-        }
-
-        if !req.confirmed {
-            return Err(LocalCodeError::new(
-                ErrorCode::PaymentConfirmRequired,
-                "Confirm Akash deploy and balance hold",
-            )
-            .with_hint("Review estimated cost and custody disclosure")
-            .with_cause("Explicit confirmation required for cloud spend"));
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let mut runtime = ActiveRuntime::new(
-            format!("akash:{}", req.model_id),
-            RuntimeKind::CloudAkash,
-            format!("https://akash.provider.example/{id}/v1"),
-        );
-        runtime.model_id = Some(req.model_id);
-        runtime.quantization = req.quantization;
-        runtime.status = RuntimeStatus::Starting;
-
-        Ok(CloudDeployment {
-            id,
-            provider: CloudProvider::Akash,
-            status: "provisioning".into(),
-            endpoint: runtime.base_url.clone().into(),
-            cost_usd_per_hour: req.estimated_usd_per_hour,
-            runtime: Some(runtime),
-            raw_error: None,
-        })
-    }
-
-    async fn destroy(&self, id: &str) -> Result<(), LocalCodeError> {
-        info!(%id, "Akash destroy");
-        Ok(())
-    }
-
-    async fn status(&self, id: &str) -> Result<CloudDeployment, LocalCodeError> {
-        Ok(CloudDeployment {
-            id: id.into(),
-            provider: CloudProvider::Akash,
-            status: "unknown".into(),
-            endpoint: None,
-            cost_usd_per_hour: None,
-            runtime: None,
-            raw_error: None,
-        })
-    }
-}
-
-fn map_provider_error(
-    provider: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> LocalCodeError {
-    let mut err = LocalCodeError::new(
-        ErrorCode::CloudProvisionFailed,
-        format!("{provider} API error: {status}"),
-    )
-    .with_details(serde_json::json!({ "body": body.chars().take(500).collect::<String>() }));
-
-    if status.as_u16() == 401 || status.as_u16() == 403 {
-        err = err
-            .with_cause("Invalid API key or insufficient scopes")
-            .with_hint("Regenerate key in provider console")
-            .with_hint("Check key is set in Setup");
-    } else if status.as_u16() == 402 || body.to_lowercase().contains("credit") {
-        err = LocalCodeError::new(ErrorCode::CloudQuotaExceeded, format!("{provider}: quota/credits"))
-            .with_cause("Insufficient provider credits")
-            .with_hint("Add credits on the provider dashboard");
-    } else if body.to_lowercase().contains("gpu") || body.to_lowercase().contains("capacity") {
-        err = err
-            .with_cause("Requested GPU type unavailable in region")
-            .with_hint("Try a different GPU type or region");
-    } else {
-        err = err
-            .with_cause("Provider rejected the request")
-            .with_hint("Open logs and Ask assistant")
-            .retryable(true);
-    }
-    err
 }

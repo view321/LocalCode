@@ -1,22 +1,30 @@
 use crate::{
-    BackendKind, DetectReport, Health, InferenceBackend, ModelDeploySpec, RunningEndpoint,
+    port_in_use, probe_client, spawn_io_drain, BackendKind, DetectReport, Health,
+    InferenceBackend, ModelDeploySpec, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::VllmConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
+use localcode_core::events::{AppEvent, EventBus};
 use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::info;
 
 pub struct VllmBackend {
     cfg: VllmConfig,
     http: reqwest::Client,
+    /// Track children so stop() works and processes are reaped (previously
+    /// they were mem::forget-ed: unstoppable and zombied on exit).
+    children: Arc<Mutex<Vec<(String, tokio::process::Child)>>>,
 }
 
 impl VllmBackend {
     pub fn new(cfg: VllmConfig) -> Self {
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            http: probe_client(),
+            children: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -66,13 +74,33 @@ impl InferenceBackend for VllmBackend {
         Ok(vec![])
     }
 
-    async fn deploy(&self, spec: ModelDeploySpec) -> Result<RunningEndpoint, LocalCodeError> {
+    async fn deploy(
+        &self,
+        spec: ModelDeploySpec,
+        events: &EventBus,
+    ) -> Result<RunningEndpoint, LocalCodeError> {
         self.ensure_ready().await?;
         let cid = localcode_core::CorrelationId::new();
         let port = spec.port.unwrap_or(self.cfg.port);
         let model = spec.local_path.clone().unwrap_or_else(|| spec.model_id.clone());
 
+        if port_in_use(port) {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendPortInUse,
+                format!("Port {port} is already in use"),
+            )
+            .with_correlation(cid)
+            .with_hint("Stop the other process or pick a different port")
+            .retryable(true));
+        }
+
         info!(%cid, %model, "starting vllm serve");
+        events.publish(AppEvent::DeployProgress {
+            job_id: spec.job_id.clone(),
+            percent: 50,
+            message: "Starting vLLM (model download may take a while)".into(),
+        });
+
         let mut child = tokio::process::Command::new(&self.cfg.bin)
             .args([
                 "serve",
@@ -83,6 +111,9 @@ impl InferenceBackend for VllmBackend {
                 &port.to_string(),
             ])
             .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| {
                 LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
@@ -91,9 +122,11 @@ impl InferenceBackend for VllmBackend {
                     .with_hint("Check CUDA version compatibility")
                     .retryable(true)
             })?;
+        spawn_io_drain("vllm".into(), &mut child);
 
         let base_url = format!("http://{}:{}/v1", self.cfg.host, port);
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(180);
+        let mut last_progress = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() > deadline {
                 let _ = child.kill().await;
@@ -116,12 +149,16 @@ impl InferenceBackend for VllmBackend {
                 )
                 .with_correlation(cid));
             }
+            if last_progress.elapsed() > tokio::time::Duration::from_secs(10) {
+                last_progress = tokio::time::Instant::now();
+                events.publish(AppEvent::DeployProgress {
+                    job_id: spec.job_id.clone(),
+                    percent: 60,
+                    message: "Waiting for vLLM to become healthy…".into(),
+                });
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-
-        // Keep child alive by leaking into background — process supervised by OS until stop
-        // For v1 we don't track child in a registry here; DeployService does.
-        std::mem::forget(child);
 
         let mut runtime = ActiveRuntime::new(
             format!("vllm:{}", spec.model_id),
@@ -132,10 +169,21 @@ impl InferenceBackend for VllmBackend {
         runtime.quantization = spec.quantization;
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
+
+        self.children
+            .lock()
+            .await
+            .push((runtime.id.to_string(), child));
+
         Ok(RunningEndpoint { runtime })
     }
 
-    async fn stop(&self, _runtime_id: &str) -> Result<(), LocalCodeError> {
+    async fn stop(&self, runtime_id: &str) -> Result<(), LocalCodeError> {
+        let mut kids = self.children.lock().await;
+        if let Some(pos) = kids.iter().position(|(id, _)| id == runtime_id) {
+            let (_, mut child) = kids.remove(pos);
+            let _ = child.kill().await;
+        }
         Ok(())
     }
 

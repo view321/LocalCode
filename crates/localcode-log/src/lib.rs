@@ -30,7 +30,7 @@ pub fn redact(input: &str) -> String {
             .replace_all(&out, |caps: &regex::Captures| {
                 if let Some(m) = caps.get(0) {
                     let s = m.as_str();
-                    if let Some(idx) = s.find(|c: char| c == ':' || c == '=') {
+                    if let Some(idx) = s.find([':', '=']) {
                         format!("{}***REDACTED***", &s[..=idx])
                     } else if s.to_lowercase().starts_with("bearer ") {
                         "Bearer ***REDACTED***".into()
@@ -51,11 +51,22 @@ pub struct LogGuard {
     pub log_dir: PathBuf,
 }
 
-/// Initialize tracing to stderr + rotating file under log_dir.
-pub fn init(paths: &AppPaths, cfg: &LoggingConfig) -> Result<LogGuard, localcode_core::LocalCodeError> {
+/// Initialize tracing to a rotating file under log_dir, optionally mirroring
+/// to stderr.
+///
+/// `stderr` MUST be false in TUI mode: the alternate screen lives on stdout,
+/// so stderr writes land straight on the raw-mode terminal and corrupt the UI.
+pub fn init(
+    paths: &AppPaths,
+    cfg: &LoggingConfig,
+    stderr: bool,
+) -> Result<LogGuard, localcode_core::LocalCodeError> {
     paths.ensure_dirs()?;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.level));
+    let level = std::env::var("LOCALCODE_LOG_LEVEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.level.clone());
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level));
 
     let file_appender = RollingFileAppender::new(Rotation::DAILY, &paths.log_dir, "localcode.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -65,7 +76,11 @@ pub fn init(paths: &AppPaths, cfg: &LoggingConfig) -> Result<LogGuard, localcode
         .with_ansi(false)
         .json();
 
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr).with_ansi(true);
+    let stderr_layer = if stderr {
+        Some(fmt::layer().with_writer(std::io::stderr).with_ansi(true))
+    } else {
+        None
+    };
 
     // Ignore double-init in tests
     let _ = tracing_subscriber::registry()

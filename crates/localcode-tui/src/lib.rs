@@ -2,6 +2,7 @@
 
 mod app;
 mod doctor;
+mod markdown;
 mod theme;
 mod ui;
 mod widgets;

@@ -4,16 +4,28 @@ use localcode_core::error::LocalCodeError;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme;
+
+/// What a Confirm modal's "Confirm" button actually does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    /// Quit the app (asked when managed runtimes would be stopped).
+    Quit,
+    /// Approve a destructive agent tool call (answers the pending approval).
+    ToolApproval,
+    /// Fetch + rebuild + swap the binary in the background.
+    InstallUpdate,
+}
 
 #[derive(Debug, Clone)]
 pub enum ModalKind {
     Confirm {
         title: String,
         body: String,
+        action: ConfirmAction,
     },
     Warning {
         title: String,
@@ -57,14 +69,56 @@ impl ModalState {
         }
     }
 
+    pub fn confirm(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        action: ConfirmAction,
+    ) -> Self {
+        Self {
+            kind: ModalKind::Confirm {
+                title: title.into(),
+                body: body.into(),
+                action,
+            },
+            // Default to the safe choice for confirmations.
+            selected: 1,
+        }
+    }
+
+    pub fn info(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind: ModalKind::Info {
+                title: title.into(),
+                body: body.into(),
+            },
+            selected: 0,
+        }
+    }
+
+    /// Button labels. Non-retryable errors get no Retry button, so a button's
+    /// label — not its index — is what handlers should match on.
     pub fn buttons(&self) -> Vec<&'static str> {
         match &self.kind {
-            ModalKind::Error { .. } => vec!["Retry", "Open logs", "Ask assistant", "Dismiss"],
+            ModalKind::Error { error } => {
+                if error.retryable {
+                    vec!["Retry", "Open logs", "Ask assistant", "Dismiss"]
+                } else {
+                    vec!["Open logs", "Ask assistant", "Dismiss"]
+                }
+            }
             ModalKind::Warning { .. } => vec!["Continue", "Cancel"],
             ModalKind::Confirm { .. } => vec!["Confirm", "Cancel"],
             ModalKind::Payment { .. } => vec!["Confirm pay", "Cancel"],
             ModalKind::Info { .. } => vec!["OK"],
         }
+    }
+
+    pub fn selected_button(&self) -> &'static str {
+        let buttons = self.buttons();
+        buttons
+            .get(self.selected.min(buttons.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or("")
     }
 }
 
@@ -118,12 +172,12 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
         }
         ModalKind::Warning { title, body } => (
             title.as_str(),
-            vec![Line::from(body.as_str())],
+            body.lines().map(|l| Line::from(l.to_string())).collect(),
             theme::warn(th),
         ),
-        ModalKind::Confirm { title, body } => (
+        ModalKind::Confirm { title, body, .. } => (
             title.as_str(),
-            vec![Line::from(body.as_str())],
+            body.lines().map(|l| Line::from(l.to_string())).collect(),
             theme::accent(th),
         ),
         ModalKind::Payment { title, body, amount } => (
@@ -140,7 +194,7 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
         ),
         ModalKind::Info { title, body } => (
             title.as_str(),
-            vec![Line::from(body.as_str())],
+            body.lines().map(|l| Line::from(l.to_string())).collect(),
             theme::accent(th),
         ),
     };
@@ -148,6 +202,7 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(style);
 
     let inner = block.inner(rect);
@@ -168,7 +223,7 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
         .iter()
         .enumerate()
         .flat_map(|(i, b)| {
-            let selected = i == modal.selected;
+            let selected = i == modal.selected.min(buttons.len().saturating_sub(1));
             let st = if selected {
                 Style::default()
                     .fg(theme::color(th, localcode_core::theme::ThemeToken::Bg))
@@ -199,6 +254,7 @@ pub fn draw_palette(
     let block = Block::default()
         .title(" Command palette (Ctrl+K) ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme::accent(th));
     let inner = block.inner(rect);
     f.render_widget(block, rect);

@@ -30,6 +30,22 @@ irm https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.ps1
 
 Scripts install Rust (via rustup) if needed, clone this repo, build the release binary, and place `localcode` on your PATH (`~/.local/bin` or `%USERPROFILE%\.local\bin`).
 
+### Updates
+
+LocalCode checks for new versions on startup (background, offline-safe) and
+shows a **⬆ update available** badge in the TUI header plus a notification.
+Press `u` to install in one step — it fetches the tracked branch, rebuilds in
+the background (Esc cancels safely), swaps the binary, and asks you to restart.
+
+```bash
+localcode update          # same thing, headless
+localcode update --check  # check only, don't install
+```
+
+Configure in `config.toml` under `[updates]`: `check_on_startup`, `repo_url`,
+`branch`, `install_dir` (defaults to the installer's checkout; the
+`LOCALCODE_INSTALL_DIR` env var overrides).
+
 ### From source (Cargo)
 
 ```bash
@@ -55,9 +71,18 @@ Website (project page): open [`website/index.html`](website/index.html) or the G
 
 1. Start Ollama (`ollama serve`) if using the default backend.
 2. Open **Models** (`2`), press `/` to search or `p` for popular coding models.
-3. Select a model, `Enter` for detail, pick a quant, press `d` to **Deploy**.
+3. Select a model, `Enter` for detail, pick a quant with `,` / `.`, press `d` to **Deploy**.
+   HF GGUF repos deploy through Ollama as `hf.co/{org}/{repo}:{quant}` automatically.
 4. If VRAM fit warns, choose **Continue** — deploys are never hard-blocked on size.
-5. Open **Coding** (`4`), type a prompt.
+5. Open **Coding** (`4`), press `i` and type a prompt. Replies **stream
+   token-by-token** into the transcript, with live tool activity (`⚙ fs.read …`)
+   as the agent works. `Esc` cancels a running turn and keeps the partial output.
+   Streaming can be disabled with `agent.stream = false` if your runtime rejects
+   `stream: true` together with tools.
+
+Coding is **local-first**: with no runtime deployed it will not silently fall back
+to a cloud provider. Set `agent.allow_cloud_fallback = true` in config.toml to
+allow using the configured assistant provider instead.
 
 ### Headless CLI
 
@@ -81,22 +106,43 @@ Accounts are **optional**. Local browse, deploy, coding, and benchmarks work off
 
 ## TUI
 
-Right rail tabs (gray idle → white hover/focus; active bold+underline):
+Top bar: identity + live chips (runtime health, GPU, API) and an update badge.
+Below it, a clickable tab strip:
 
-1. dashboard · 2 models · 3 benchmarks · 4 coding · 5 setup · 6 notifications · 7 settings
+1 home · 2 models · 3 bench · 4 coding · 5 setup · 6 alerts · 7 settings
 
 | Shortcut | Action |
 |----------|--------|
-| `1`–`7` | Switch tab |
+| `1`–`7`, `Tab`/`Shift+Tab` | Switch tab (or click the strip) |
+| `?` | Help overlay (per-tab keys) |
 | `Ctrl+K` | Command palette |
-| `/` | Models search |
-| `d` | One-click deploy |
+| `u` | Install the available update (background build) |
+| `Esc` | Cancel the running task (search/deploy/agent turn/update) |
+| `/` `p` `t` | Models: search / popular / trending |
+| `←`/`→` | Models: focus the results list or the model card |
+| `j`/`k`, `PgUp/PgDn`, `g`/`G` | Models: move selection / scroll the card |
+| `,` `.` / `+` `-` | Models: pick quant / adjust context size |
+| `b` / `d` | Models: cycle backend / one-click deploy |
+| `[` `]` and `{` `}` | Resize panes (Models: list↔card and card↔deploy; Dashboard: columns) |
+| `i`, `Enter` | Coding: focus composer (`↑` history, `PgUp/PgDn` scroll) |
+| `Ctrl+↑`/`Ctrl+↓` (or `+`/`-`) | Coding: grow/shrink the composer |
+| `n` | Coding: new session |
+| `j`/`k`, `x` | Dashboard: select / stop runtime |
 | `a` | Ask assistant (uses last error context) |
-| `s` | Toggle subagents (Coding) |
+| `e` | Open last error details (with working Retry) |
+| `c` | Notifications: clear |
 | `Ctrl+S` | Save config |
-| `q` | Quit |
+| `q` | Quit (confirms if managed runtimes are running) |
 
-Mouse: hover/click rail, resize supported. Pane ratios for Models adjust with `[` `]`.
+**Model cards** render as formatted markdown (headings, lists, tables, code)
+with metadata chips — downloads, likes, license, parameter size, gating — and
+scroll independently of the results list; the focused pane has the accent
+border. **Pane sizes persist** across restarts (saved with the config).
+
+Mouse: click tabs, scroll wheel in transcript/card/setup (honors `ui.mouse`
+config; disable it to keep native text selection). Long operations run in the
+background — the status bar shows a spinner and elapsed time, and `Esc`
+cancels.
 
 ## Server (optional VPS)
 
@@ -132,6 +178,7 @@ crates/
   localcode-agent/      coding agent, skills, MCP, tools
   localcode-assistant/  app-repair assistant
   localcode-api-client/ VPS REST client
+  localcode-upgrade/    update check + self-update
   localcode-tui/        ratatui UI
   localcode-cli/        binary
 server/localcode-server/

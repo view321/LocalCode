@@ -76,4 +76,24 @@ impl BackendRegistry {
     pub async fn remove_runtime(&self, id: &str) {
         self.runtimes.write().await.retain(|r| r.id.to_string() != id);
     }
+
+    /// Stop a runtime's backing process (when we own one) and deregister it.
+    pub async fn stop_runtime(&self, id: &str) -> Result<(), LocalCodeError> {
+        let runtime = self
+            .runtimes
+            .read()
+            .await
+            .iter()
+            .find(|r| r.id.to_string() == id)
+            .cloned();
+        if let Some(rt) = runtime {
+            if let Some(kind) = BackendKind::from_runtime_kind(rt.kind) {
+                if let Ok(backend) = self.get(kind) {
+                    backend.stop(id).await?;
+                }
+            }
+        }
+        self.remove_runtime(id).await;
+        Ok(())
+    }
 }

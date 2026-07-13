@@ -36,6 +36,8 @@ Stable machine-readable codes used in `LocalCodeError.code`. User surfaces alway
 | `API_UNREACHABLE` | VPS API down | Local features still work |
 | `AUTH_REQUIRED` | Sign-in needed (publish etc.) | Device auth in Setup |
 | `AUTH_FAILED` | Bad/expired token | Re-login |
+| `UPDATE_CHECK_FAILED` | Version check unreachable/invalid | Check network; LocalCode works without updating |
+| `UPDATE_FAILED` | Self-update fetch/build/swap failed | Causes in error; run `localcode update` for full log |
 | `IO_ERROR` | Filesystem/process I/O | Permissions, disk |
 | `INTERNAL` | Unexpected internal error | Logs + Ask assistant |
 | `CANCELLED` | User cancelled | — |

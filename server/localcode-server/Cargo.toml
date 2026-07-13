@@ -23,3 +23,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 tower = { workspace = true }
+
+[lints]
+workspace = true

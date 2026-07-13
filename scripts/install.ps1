@@ -75,6 +75,11 @@ function Clone-OrUpdate {
         }
     }
     else {
+        # Never delete a non-empty directory we don't recognize — a mistyped
+        # LOCALCODE_INSTALL_DIR must not wipe user data.
+        if ((Test-Path $InstallDir) -and (Get-ChildItem -Force $InstallDir | Select-Object -First 1)) {
+            throw "$InstallDir exists, is not empty, and is not a LocalCode checkout. Move it or set LOCALCODE_INSTALL_DIR elsewhere."
+        }
         Write-Info "Cloning LocalCode into $InstallDir"
         if (Test-Path $InstallDir) {
             Remove-Item -Recurse -Force $InstallDir

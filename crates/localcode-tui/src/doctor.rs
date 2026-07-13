@@ -17,12 +17,11 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
     let registry = Arc::new(BackendRegistry::from_config(cfg));
     let backends = registry.detect_all().await;
 
-    let hf_ok = check_url(&cfg.registry.api_endpoint).await;
-    let api_ok = check_url(&format!(
-        "{}/v1/health",
-        cfg.api.base_url.trim_end_matches('/')
-    ))
-    .await;
+    // Use the same env-resolved endpoints the actual clients use.
+    let (hf_endpoint, hf_api_endpoint) = cfg.hf_endpoints();
+    let api_base = cfg.api_base_url();
+    let hf_ok = check_url(&hf_api_endpoint).await;
+    let api_ok = check_url(&format!("{}/v1/health", api_base.trim_end_matches('/'))).await;
 
     let disk = disk_space(&paths.data_dir);
 
@@ -37,13 +36,13 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
         "gpu": gpu,
         "backends": backends,
         "huggingface": {
-            "endpoint": cfg.registry.endpoint,
-            "api_endpoint": cfg.registry.api_endpoint,
+            "endpoint": hf_endpoint,
+            "api_endpoint": hf_api_endpoint,
             "reachable": hf_ok,
             "token_set": cfg.hf_token().is_some(),
         },
         "api": {
-            "base_url": cfg.api.base_url,
+            "base_url": api_base,
             "reachable": api_ok,
         },
         "assistant": {

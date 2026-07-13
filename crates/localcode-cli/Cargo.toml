@@ -20,7 +20,11 @@ localcode-bench = { workspace = true }
 localcode-agent = { workspace = true }
 localcode-tui = { workspace = true }
 localcode-api-client = { workspace = true }
+localcode-upgrade = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

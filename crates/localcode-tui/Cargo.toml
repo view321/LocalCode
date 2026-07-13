@@ -17,7 +17,10 @@ localcode-bench = { workspace = true }
 localcode-agent = { workspace = true }
 localcode-assistant = { workspace = true }
 localcode-api-client = { workspace = true }
+localcode-upgrade = { workspace = true }
+async-trait = { workspace = true }
 crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -28,3 +31,6 @@ chrono = { workspace = true }
 unicode-width = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ description = "Coding agent: tools, skills, MCP, subagents"
 [dependencies]
 localcode-core = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,3 +22,6 @@ chrono = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

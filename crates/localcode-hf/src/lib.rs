@@ -62,6 +62,7 @@ impl HfClient {
     ) -> Result<Self, LocalCodeError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("LocalCode/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| {
@@ -69,9 +70,22 @@ impl HfClient {
                     .with_source("hf", "client_build")
             })?;
 
+        // LOCALCODE_HF_ENDPOINT overrides both web and API endpoints (mirrors).
+        let (endpoint, api_endpoint) = match std::env::var("LOCALCODE_HF_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(ep) => {
+                let ep = ep.trim_end_matches('/').to_string();
+                let api = format!("{ep}/api");
+                (ep, api)
+            }
+            None => (registry.endpoint.clone(), registry.api_endpoint.clone()),
+        };
+
         Ok(Self {
             http,
-            urls: UrlBuilder::new(&registry.endpoint, &registry.api_endpoint),
+            urls: UrlBuilder::new(&endpoint, &api_endpoint),
             token,
             cache: ModelCache::new(cache_dir),
         })
@@ -176,7 +190,9 @@ impl HfClient {
         model_id: &str,
         cid: CorrelationId,
     ) -> Result<ModelDetail, LocalCodeError> {
-        let url = self.urls.api(&format!("models/{model_id}"));
+        // blobs=true is required for sibling file sizes; without it every
+        // quant reports 0 bytes and VRAM fit prediction is meaningless.
+        let url = self.urls.api(&format!("models/{model_id}?blobs=true"));
         info!(%cid, %model_id, "HF model info");
         let req = self.auth_header(self.http.get(&url));
         let resp = req.send().await.map_err(|e| map_http_err(e, cid))?;
@@ -204,6 +220,7 @@ impl HfClient {
             private: Option<bool>,
             gated: Option<serde_json::Value>,
             siblings: Option<Vec<RawSibling>>,
+            #[serde(rename = "cardData")]
             card_data: Option<serde_json::Value>,
             sha: Option<String>,
         }

@@ -55,9 +55,14 @@ struct BenchResultRow {
     user_id: Option<String>,
     hf_model_id: String,
     quantization: String,
+    weight_source: Option<String>,
     backend: String,
+    backend_version: Option<String>,
+    precision_notes: Option<String>,
     hardware_json: serde_json::Value,
     metrics_json: serde_json::Value,
+    started_at: Option<String>,
+    finished_at: Option<String>,
     runner_version: String,
     created_at: String,
     visibility: String,
@@ -221,17 +226,26 @@ struct DevicePollResp {
     access_token: Option<String>,
 }
 
+/// Device codes expire after this many seconds (mirrors `expires_in`).
+const DEVICE_CODE_TTL_SECS: i64 = 900;
+
 async fn device_poll(
     State(state): State<AppState>,
     Json(req): Json<DevicePollReq>,
 ) -> Result<Json<DevicePollResp>, StatusCode> {
     let mut db = state.inner.lock().unwrap();
-    let approved_user = db
+    let pending = db
         .device_codes
         .get(&req.device_code)
-        .ok_or(StatusCode::NOT_FOUND)?
-        .approved_user
-        .clone();
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if (Utc::now() - pending.created_at).num_seconds() > DEVICE_CODE_TTL_SECS {
+        db.device_codes.remove(&req.device_code);
+        return Ok(Json(DevicePollResp {
+            status: "expired".into(),
+            access_token: None,
+        }));
+    }
+    let approved_user = pending.approved_user.clone();
     if let Some(user_id) = approved_user {
         let token = Uuid::new_v4().to_string();
         let hash = hash_token(&token);
@@ -449,9 +463,14 @@ async fn publish_result(
         user_id: Some(user.id),
         hf_model_id: body.hf_model_id,
         quantization: body.quantization,
+        weight_source: body.weight_source,
         backend: body.backend,
+        backend_version: body.backend_version,
+        precision_notes: body.precision_notes,
         hardware_json: body.hardware,
         metrics_json: body.metrics,
+        started_at: body.started_at,
+        finished_at: body.finished_at,
         runner_version: body.runner_version,
         created_at: Utc::now().to_rfc3339(),
         visibility: "public".into(),
@@ -559,6 +578,9 @@ async fn create_tx(
     Json(req): Json<TxReq>,
 ) -> Result<Json<LedgerEntry>, StatusCode> {
     let user = require_user(&state, &headers)?;
+    if !req.amount.is_finite() || req.amount <= 0.0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let mut db = state.inner.lock().unwrap();
     let bal = db.balances.entry(user.id.clone()).or_insert(Balance {
         currency: "USDC".into(),
@@ -573,7 +595,12 @@ async fn create_tx(
             bal.available -= req.amount;
             bal.held += req.amount;
         }
+        // Self-crediting a balance is a dev convenience only. In production
+        // deposits are credited by the chain watcher, never by clients.
         "deposit" | "adjust" => {
+            if std::env::var("LOCALCODE_DEV_ALLOW_CREDIT").ok().as_deref() != Some("1") {
+                return Err(StatusCode::FORBIDDEN);
+            }
             bal.available += req.amount;
         }
         "capture" => {
@@ -632,8 +659,12 @@ async fn akash_destroy(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let _user = require_user(&state, &headers)?;
+    let user = require_user(&state, &headers)?;
     let mut db = state.inner.lock().unwrap();
+    let dep = db.akash_deployments.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if dep.get("user_id").and_then(|u| u.as_str()) != Some(user.id.as_str()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     db.akash_deployments.remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }

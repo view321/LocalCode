@@ -48,6 +48,9 @@ pub enum ErrorCode {
     ApiUnreachable,
     AuthRequired,
     AuthFailed,
+    // Self-update
+    UpdateCheckFailed,
+    UpdateFailed,
     // Generic
     IoError,
     Internal,
@@ -90,6 +93,8 @@ impl ErrorCode {
             Self::ApiUnreachable => "API_UNREACHABLE",
             Self::AuthRequired => "AUTH_REQUIRED",
             Self::AuthFailed => "AUTH_FAILED",
+            Self::UpdateCheckFailed => "UPDATE_CHECK_FAILED",
+            Self::UpdateFailed => "UPDATE_FAILED",
             Self::IoError => "IO_ERROR",
             Self::Internal => "INTERNAL",
             Self::Cancelled => "CANCELLED",

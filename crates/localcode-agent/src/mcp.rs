@@ -70,6 +70,11 @@ impl McpManager {
         &self.statuses
     }
 
+    /// Number of servers present in mcp.json (connected or not).
+    pub fn configured_count(&self) -> usize {
+        self.config.servers.len()
+    }
+
     pub fn config_path(&self) -> &PathBuf {
         &self.config_path
     }
@@ -88,14 +93,21 @@ fn load_config(path: &PathBuf) -> Result<McpConfig, LocalCodeError> {
 }
 
 async fn connect_server(server: &McpServerConfig) -> McpServerStatus {
-    // v1: record config presence; full JSON-RPC MCP handshake in hardening
+    // v1 honesty: the MCP handshake is not implemented yet, so nothing is
+    // reported healthy — a reachable URL is only "configured", never
+    // "connected", and its tools are not available to the agent.
     if let Some(url) = &server.url {
-        match reqwest::Client::new().get(url).send().await {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        match client.get(url).send().await {
             Ok(r) if r.status().is_success() => McpServerStatus {
                 name: server.name.clone(),
-                healthy: true,
-                tools: vec!["(http mcp — schema cache pending)".into()],
-                error: None,
+                healthy: false,
+                tools: vec![],
+                error: Some("reachable, but MCP handshake not implemented yet".into()),
             },
             Ok(r) => McpServerStatus {
                 name: server.name.clone(),
@@ -113,9 +125,9 @@ async fn connect_server(server: &McpServerConfig) -> McpServerStatus {
     } else if server.command.is_some() {
         McpServerStatus {
             name: server.name.clone(),
-            healthy: true,
-            tools: vec!["(stdio mcp — started on demand)".into()],
-            error: None,
+            healthy: false,
+            tools: vec![],
+            error: Some("configured, but stdio MCP is not implemented yet".into()),
         }
     } else {
         McpServerStatus {

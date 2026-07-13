@@ -17,12 +17,18 @@ impl ApiClient {
     pub fn new(cfg: &ApiConfig, token: Option<String>) -> Result<Self, LocalCodeError> {
         let http = reqwest::Client::builder()
             .user_agent(format!("LocalCode/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| LocalCodeError::new(ErrorCode::Internal, e.to_string()))?;
+        // Env override resolved here, at use time — never persisted to config.
+        let base_url = std::env::var("LOCALCODE_API_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cfg.base_url.clone());
         Ok(Self {
             http,
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
             token,
         })
     }

@@ -46,6 +46,11 @@ clone_or_update() {
     git -C "$INSTALL_DIR" fetch --depth 1 origin "$REPO_BRANCH"
     git -C "$INSTALL_DIR" checkout -B "$REPO_BRANCH" "origin/${REPO_BRANCH}"
   else
+    # Never delete a non-empty directory we don't recognize — a mistyped
+    # LOCALCODE_INSTALL_DIR must not wipe user data.
+    if [[ -d "$INSTALL_DIR" ]] && [[ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
+      error "${INSTALL_DIR} exists, is not empty, and is not a LocalCode checkout. Move it or set LOCALCODE_INSTALL_DIR elsewhere."
+    fi
     info "Cloning LocalCode into ${INSTALL_DIR}"
     rm -rf "$INSTALL_DIR"
     git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"

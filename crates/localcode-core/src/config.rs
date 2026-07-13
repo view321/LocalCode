@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub type ConfigError = LocalCodeError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub ui: UiConfig,
@@ -28,22 +28,13 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub panes: PaneRatios,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            ui: UiConfig::default(),
-            registry: RegistryConfig::default(),
-            backends: BackendsConfig::default(),
-            assistant: AssistantConfig::default(),
-            agent: AgentConfig::default(),
-            cloud: CloudConfig::default(),
-            api: ApiConfig::default(),
-            logging: LoggingConfig::default(),
-            panes: PaneRatios::default(),
-        }
-    }
+/// Read an env var, treating empty values as unset.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +45,9 @@ pub struct UiConfig {
     pub mouse: bool,
     #[serde(default = "default_true")]
     pub right_rail_hover_brightens: bool,
+    /// Height (text rows) of the Coding composer. Clamped to 1..=10 at use.
+    #[serde(default = "default_composer_rows")]
+    pub composer_rows: u16,
 }
 
 impl Default for UiConfig {
@@ -62,6 +56,36 @@ impl Default for UiConfig {
             theme: ThemeMode::Dark,
             mouse: true,
             right_rail_hover_brightens: true,
+            composer_rows: default_composer_rows(),
+        }
+    }
+}
+
+/// Where updates come from and whether to look for them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesConfig {
+    /// Check for a new version in the background on TUI startup.
+    #[serde(default = "default_true")]
+    pub check_on_startup: bool,
+    /// Git repository updates are pulled from (same source as the installer).
+    #[serde(default = "default_repo_url")]
+    pub repo_url: String,
+    /// Branch the installer tracks.
+    #[serde(default = "default_repo_branch")]
+    pub branch: String,
+    /// Source checkout used for self-update. Defaults to the installer's
+    /// location; `LOCALCODE_INSTALL_DIR` env overrides at use time.
+    #[serde(default)]
+    pub install_dir: Option<String>,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            repo_url: default_repo_url(),
+            branch: default_repo_branch(),
+            install_dir: None,
         }
     }
 }
@@ -89,7 +113,7 @@ impl Default for RegistryConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BackendsConfig {
     #[serde(default)]
     pub default: DefaultBackend,
@@ -101,18 +125,6 @@ pub struct BackendsConfig {
     pub vllm: VllmConfig,
     #[serde(default)]
     pub sglang: SglangConfig,
-}
-
-impl Default for BackendsConfig {
-    fn default() -> Self {
-        Self {
-            default: DefaultBackend::default(),
-            ollama: OllamaConfig::default(),
-            llamacpp: LlamaCppConfig::default(),
-            vllm: VllmConfig::default(),
-            sglang: SglangConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,10 +249,18 @@ pub struct AgentConfig {
     pub mcp_config: Option<String>,
     #[serde(default = "default_true")]
     pub confirm_destructive_tools: bool,
+    /// Allow the Coding tab to fall back to the (cloud) assistant provider
+    /// when no local runtime is deployed. Off by default: local-first.
+    #[serde(default)]
+    pub allow_cloud_fallback: bool,
     #[serde(default)]
     pub workspace_root: Option<String>,
     #[serde(default = "default_max_tools")]
     pub max_tool_rounds: u32,
+    /// Stream model output token-by-token (SSE). Turn off for OpenAI-compatible
+    /// servers that reject `stream: true` together with tools.
+    #[serde(default = "default_true")]
+    pub stream: bool,
 }
 
 impl Default for AgentConfig {
@@ -250,8 +270,10 @@ impl Default for AgentConfig {
             skills_dir: None,
             mcp_config: None,
             confirm_destructive_tools: true,
+            allow_cloud_fallback: false,
             workspace_root: None,
             max_tool_rounds: default_max_tools(),
+            stream: true,
         }
     }
 }
@@ -268,21 +290,12 @@ pub struct CloudConfig {
     pub spend_confirm_threshold_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CloudProviderConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub api_key_env: String,
-}
-
-impl Default for CloudProviderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key_env: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,15 +413,25 @@ fn default_assistant_key_env() -> String {
 fn default_max_tools() -> u32 {
     32
 }
+fn default_composer_rows() -> u16 {
+    3
+}
+fn default_repo_url() -> String {
+    "https://github.com/view321/LocalCode.git".into()
+}
+fn default_repo_branch() -> String {
+    "main".into()
+}
 fn default_spend_threshold() -> f64 {
     1.0
 }
+// NOTE: defaults must be pure — env overrides are resolved at *use* time
+// (api_base_url(), log_level(), hf endpoints), never baked into a saved config.
 fn default_api_url() -> String {
-    std::env::var("LOCALCODE_API_URL")
-        .unwrap_or_else(|_| "https://api.localcode.example".into())
+    "https://api.localcode.example".into()
 }
 fn default_log_level() -> String {
-    std::env::var("LOCALCODE_LOG_LEVEL").unwrap_or_else(|_| "info".into())
+    "info".into()
 }
 fn default_max_log_files() -> u32 {
     20
@@ -454,13 +477,36 @@ impl Config {
     }
 
     pub fn hf_token(&self) -> Option<String> {
-        std::env::var(&self.registry.token_env).ok().filter(|s| !s.is_empty())
+        env_nonempty(&self.registry.token_env)
     }
 
     pub fn assistant_api_key(&self) -> Option<String> {
-        std::env::var(&self.assistant.api_key_env)
-            .ok()
-            .filter(|s| !s.is_empty())
+        env_nonempty(&self.assistant.api_key_env)
+    }
+
+    /// API base URL with `LOCALCODE_API_URL` env override (never persisted).
+    pub fn api_base_url(&self) -> String {
+        env_nonempty("LOCALCODE_API_URL").unwrap_or_else(|| self.api.base_url.clone())
+    }
+
+    /// Log level with `LOCALCODE_LOG_LEVEL` env override (never persisted).
+    pub fn log_level(&self) -> String {
+        env_nonempty("LOCALCODE_LOG_LEVEL").unwrap_or_else(|| self.logging.level.clone())
+    }
+
+    /// HF endpoints with `LOCALCODE_HF_ENDPOINT` env override (never persisted).
+    /// Returns (web endpoint, api endpoint).
+    pub fn hf_endpoints(&self) -> (String, String) {
+        if let Some(ep) = env_nonempty("LOCALCODE_HF_ENDPOINT") {
+            let ep = ep.trim_end_matches('/').to_string();
+            let api = format!("{ep}/api");
+            (ep, api)
+        } else {
+            (
+                self.registry.endpoint.clone(),
+                self.registry.api_endpoint.clone(),
+            )
+        }
     }
 }
 
