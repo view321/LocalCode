@@ -1,0 +1,23 @@
+[package]
+name = "localcode-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coding agent: tools, skills, MCP, subagents"
+
+[dependencies]
+localcode-core = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

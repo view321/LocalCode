@@ -1,0 +1,19 @@
+id = "localcode-sample-coding"
+version = "1.0.0"
+title = "Sample Coding Suite"
+description = "Tiny coding tasks for smoke benchmarks"
+
+[[tasks]]
+id = "hello_fn"
+prompt = "Write a Python function `add(a, b)` that returns the sum of a and b. Reply with code only."
+expect_regex = "def\\s+add\\s*\\("
+expect_contains = "return"
+timeout_secs = 60
+weight = 1.0
+
+[[tasks]]
+id = "fizzbuzz"
+prompt = "Write a Python function fizzbuzz(n) that returns 'Fizz' if n divisible by 3, 'Buzz' if by 5, 'FizzBuzz' if both, else str(n)."
+expect_regex = "def\\s+fizzbuzz"
+timeout_secs = 60
+weight = 1.0

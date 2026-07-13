@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/localcode-core",
+    "crates/localcode-log",
+    "crates/localcode-gpu",
+    "crates/localcode-hf",
+    "crates/localcode-backends",
+    "crates/localcode-cloud",
+    "crates/localcode-payments",
+    "crates/localcode-bench",
+    "crates/localcode-agent",
+    "crates/localcode-assistant",
+    "crates/localcode-api-client",
+    "crates/localcode-tui",
+    "crates/localcode-cli",
+    "server/localcode-server",
+]
+default-members = ["crates/localcode-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["LocalCode Contributors"]
+repository = "https://github.com/view321/LocalCode"
+
+[workspace.dependencies]
+localcode-core = { path = "crates/localcode-core" }
+localcode-log = { path = "crates/localcode-log" }
+localcode-gpu = { path = "crates/localcode-gpu" }
+localcode-hf = { path = "crates/localcode-hf" }
+localcode-backends = { path = "crates/localcode-backends" }
+localcode-cloud = { path = "crates/localcode-cloud" }
+localcode-payments = { path = "crates/localcode-payments" }
+localcode-bench = { path = "crates/localcode-bench" }
+localcode-agent = { path = "crates/localcode-agent" }
+localcode-assistant = { path = "crates/localcode-assistant" }
+localcode-api-client = { path = "crates/localcode-api-client" }
+localcode-tui = { path = "crates/localcode-tui" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "5"
+futures = "0.3"
+hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+jsonwebtoken = "9"
+once_cell = "1"
+pulldown-cmark = "0.12"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-width = "0.2"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+ratatui = "0.29"
+bytes = "1"
+walkdir = "2"
+which = "7"
+tempfile = "3"
+pretty_assertions = "1"
+httpmock = "0.7"

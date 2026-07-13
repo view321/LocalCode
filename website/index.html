@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="LocalCode — local-first Rust TUI coding agent for developers who prefer local LLMs. Hugging Face models, one-click deploy, GPU awareness, benchmarks." />
+  <meta name="theme-color" content="#0a0e14" />
+  <meta property="og:title" content="LocalCode — Local-first coding agent" />
+  <meta property="og:description" content="Rust TUI coding agent for local LLMs. Discover models, deploy with one click, code offline." />
+  <meta property="og:type" content="website" />
+  <title>LocalCode — Local-first coding agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230a0e14'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='monospace' font-size='14' font-weight='700' fill='%2334d399'%3ELC%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <a class="logo" href="#">
+      <span class="logo-mark">LC</span>
+      <span class="logo-text">LocalCode</span>
+    </a>
+    <nav class="nav">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#backends">Backends</a>
+      <a href="#docs">Docs</a>
+      <a class="nav-github" href="https://github.com/view321/LocalCode" target="_blank" rel="noopener noreferrer">GitHub</a>
+    </nav>
+    <button class="nav-toggle" type="button" aria-label="Toggle menu" aria-expanded="false">
+      <span></span><span></span>
+    </button>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Local-first · Account-optional · MIT</p>
+        <h1>
+          Coding agent for
+          <span class="gradient-text">local models</span>
+        </h1>
+        <p class="lede">
+          LocalCode is a Rust TUI coding agent built for developers who run LLMs on their own machines.
+          Discover Hugging Face models, check VRAM fit, one-click deploy, and code — offline when you want it.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="#install">Install LocalCode</a>
+          <a class="btn btn-ghost" href="https://github.com/view321/LocalCode" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+        </div>
+        <ul class="hero-pills">
+          <li>Ollama · llama.cpp · vLLM · SGLang</li>
+          <li>GPU VRAM warnings</li>
+          <li>Skills · MCP · subagents</li>
+        </ul>
+      </div>
+      <div class="hero-terminal" aria-hidden="true">
+        <div class="term-chrome">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+          <span class="term-title">localcode — coding</span>
+        </div>
+        <pre class="term-body"><code><span class="t-dim">┌─ LocalCode ─────────────────────────────────────┐</span>
+<span class="t-dim">│</span> <span class="t-accent">models</span>  benchmarks  <span class="t-active">coding</span>  setup  settings   <span class="t-dim">│</span>
+<span class="t-dim">├─────────────────────────────────────────────────┤</span>
+<span class="t-dim">│</span> <span class="t-muted">runtime</span>  qwen2.5-coder:7b @ ollama             <span class="t-dim">│</span>
+<span class="t-dim">│</span> <span class="t-muted">workspace</span>  ~/projects/app                      <span class="t-dim">│</span>
+<span class="t-dim">│</span>                                                 <span class="t-dim">│</span>
+<span class="t-dim">│</span> <span class="t-user">you</span>  Add error handling to the API client      <span class="t-dim">│</span>
+<span class="t-dim">│</span>                                                 <span class="t-dim">│</span>
+<span class="t-dim">│</span> <span class="t-agent">agent</span>  Reading src/api/client.rs…             <span class="t-dim">│</span>
+<span class="t-dim">│</span>         <span class="t-ok">✓</span> tool:read_file                       <span class="t-dim">│</span>
+<span class="t-dim">│</span>         Applying Result&lt;T, Error&gt; wrappers…    <span class="t-dim">│</span>
+<span class="t-dim">│</span>         <span class="t-ok">✓</span> tool:search_replace                  <span class="t-dim">│</span>
+<span class="t-dim">│</span>         Tests pass. Ready for review.          <span class="t-dim">│</span>
+<span class="t-dim">└─────────────────────────────────────────────────┘</span>
+<span class="prompt">›</span> <span class="cursor">█</span></code></pre>
+      </div>
+    </section>
+
+    <section id="features" class="section">
+      <div class="section-head">
+        <h2>Built for the local stack</h2>
+        <p>One happy path: discover → fit check → deploy → code. Failures are visible, logged, and recoverable.</p>
+      </div>
+      <div class="feature-grid">
+        <article class="card">
+          <div class="card-icon">⌕</div>
+          <h3>HF model discovery</h3>
+          <p>Search Hugging Face, browse popular coding models, inspect quants, licenses, and estimated sizes.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">⚡</div>
+          <h3>One-click deploy</h3>
+          <p>Deploy any quantization to Ollama, llama.cpp, vLLM, or SGLang. Oversized? Warn and continue — never hard-block.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">▣</div>
+          <h3>GPU-aware</h3>
+          <p>Detect GPUs, predict VRAM fit, and surface free vs total memory before you pull a model.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">⌘</div>
+          <h3>Full coding agent</h3>
+          <p>Tools, skills, MCP servers, optional subagents — a real agent loop in a keyboard-first TUI.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">▤</div>
+          <h3>Benchmarks</h3>
+          <p>Run suites locally against your model+quant. Publish results when signed in for community data.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">☁</div>
+          <h3>Optional cloud</h3>
+          <p>Burst to RunPod, Vast.ai, or Akash. Crypto top-up with USDC on Base for managed Akash deploys.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="install" class="section section-install">
+      <div class="section-head">
+        <h2>Install in one line</h2>
+        <p>Scripts install Rust if needed, build from source, and put <code>localcode</code> on your PATH.</p>
+      </div>
+
+      <div class="install-tabs" role="tablist" aria-label="Install platform">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="unix">Linux / macOS</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="windows">Windows</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="cargo">Cargo</button>
+      </div>
+
+      <div class="install-panels">
+        <div class="panel active" data-panel="unix" role="tabpanel">
+          <div class="code-block">
+            <button class="copy-btn" type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.sh | bash">Copy</button>
+            <pre><code>curl -fsSL https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.sh | bash</code></pre>
+          </div>
+          <p class="panel-note">Requires <code>curl</code>, a C toolchain, and network access. Installs to <code>~/.local/bin</code> by default.</p>
+        </div>
+        <div class="panel" data-panel="windows" role="tabpanel" hidden>
+          <div class="code-block">
+            <button class="copy-btn" type="button" data-copy="irm https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.ps1 | iex">Copy</button>
+            <pre><code>irm https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.ps1 | iex</code></pre>
+          </div>
+          <p class="panel-note">Run in PowerShell. Installs to <code>%USERPROFILE%\.local\bin</code> and offers to add it to your user PATH.</p>
+        </div>
+        <div class="panel" data-panel="cargo" role="tabpanel" hidden>
+          <div class="code-block">
+            <button class="copy-btn" type="button" data-copy="git clone https://github.com/view321/LocalCode.git
+cd LocalCode
+cargo install --path crates/localcode-cli">Copy</button>
+            <pre><code>git clone https://github.com/view321/LocalCode.git
+cd LocalCode
+cargo install --path crates/localcode-cli</code></pre>
+          </div>
+          <p class="panel-note">Requires Rust 1.75+. Binary lands in <code>~/.cargo/bin</code>.</p>
+        </div>
+      </div>
+
+      <div class="post-install">
+        <h3>After install</h3>
+        <div class="code-block">
+          <pre><code><span class="t-comment"># Launch the TUI</span>
+localcode
+
+<span class="t-comment"># Diagnostics</span>
+localcode doctor --json
+
+<span class="t-comment"># Headless agent</span>
+localcode agent run "List files in the workspace" --workspace .</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="backends" class="section">
+      <div class="section-head">
+        <h2>Your runtime, your choice</h2>
+        <p>Local backends and cloud providers sit behind the same coding surface.</p>
+      </div>
+      <div class="backend-row">
+        <div class="backend-chip">Ollama</div>
+        <div class="backend-chip">llama.cpp</div>
+        <div class="backend-chip">vLLM</div>
+        <div class="backend-chip">SGLang</div>
+        <div class="backend-chip">RunPod</div>
+        <div class="backend-chip">Vast.ai</div>
+        <div class="backend-chip">Akash</div>
+        <div class="backend-chip">OpenRouter</div>
+      </div>
+    </section>
+
+    <section id="docs" class="section section-philosophy">
+      <div class="philosophy">
+        <blockquote>
+          <p>“One-click and no errors” — guided recovery, warnings over hard blocks, always-available Ask assistant.</p>
+        </blockquote>
+        <div class="doc-links">
+          <a href="https://github.com/view321/LocalCode#readme" target="_blank" rel="noopener noreferrer">README</a>
+          <a href="https://github.com/view321/LocalCode/blob/main/docs/HANDOFF.md" target="_blank" rel="noopener noreferrer">Product spec</a>
+          <a href="https://github.com/view321/LocalCode/blob/main/docs/ERROR_CODES.md" target="_blank" rel="noopener noreferrer">Error catalog</a>
+          <a href="https://github.com/view321/LocalCode/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="logo">
+        <span class="logo-mark">LC</span>
+        <span class="logo-text">LocalCode</span>
+      </div>
+      <p>Local-first coding agent for local model users.</p>
+      <p class="footer-meta">
+        <a href="https://github.com/view321/LocalCode" target="_blank" rel="noopener noreferrer">GitHub</a>
+        · MIT · Built with Rust
+      </p>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
