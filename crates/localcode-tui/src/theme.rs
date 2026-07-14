@@ -1,9 +1,19 @@
 use localcode_core::theme::{Theme, ThemeToken};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 pub fn color(theme: &Theme, token: ThemeToken) -> Color {
     let (r, g, b) = theme.token_rgb(token);
     Color::Rgb(r, g, b)
+}
+
+/// The background-highlight for the currently-selected row/element. Meant to be
+/// used as a row's base style (per-span `fg` still shows through), or patched
+/// onto individual spans, so the picked item reads as a solid bar.
+pub fn selected(theme: &Theme) -> Style {
+    Style::default()
+        .bg(color(theme, ThemeToken::SelBg))
+        .fg(color(theme, ThemeToken::Accent))
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn accent(theme: &Theme) -> Style {

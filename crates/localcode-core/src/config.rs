@@ -276,6 +276,22 @@ pub struct AgentConfig {
     /// servers that reject `stream: true` together with tools.
     #[serde(default = "default_true")]
     pub stream: bool,
+    /// Custom system prompt. When set (non-empty), it replaces LocalCode's
+    /// built-in agent preamble; workspace path, project AGENTS.md and available
+    /// skills are still appended. Empty/None uses the built-in preamble.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Read a project `AGENTS.md` (from the workspace root) into the system
+    /// prompt so the agent follows repo-specific instructions. On by default.
+    #[serde(default = "default_true")]
+    pub use_agents_md: bool,
+    /// Tool names (e.g. `shell.exec`) the agent is NOT allowed to use. Disabled
+    /// tools are hidden from the model and refused if the model asks for them.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    /// Skill names to hide from the agent's system prompt.
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -289,6 +305,10 @@ impl Default for AgentConfig {
             workspace_root: None,
             max_tool_rounds: default_max_tools(),
             stream: true,
+            system_prompt: None,
+            use_agents_md: true,
+            disabled_tools: Vec::new(),
+            disabled_skills: Vec::new(),
         }
     }
 }

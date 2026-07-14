@@ -61,11 +61,44 @@ pub trait ToolApprover: Send + Sync {
     async fn approve(&self, description: &str) -> bool;
 }
 
-pub struct ToolRegistry;
+pub struct ToolRegistry {
+    /// Tool names the user disabled in Settings; hidden from the model schema
+    /// and refused if the model asks for them anyway.
+    disabled: std::collections::HashSet<String>,
+}
 
 impl ToolRegistry {
     pub fn default_tools() -> Self {
-        Self
+        Self {
+            disabled: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Build a registry with a set of disabled tool names.
+    pub fn new(disabled: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            disabled: disabled.into_iter().collect(),
+        }
+    }
+
+    /// The full built-in tool catalog: `(name, one-line description)`. Drives
+    /// both the model schema and the Settings tool list so they never drift.
+    pub fn catalog() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("fs.read", "Read a file"),
+            ("fs.list", "List a directory"),
+            ("fs.search", "Search files by regex"),
+            ("fs.write", "Write full file contents"),
+            ("fs.apply_patch", "Edit a file by exact string replacement"),
+            ("shell.exec", "Run a shell command in the workspace"),
+            ("git.status", "Show git status"),
+            ("git.diff", "Show git diff"),
+        ]
+    }
+
+    /// Whether a tool is available (not disabled by the user).
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.contains(name)
     }
 
     pub fn openai_tools_schema(&self) -> Value {
@@ -117,6 +150,17 @@ impl ToolRegistry {
             tool_schema("git.status", "Git status", json!({"type":"object","properties":{}})),
             tool_schema("git.diff", "Git diff", json!({"type":"object","properties":{}})),
         ];
+        // Hide disabled tools from the model entirely.
+        let tools: Vec<Value> = tools
+            .into_iter()
+            .filter(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|n| self.is_enabled(n))
+                    .unwrap_or(true)
+            })
+            .collect();
         Value::Array(tools)
     }
 
@@ -128,6 +172,15 @@ impl ToolRegistry {
         approver: Option<&dyn ToolApprover>,
     ) -> Result<ToolResult, LocalCodeError> {
         info!(tool = %call.name, "tool execute");
+        // A disabled tool is refused even if the model tries to call it (e.g.
+        // from a stale schema or a pseudo tool-call).
+        if !self.is_enabled(&call.name) {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("Tool '{}' is disabled in LocalCode settings", call.name),
+            )
+            .with_hint("Enable it in Settings → tools if you want the agent to use it"));
+        }
         match call.name.as_str() {
             "fs.read" => {
                 let path = arg_path(call, workspace, "path")?;

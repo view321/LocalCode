@@ -75,6 +75,30 @@ impl McpManager {
         self.config.servers.len()
     }
 
+    /// `name → url|command` for each configured server, for display in Settings.
+    pub fn server_summaries(&self) -> Vec<String> {
+        self.config
+            .servers
+            .iter()
+            .map(|s| {
+                let target = s
+                    .url
+                    .clone()
+                    .or_else(|| {
+                        s.command.as_ref().map(|c| {
+                            if s.args.is_empty() {
+                                c.clone()
+                            } else {
+                                format!("{c} {}", s.args.join(" "))
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| "(no url/command)".into());
+                format!("{} → {}", s.name, target)
+            })
+            .collect()
+    }
+
     pub fn config_path(&self) -> &PathBuf {
         &self.config_path
     }

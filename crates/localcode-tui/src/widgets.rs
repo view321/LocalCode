@@ -7,14 +7,49 @@
 
 use localcode_backends::BackendKind;
 use localcode_core::error::LocalCodeError;
-use localcode_core::theme::ThemeToken;
+use localcode_core::theme::{Theme, ThemeToken};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme;
+
+/// A button "surrounded" by block-drawing caps instead of plain `[ ]`.
+///
+/// `active` (a primary action, or the selected button in a row) fills the pill
+/// with the accent colour; otherwise it renders as a light outline. The total
+/// width is always [`button_width`] regardless of `active`, so click regions
+/// computed from the label stay exact.
+pub fn button(th: &Theme, label: &str, active: bool) -> Vec<Span<'static>> {
+    let body = format!(" {label} ");
+    if active {
+        let accent = theme::color(th, ThemeToken::Accent);
+        let bg = theme::color(th, ThemeToken::Bg);
+        let cap = Style::default().fg(accent);
+        vec![
+            Span::styled("▐", cap),
+            Span::styled(body, Style::default().bg(accent).fg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled("▌", cap),
+        ]
+    } else {
+        let wall = theme::muted(th);
+        let text = Style::default().fg(theme::color(th, ThemeToken::Fg));
+        vec![
+            Span::styled("▏", wall),
+            Span::styled(body, text),
+            Span::styled("▕", wall),
+        ]
+    }
+}
+
+/// Display width of [`button`] for `label`: two caps + two padding spaces + the
+/// label itself.
+pub fn button_width(label: &str) -> u16 {
+    label.width() as u16 + 4
+}
 
 /// What a Confirm banner's "Confirm" button actually does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,24 +253,19 @@ pub fn draw_inline_banner(
     }
     f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), body_rect);
 
-    // Inline action words: `[ confirm ] [ cancel ]`.
+    // Inline pseudographic buttons; the selected one is filled, the rest outlined.
     let buttons = modal.buttons();
     let sel = modal.selected.min(buttons.len().saturating_sub(1));
     let mut spans: Vec<Span> = Vec::new();
     let mut hits: Vec<(Rect, usize)> = Vec::new();
     let mut x = inner.x;
     for (i, b) in buttons.iter().enumerate() {
-        let label = format!("[ {} ]", b.to_lowercase());
-        let w = label.chars().count() as u16;
-        let style = if i == sel {
-            theme::accent(th).add_modifier(Modifier::BOLD)
-        } else {
-            theme::muted(th)
-        };
+        let label = b.to_lowercase();
+        let w = button_width(&label);
         if x + w <= inner.x + inner.width {
             hits.push((Rect { x, y: button_y, width: w, height: 1 }, i));
         }
-        spans.push(Span::styled(label, style));
+        spans.extend(button(th, &label, i == sel));
         spans.push(Span::raw(" "));
         x = x.saturating_add(w + 1);
     }

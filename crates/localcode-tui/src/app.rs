@@ -18,7 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use localcode_agent::{AgentEvent, AgentSession, CodingAgent, ToolApprover};
+use localcode_agent::{AgentEvent, AgentSession, CodingAgent, Skill, SkillLoader, ToolApprover, ToolRegistry};
 use localcode_api_client::ApiClient;
 use localcode_assistant::{Assistant, AssistantRequest};
 use localcode_backends::{
@@ -87,6 +87,7 @@ impl Mode {
         match self {
             Mode::Chat => "message the agent…    / for commands",
             Mode::Models => "search models — type to filter, Enter to run",
+            Mode::Settings => "↑↓ move · Enter toggle/edit · or type to chat",
             _ => "type to chat, or / for commands",
         }
     }
@@ -133,8 +134,7 @@ pub struct ClickRegion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickTarget {
     // Status bar
-    ThemeDark,
-    ThemeLight,
+    Theme(ThemeMode),
     UpdateBadge,
     // Command list (shown while the omnibar starts with '/')
     CommandItem(usize),
@@ -167,6 +167,78 @@ pub enum ClickTarget {
     SetupDoctor,
     // Bench
     BenchRun,
+    // Settings — a row's action (toggle / edit / theme / reload / …)
+    Setting(SettingAction),
+}
+
+/// An editable free-text Settings field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingField {
+    SystemPrompt,
+    SkillsDir,
+    McpPath,
+    Workspace,
+}
+
+/// What activating a Settings row does. `Copy` so it can ride inside
+/// [`ClickTarget`]; index-carrying variants point into stable catalogs
+/// (`ToolRegistry::catalog()` / `App::skills`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingAction {
+    ThemeToggle,
+    ToggleMouse,
+    ToggleStream,
+    ToggleConfirmShell,
+    ToggleCloudFallback,
+    ToggleAgentsMd,
+    ToggleCheckUpdates,
+    ToggleTool(usize),
+    ToggleSkill(usize),
+    ReloadSkills,
+    Edit(SettingField),
+}
+
+/// How a Settings row renders. `Toggle` carries the current on/off state.
+#[derive(Debug, Clone)]
+pub enum SettingsRowKind {
+    Header,
+    Toggle(bool),
+    /// Editable free text (click to edit inline).
+    Text,
+    /// A one-shot action word, e.g. `[ reload ]`.
+    Action(&'static str),
+    /// Read-only informational row.
+    Info,
+}
+
+/// One row of the Settings view. Built by [`App::settings_rows`] and consumed by
+/// both the renderer and the keyboard/mouse handlers, so they never drift.
+#[derive(Debug, Clone)]
+pub struct SettingsRow {
+    pub label: String,
+    pub value: String,
+    pub kind: SettingsRowKind,
+    pub action: Option<SettingAction>,
+}
+
+impl SettingsRow {
+    fn header(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            value: String::new(),
+            kind: SettingsRowKind::Header,
+            action: None,
+        }
+    }
+
+    fn info(label: &str, value: impl Into<String>) -> Self {
+        Self {
+            label: label.to_string(),
+            value: value.into(),
+            kind: SettingsRowKind::Info,
+            action: None,
+        }
+    }
 }
 
 /// Memoized rendered model card — markdown is parsed once per model/theme,
@@ -254,11 +326,13 @@ pub enum BgMsg {
     },
     UpdateProgress(String),
     UpdateDone(Result<UpdateReport, LocalCodeError>),
-    /// A backend install: streamed output lines, then the terminal result.
+    /// A backend install: streamed output lines, then the terminal result. On
+    /// success `repoint` (Some for a fetched llama.cpp binary) points the
+    /// backend at the freshly-installed managed binary.
     InstallProgress(String),
     InstallDone {
         kind: BackendKind,
-        result: Result<(), LocalCodeError>,
+        result: Result<Option<Repoint>, LocalCodeError>,
     },
     /// A diagnosed repair: streamed output lines, then the terminal result. On
     /// success the `repoint` (if any) points the backend at the repaired install.
@@ -303,6 +377,10 @@ pub struct App {
     pub paths: AppPaths,
     pub config: Config,
     pub theme: Theme,
+    /// Whether the app is currently capturing the mouse. "Select mode" (F2 /
+    /// `/select`) flips this off so the terminal's own drag-to-select/copy
+    /// works; the run loop applies the change to the real terminal.
+    pub mouse_capture: bool,
     /// Which view fills the working area (Chat is home).
     pub mode: Mode,
     /// Clickable regions for the current frame, refilled every draw so the
@@ -390,6 +468,16 @@ pub struct App {
     pub coding_total_lines: usize,
     pub skill_count: usize,
     pub mcp_status_summary: String,
+    /// Skills discovered from the skills dir, for the Settings view.
+    pub skills: Vec<Skill>,
+    /// `name → target` for each configured MCP server, for the Settings view.
+    pub mcp_servers: Vec<String>,
+    // Settings view: selection over actionable rows, scroll, and inline editor.
+    pub settings_sel: usize,
+    pub settings_scroll: u16,
+    pub settings_view_height: u16,
+    settings_editing: Option<SettingField>,
+    settings_field_edit: String,
     // Bench
     pub last_bench_summary: String,
     pub last_bench_result: Option<localcode_bench::RunResult>,
@@ -438,6 +526,8 @@ impl App {
         } else {
             format!("{mcp_count} configured (not connected)")
         };
+        let skills = agent_probe.skills.list().to_vec();
+        let mcp_servers = agent_probe.mcp.server_summaries();
 
         let workspace = config
             .agent
@@ -451,6 +541,7 @@ impl App {
 
         let mut app = Self {
             theme: Theme::new(config.ui.theme),
+            mouse_capture: config.ui.mouse,
             paths,
             mode: Mode::Chat,
             click_regions: vec![],
@@ -522,6 +613,13 @@ impl App {
             coding_total_lines: 0,
             skill_count,
             mcp_status_summary,
+            skills,
+            mcp_servers,
+            settings_sel: 0,
+            settings_scroll: 0,
+            settings_view_height: 0,
+            settings_editing: None,
+            settings_field_edit: String::new(),
             last_bench_summary: "No runs yet.".into(),
             last_bench_result: None,
             events,
@@ -1279,7 +1377,7 @@ impl App {
             self.set_status("An install is already running (Esc to cancel)", false);
             return;
         }
-        match resolve_install_plan(kind) {
+        match resolve_install_plan(kind, &self.paths) {
             InstallPlan::Automated { display, .. } => {
                 let body = format!(
                     "LocalCode will run:\n\n{display}\n\n{}Esc cancels — nothing runs until you confirm.",
@@ -1325,9 +1423,9 @@ impl App {
                 }
             }
         });
+        let plan = resolve_install_plan(kind, &self.paths);
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
-            let plan = resolve_install_plan(kind);
             let result = run_install(&plan, ptx).await;
             let _ = tx.send(BgMsg::InstallDone { kind, result });
         });
@@ -2087,7 +2185,13 @@ impl App {
                     self.installing_kind = None;
                     self.install_progress_line.clear();
                     match result {
-                        Ok(()) => {
+                        Ok(repoint) => {
+                            // A fetched llama.cpp binary lives in a managed dir
+                            // (not on PATH): repoint config at it and rebuild the
+                            // registry so detect finds it.
+                            if let Some(rp) = repoint {
+                                self.apply_repoint(rp);
+                            }
                             self.set_status(
                                 format!("{} installed — re-detecting…", kind.as_str()),
                                 false,
@@ -2256,7 +2360,8 @@ impl App {
             ("/bench", "", "run the sample benchmark suite"),
             ("/setup", "", "first-run setup & doctor"),
             ("/settings", "", "preferences & config file"),
-            ("/theme", "", "toggle dark / light"),
+            ("/theme", "", "cycle dark / neon / pink"),
+            ("/select", "", "release mouse to select & copy text (F2)"),
             ("/chat", "", "back to the conversation"),
             ("/new", "", "start a new conversation"),
             ("/deploy", "", "deploy the selected model"),
@@ -2387,6 +2492,7 @@ impl App {
             }
             "settings" => self.set_mode(Mode::Settings),
             "theme" => self.toggle_theme(),
+            "select" => self.toggle_select_mode(),
             "chat" => self.set_mode(Mode::Chat),
             "new" => {
                 self.set_mode(Mode::Chat);
@@ -2439,21 +2545,396 @@ impl App {
         }
     }
 
-    /// Set the theme (used by the status-bar `dark / light` toggle).
+    /// Set the theme (used by the status-bar switcher and Settings).
     pub(crate) fn set_theme(&mut self, mode: ThemeMode) {
         self.config.ui.theme = mode;
         self.theme = Theme::new(mode);
-        self.set_status(format!("Theme: {:?}", mode), false);
+        self.set_status(format!("Theme: {}", mode.label()), false);
     }
 
-    /// `/theme` toggles between the two shipped grayscale themes.
+    /// `/theme` cycles through the shipped themes (dark → neon → pink).
     fn toggle_theme(&mut self) {
-        let next = if self.config.ui.theme == ThemeMode::Light {
-            ThemeMode::Dark
+        self.set_theme(self.config.ui.theme.next());
+    }
+
+    /// Toggle "select mode": release the mouse so the terminal's native
+    /// drag-to-select/copy works, or re-grab it for click interaction. Bound to
+    /// F2 and `/select`. Transient (not saved) — the run loop applies the change
+    /// to the real terminal; the persistent default lives in Settings → mouse.
+    pub(crate) fn toggle_select_mode(&mut self) {
+        self.mouse_capture = !self.mouse_capture;
+        if self.mouse_capture {
+            self.set_status("Mouse mode — click to interact", false);
         } else {
-            ThemeMode::Light
+            self.set_status(
+                "Select mode — drag to select & copy · F2 or /select to resume mouse",
+                false,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Settings (interactive: toggles, inline text edits, skill/tool/MCP config)
+    // ------------------------------------------------------------------
+
+    /// The Settings view as an ordered list of rows. Single source of truth for
+    /// the renderer and the keyboard/mouse handlers.
+    pub fn settings_rows(&self) -> Vec<SettingsRow> {
+        let toggle = |label: &str, on: bool, action: SettingAction| SettingsRow {
+            label: label.to_string(),
+            value: if on { "on".into() } else { "off".into() },
+            kind: SettingsRowKind::Toggle(on),
+            action: Some(action),
         };
-        self.set_theme(next);
+        let text = |label: &str, value: String, field: SettingField| SettingsRow {
+            label: label.to_string(),
+            value,
+            kind: SettingsRowKind::Text,
+            action: Some(SettingAction::Edit(field)),
+        };
+        let mut r = Vec::new();
+
+        // General.
+        r.push(SettingsRow::header("general"));
+        r.push(SettingsRow {
+            label: "theme".into(),
+            value: self.config.ui.theme.label().to_string(),
+            kind: SettingsRowKind::Action("cycle"),
+            action: Some(SettingAction::ThemeToggle),
+        });
+        r.push(SettingsRow {
+            label: "mouse".into(),
+            value: if self.config.ui.mouse {
+                "on — click to interact".into()
+            } else {
+                "off — drag to select & copy text".into()
+            },
+            kind: SettingsRowKind::Toggle(self.config.ui.mouse),
+            action: Some(SettingAction::ToggleMouse),
+        });
+        r.push(toggle("token streaming", self.config.agent.stream, SettingAction::ToggleStream));
+        r.push(toggle(
+            "confirm shell",
+            self.config.agent.confirm_destructive_tools,
+            SettingAction::ToggleConfirmShell,
+        ));
+        r.push(toggle(
+            "cloud fallback",
+            self.config.agent.allow_cloud_fallback,
+            SettingAction::ToggleCloudFallback,
+        ));
+        r.push(toggle(
+            "check updates",
+            self.config.updates.check_on_startup,
+            SettingAction::ToggleCheckUpdates,
+        ));
+
+        // Agent: system prompt, AGENTS.md, workspace.
+        r.push(SettingsRow::header("agent — prompt & project context"));
+        let sp = self.config.agent.system_prompt.as_deref().unwrap_or("");
+        let sp_val = if sp.trim().is_empty() {
+            "(built-in default) — click to customize".to_string()
+        } else {
+            compact_ws(sp)
+        };
+        r.push(text("system prompt", sp_val, SettingField::SystemPrompt));
+        let agents_here = self.workspace_path().join("AGENTS.md").exists();
+        r.push(SettingsRow {
+            label: "use AGENTS.md".into(),
+            value: format!(
+                "{} · {}",
+                if self.config.agent.use_agents_md { "on" } else { "off" },
+                if agents_here { "found in workspace" } else { "none in workspace" },
+            ),
+            kind: SettingsRowKind::Toggle(self.config.agent.use_agents_md),
+            action: Some(SettingAction::ToggleAgentsMd),
+        });
+        let ws = self
+            .config
+            .agent
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| self.workspace_path().display().to_string());
+        r.push(text("workspace", ws, SettingField::Workspace));
+
+        // Tools.
+        r.push(SettingsRow::header("tools — what the agent may call"));
+        for (i, (name, desc)) in ToolRegistry::catalog().iter().enumerate() {
+            let enabled = !self.config.agent.disabled_tools.iter().any(|t| t == name);
+            r.push(SettingsRow {
+                label: (*name).to_string(),
+                value: (*desc).to_string(),
+                kind: SettingsRowKind::Toggle(enabled),
+                action: Some(SettingAction::ToggleTool(i)),
+            });
+        }
+
+        // Skills.
+        r.push(SettingsRow::header("skills"));
+        let sd = self
+            .config
+            .agent
+            .skills_dir
+            .clone()
+            .unwrap_or_else(|| ".localcode/skills".into());
+        r.push(text("skills dir", sd, SettingField::SkillsDir));
+        r.push(SettingsRow {
+            label: "reload skills".into(),
+            value: format!("{} discovered", self.skills.len()),
+            kind: SettingsRowKind::Action("reload"),
+            action: Some(SettingAction::ReloadSkills),
+        });
+        for (i, sk) in self.skills.iter().enumerate() {
+            let enabled = !self.config.agent.disabled_skills.iter().any(|d| d == &sk.name);
+            r.push(SettingsRow {
+                label: sk.name.clone(),
+                value: compact_ws(&sk.description),
+                kind: SettingsRowKind::Toggle(enabled),
+                action: Some(SettingAction::ToggleSkill(i)),
+            });
+        }
+
+        // MCP servers.
+        r.push(SettingsRow::header("mcp servers"));
+        let mp = self
+            .config
+            .agent
+            .mcp_config
+            .clone()
+            .unwrap_or_else(|| ".localcode/mcp.json".into());
+        r.push(text("mcp config", mp, SettingField::McpPath));
+        if self.mcp_servers.is_empty() {
+            r.push(SettingsRow::info("", "no servers — add them to the mcp.json above"));
+        } else {
+            for s in &self.mcp_servers {
+                r.push(SettingsRow::info("server", s.clone()));
+            }
+        }
+
+        // Config file / env.
+        r.push(SettingsRow::header("config"));
+        r.push(SettingsRow::info(
+            "config file",
+            self.paths.config_file().display().to_string(),
+        ));
+        r.push(SettingsRow::info(
+            "",
+            "toggles & edits save immediately · Ctrl+S also saves",
+        ));
+        r.push(SettingsRow::info(
+            "env overrides",
+            "LOCALCODE_API_URL · LOCALCODE_HF_ENDPOINT · HF_TOKEN · OPENROUTER_API_KEY",
+        ));
+        r
+    }
+
+    /// `(flat row index, action)` for every actionable Settings row, in order.
+    fn settings_actionable(&self) -> Vec<(usize, SettingAction)> {
+        self.settings_rows()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.action.map(|a| (i, a)))
+            .collect()
+    }
+
+    /// Is `field` the one currently being edited inline?
+    pub fn settings_editing_field(&self) -> Option<SettingField> {
+        self.settings_editing
+    }
+
+    /// The inline edit buffer (rendered with a caret while editing).
+    pub fn settings_edit_buffer(&self) -> &str {
+        &self.settings_field_edit
+    }
+
+    fn settings_move(&mut self, delta: i32) {
+        let n = self.settings_actionable().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.settings_sel.min(n - 1) as i32;
+        self.settings_sel = (cur + delta).clamp(0, n as i32 - 1) as usize;
+        self.settings_ensure_visible();
+    }
+
+    /// Scroll so the selected actionable row stays on screen.
+    fn settings_ensure_visible(&mut self) {
+        let Some((flat, _)) = self.settings_actionable().get(self.settings_sel).copied() else {
+            return;
+        };
+        let vh = self.settings_view_height.max(1) as usize;
+        let scroll = self.settings_scroll as usize;
+        if flat < scroll {
+            self.settings_scroll = flat as u16;
+        } else if flat >= scroll + vh {
+            self.settings_scroll = (flat + 1 - vh) as u16;
+        }
+    }
+
+    fn activate_selected_setting(&mut self) {
+        if let Some((_, action)) = self.settings_actionable().get(self.settings_sel).copied() {
+            self.activate_setting(action);
+        }
+    }
+
+    /// Run a Settings row's action. Toggles/reloads persist immediately; text
+    /// edits open the inline editor and persist on commit.
+    fn activate_setting(&mut self, action: SettingAction) {
+        // Move the keyboard selection to the activated row for visual feedback.
+        if let Some(idx) = self
+            .settings_actionable()
+            .iter()
+            .position(|(_, a)| *a == action)
+        {
+            self.settings_sel = idx;
+        }
+        match action {
+            SettingAction::ThemeToggle => self.toggle_theme(),
+            SettingAction::ToggleMouse => {
+                self.config.ui.mouse = !self.config.ui.mouse;
+                self.mouse_capture = self.config.ui.mouse;
+            }
+            SettingAction::ToggleStream => {
+                self.config.agent.stream = !self.config.agent.stream;
+            }
+            SettingAction::ToggleConfirmShell => {
+                self.config.agent.confirm_destructive_tools =
+                    !self.config.agent.confirm_destructive_tools;
+            }
+            SettingAction::ToggleCloudFallback => {
+                self.config.agent.allow_cloud_fallback = !self.config.agent.allow_cloud_fallback;
+            }
+            SettingAction::ToggleAgentsMd => {
+                self.config.agent.use_agents_md = !self.config.agent.use_agents_md;
+            }
+            SettingAction::ToggleCheckUpdates => {
+                self.config.updates.check_on_startup = !self.config.updates.check_on_startup;
+            }
+            SettingAction::ToggleTool(i) => self.toggle_tool(i),
+            SettingAction::ToggleSkill(i) => self.toggle_skill(i),
+            SettingAction::ReloadSkills => {
+                self.reload_skills_list();
+                self.set_status(format!("Reloaded skills — {} found", self.skills.len()), false);
+            }
+            SettingAction::Edit(field) => {
+                self.begin_settings_edit(field);
+                return; // editor persists on commit, not now
+            }
+        }
+        if let Err(e) = self.config.save(&self.paths) {
+            self.raise_error(e);
+        }
+    }
+
+    fn toggle_tool(&mut self, i: usize) {
+        let Some((name, _)) = ToolRegistry::catalog().get(i) else {
+            return;
+        };
+        let name = name.to_string();
+        if let Some(pos) = self.config.agent.disabled_tools.iter().position(|t| *t == name) {
+            self.config.agent.disabled_tools.remove(pos);
+            self.set_status(format!("Enabled tool {name}"), false);
+        } else {
+            self.config.agent.disabled_tools.push(name.clone());
+            self.set_status(format!("Disabled tool {name}"), false);
+        }
+    }
+
+    fn toggle_skill(&mut self, i: usize) {
+        let Some(name) = self.skills.get(i).map(|s| s.name.clone()) else {
+            return;
+        };
+        if let Some(pos) = self.config.agent.disabled_skills.iter().position(|s| *s == name) {
+            self.config.agent.disabled_skills.remove(pos);
+            self.set_status(format!("Enabled skill {name}"), false);
+        } else {
+            self.config.agent.disabled_skills.push(name.clone());
+            self.set_status(format!("Disabled skill {name}"), false);
+        }
+        self.refresh_agent_summaries();
+    }
+
+    fn begin_settings_edit(&mut self, field: SettingField) {
+        self.settings_field_edit = match field {
+            SettingField::SystemPrompt => {
+                self.config.agent.system_prompt.clone().unwrap_or_default()
+            }
+            SettingField::SkillsDir => self.config.agent.skills_dir.clone().unwrap_or_default(),
+            SettingField::McpPath => self.config.agent.mcp_config.clone().unwrap_or_default(),
+            SettingField::Workspace => self.config.agent.workspace_root.clone().unwrap_or_default(),
+        };
+        self.settings_editing = Some(field);
+        self.set_status("Editing — type a value, ↵ save, Esc cancel", false);
+    }
+
+    /// Key handling while a Settings text field is being edited inline.
+    fn handle_settings_field_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.commit_settings_field(),
+            KeyCode::Esc => {
+                self.settings_editing = None;
+                self.set_status("Edit cancelled", false);
+            }
+            KeyCode::Backspace => {
+                self.settings_field_edit.pop();
+            }
+            KeyCode::Char(c) => self.settings_field_edit.push(c),
+            _ => {}
+        }
+    }
+
+    fn commit_settings_field(&mut self) {
+        let Some(field) = self.settings_editing.take() else {
+            return;
+        };
+        let raw = self.settings_field_edit.trim().to_string();
+        let opt = if raw.is_empty() { None } else { Some(raw) };
+        match field {
+            SettingField::SystemPrompt => self.config.agent.system_prompt = opt,
+            SettingField::SkillsDir => {
+                self.config.agent.skills_dir = opt;
+                self.reload_skills_list();
+            }
+            SettingField::McpPath => self.config.agent.mcp_config = opt,
+            SettingField::Workspace => self.config.agent.workspace_root = opt,
+        }
+        self.refresh_agent_summaries();
+        match self.config.save(&self.paths) {
+            Ok(()) => self.set_status("Saved", false),
+            Err(e) => self.raise_error(e),
+        }
+    }
+
+    /// Rebuild the discovered-skills list from the configured skills dir.
+    fn reload_skills_list(&mut self) {
+        let dir = self
+            .config
+            .agent
+            .skills_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".localcode/skills"));
+        self.skills = SkillLoader::new(dir).list().to_vec();
+        self.refresh_agent_summaries();
+    }
+
+    /// Recompute the cached skill/MCP summaries from current config (after an
+    /// edit that changes skills dir, mcp path, or disabled lists).
+    fn refresh_agent_summaries(&mut self) {
+        let probe = CodingAgent::new(self.config.agent.clone());
+        self.skills = probe.skills.list().to_vec();
+        self.mcp_servers = probe.mcp.server_summaries();
+        let mcp_count = probe.mcp.configured_count();
+        self.mcp_status_summary = if mcp_count == 0 {
+            "none configured".into()
+        } else {
+            format!("{mcp_count} configured (not connected)")
+        };
+        self.skill_count = self
+            .skills
+            .iter()
+            .filter(|s| !self.config.agent.disabled_skills.iter().any(|d| d == &s.name))
+            .count();
     }
 
     // ------------------------------------------------------------------
@@ -2546,6 +3027,13 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
+        // Global: toggle "select mode". Releasing the mouse lets the terminal
+        // select/copy text; works in every mode, even over a modal or prompt.
+        if key.code == KeyCode::F(2) {
+            self.toggle_select_mode();
+            return;
+        }
+
         // Global chords.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -2611,6 +3099,12 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
+        // An in-place settings field edit captures input.
+        if self.mode == Mode::Settings && self.settings_editing.is_some() {
+            self.handle_settings_field_key(key);
+            return;
+        }
+
         // Esc: cancel a running task; else leave a non-chat mode / clear input.
         if key.code == KeyCode::Esc {
             if self.fg_busy()
@@ -2629,9 +3123,22 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
-        // Enter: run command / search / submit a prompt / mode primary action.
+        // Enter submits; Shift+Enter / Alt+Enter insert a newline so the omnibar
+        // is a real multi-line composer.
         if key.code == KeyCode::Enter {
-            self.omnibar_submit();
+            if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                self.omnibar_insert_newline();
+            } else {
+                self.omnibar_submit();
+            }
+            return;
+        }
+
+        // In a multi-line composer, Up/Down move the caret between its lines
+        // before falling back to history / list navigation.
+        if self.coding_input.contains('\n') && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+            self.omnibar_cursor_vertical(delta);
             return;
         }
 
@@ -2663,8 +3170,8 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 self.coding_cursor =
                     (self.coding_cursor + 1).min(self.coding_input.chars().count());
             }
-            KeyCode::Home => self.coding_cursor = 0,
-            KeyCode::End => self.coding_cursor = self.coding_input.chars().count(),
+            KeyCode::Home => self.coding_cursor = self.line_start_index(),
+            KeyCode::End => self.coding_cursor = self.line_end_index(),
             KeyCode::Backspace => {
                 if self.coding_cursor > 0 {
                     let idx = char_to_byte(&self.coding_input, self.coding_cursor - 1);
@@ -2688,6 +3195,62 @@ to select, click deploy. Remote: click a field to edit, then connect."
             }
             _ => {}
         }
+    }
+
+    /// Insert a newline at the caret (Shift/Alt+Enter) — makes the omnibar a
+    /// multi-line composer.
+    fn omnibar_insert_newline(&mut self) {
+        let idx = char_to_byte(&self.coding_input, self.coding_cursor);
+        self.coding_input.insert(idx, '\n');
+        self.coding_cursor += 1;
+        self.coding_hist_idx = None;
+    }
+
+    /// `(line, column)` of the caret within the multi-line composer.
+    pub fn omnibar_cursor_line_col(&self) -> (usize, usize) {
+        let cur = self.coding_cursor.min(self.coding_input.chars().count());
+        let mut line = 0usize;
+        let mut col = 0usize;
+        for c in self.coding_input.chars().take(cur) {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Char index of the given `(line, column)` within the composer, clamping
+    /// the column to that line's length.
+    fn line_col_to_index(&self, line: usize, col: usize) -> usize {
+        let lines: Vec<&str> = self.coding_input.split('\n').collect();
+        let line = line.min(lines.len().saturating_sub(1));
+        let mut idx = 0usize;
+        for l in &lines[..line] {
+            idx += l.chars().count() + 1; // +1 for the '\n'
+        }
+        idx + col.min(lines[line].chars().count())
+    }
+
+    fn line_start_index(&self) -> usize {
+        let (line, _) = self.omnibar_cursor_line_col();
+        self.line_col_to_index(line, 0)
+    }
+
+    fn line_end_index(&self) -> usize {
+        let (line, _) = self.omnibar_cursor_line_col();
+        self.line_col_to_index(line, usize::MAX)
+    }
+
+    /// Move the caret one composer line up (`-1`) or down (`+1`), keeping the
+    /// column where possible.
+    fn omnibar_cursor_vertical(&mut self, delta: i32) {
+        let (line, col) = self.omnibar_cursor_line_col();
+        let n = self.coding_input.split('\n').count();
+        let target = (line as i32 + delta).clamp(0, n.saturating_sub(1) as i32) as usize;
+        self.coding_cursor = self.line_col_to_index(target, col);
     }
 
     fn history_prev(&mut self) {
@@ -2730,6 +3293,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.remote_editing = false;
+        self.settings_editing = None;
     }
 
     /// Selection / scroll keys for the active mode (arrows, page keys, Tab).
@@ -2794,7 +3358,18 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 }
                 _ => {}
             },
-            Mode::Bench | Mode::Settings => {}
+            Mode::Settings => match code {
+                KeyCode::Down | KeyCode::Tab => self.settings_move(1),
+                KeyCode::Up | KeyCode::BackTab => self.settings_move(-1),
+                KeyCode::PageDown => {
+                    self.settings_scroll = self.settings_scroll.saturating_add(6);
+                }
+                KeyCode::PageUp => {
+                    self.settings_scroll = self.settings_scroll.saturating_sub(6);
+                }
+                _ => {}
+            },
+            Mode::Bench => {}
         }
     }
 
@@ -2825,6 +3400,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 let kind = BACKEND_ORDER[self.backend_sel.min(BACKEND_ORDER.len() - 1)];
                 self.start_install(kind);
             }
+            Mode::Settings => self.activate_selected_setting(),
             _ => {}
         }
     }
@@ -2984,8 +3560,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
         let rel_row = row.saturating_sub(region.rect.y) as usize;
         match region.target {
             // Status bar.
-            ClickTarget::ThemeDark => self.set_theme(ThemeMode::Dark),
-            ClickTarget::ThemeLight => self.set_theme(ThemeMode::Light),
+            ClickTarget::Theme(m) => self.set_theme(m),
             ClickTarget::UpdateBadge => {
                 if self.update_available.is_some() {
                     self.open_update_modal();
@@ -3067,6 +3642,8 @@ to select, click deploy. Remote: click a field to edit, then connect."
             ClickTarget::SetupDoctor => self.start_doctor(),
             // Bench.
             ClickTarget::BenchRun => self.start_bench(),
+            // Settings — toggle / edit / theme / reload.
+            ClickTarget::Setting(action) => self.activate_setting(action),
             // Handled above.
             ClickTarget::ModalButton(_) | ClickTarget::CommandItem(_) => {}
         }
@@ -3124,6 +3701,9 @@ to select, click deploy. Remote: click a field to edit, then connect."
             Mode::Models => self.scroll_card(delta),
             Mode::Setup => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
+            }
+            Mode::Settings => {
+                self.settings_scroll = (i64::from(self.settings_scroll) + delta).max(0) as u16;
             }
             _ => {}
         }
@@ -3183,6 +3763,12 @@ fn install_caveat(kind: BackendKind) -> String {
     }
 }
 
+/// Collapse all runs of whitespace (incl. newlines) to single spaces, so a
+/// multi-line value renders on one Settings row.
+fn compact_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Byte index of the `char_idx`-th char (== s.len() when at the end).
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
@@ -3223,9 +3809,9 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    if mouse_enabled {
-        execute!(terminal.backend_mut(), DisableMouseCapture).ok();
-    }
+    // Always release the mouse — select mode may have toggled capture at
+    // runtime, so the startup flag no longer reflects the live state.
+    execute!(terminal.backend_mut(), DisableMouseCapture).ok();
     terminal.show_cursor().ok();
     result
 }
@@ -3234,9 +3820,23 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<(), LocalCodeError> {
+    let mut mouse_on = app.mouse_capture;
     loop {
         app.process_events().await;
         app.process_bg();
+
+        // Apply a pending mouse-capture change. "Select mode" (F2 / `/select`)
+        // releases the mouse so the terminal can drag-select/copy text; the
+        // Settings toggle sets the persistent default.
+        if app.mouse_capture != mouse_on {
+            let _ = if app.mouse_capture {
+                execute!(terminal.backend_mut(), EnableMouseCapture)
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)
+            };
+            mouse_on = app.mouse_capture;
+        }
+
         terminal
             .draw(|f| ui::draw(f, app))
             .map_err(LocalCodeError::from)?;
@@ -3326,6 +3926,60 @@ mod tests {
         typ(&mut app, "/theme");
         app.handle_key(key(KeyCode::Enter));
         assert_ne!(app.config.ui.theme, before);
+    }
+
+    #[test]
+    fn theme_cycle_visits_neon_variants() {
+        let mut app = test_app();
+        app.set_theme(ThemeMode::Dark);
+        app.toggle_theme();
+        assert_eq!(app.config.ui.theme, ThemeMode::Neon);
+        app.toggle_theme();
+        assert_eq!(app.config.ui.theme, ThemeMode::NeonPink);
+        app.toggle_theme();
+        assert_eq!(app.config.ui.theme, ThemeMode::Dark);
+    }
+
+    #[test]
+    fn selected_row_paints_a_highlight_bar() {
+        use localcode_core::theme::ThemeToken;
+        use ratatui::style::Color;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app();
+        app.set_theme(ThemeMode::Neon);
+        app.mode = Mode::Backends;
+        app.backend_sel = 1;
+        let mut terminal = Terminal::new(TestBackend::new(84, 20)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let sel_bg = {
+            let (r, g, b) = app.theme.token_rgb(ThemeToken::SelBg);
+            Color::Rgb(r, g, b)
+        };
+        let wide = |y: u16| (0..84).filter(|&x| buf[(x, y)].bg == sel_bg).count() > 20;
+        // Exactly one row (the selected backend) shows a wide selection bar —
+        // not zero (the old bold-only selection) and not the whole screen.
+        let highlighted = (0..20).filter(|&y| wide(y)).count();
+        assert_eq!(highlighted, 1, "exactly the selected row is highlighted");
+    }
+
+    #[test]
+    fn f2_toggles_select_mode_releasing_and_regrabbing_the_mouse() {
+        let mut app = test_app();
+        assert!(app.mouse_capture, "the mouse is captured by default");
+        app.handle_key(key(KeyCode::F(2)));
+        assert!(!app.mouse_capture, "F2 releases the mouse so text is selectable");
+        app.handle_key(key(KeyCode::F(2)));
+        assert!(app.mouse_capture, "F2 again re-grabs the mouse");
+    }
+
+    #[test]
+    fn settings_mouse_toggle_persists_and_syncs_live_state() {
+        let mut app = test_app();
+        let before = app.config.ui.mouse;
+        app.activate_setting(SettingAction::ToggleMouse);
+        assert_eq!(app.config.ui.mouse, !before, "the persistent preference flips");
+        assert_eq!(app.mouse_capture, app.config.ui.mouse, "live capture tracks the setting");
     }
 
     #[test]
@@ -3530,5 +4184,109 @@ mod tests {
         // Esc cancels and drops the (zeroized) buffer.
         app.handle_sudo_key(key(KeyCode::Esc));
         assert!(app.sudo_prompt().is_none());
+    }
+
+    #[test]
+    fn shift_enter_makes_a_multiline_composer_and_hint_bar_is_last() {
+        let mut app = test_app();
+        typ(&mut app, "first");
+        // Shift+Enter inserts a newline instead of submitting.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        typ(&mut app, "second");
+        assert_eq!(app.coding_input, "first\nsecond");
+
+        let screen = render_to_string(&mut app, 100, 30);
+        assert!(screen.contains("first") && screen.contains("second"));
+        // A hint bar sits below the omnibar (so the ❯ input row is not last) and
+        // advertises Shift+Enter for a newline.
+        let rows: Vec<&str> = screen.lines().collect();
+        let last = rows.iter().rev().find(|r| !r.trim().is_empty()).unwrap();
+        assert!(last.contains("newline") || last.contains("commands"), "last: {last:?}");
+        assert!(!last.contains('❯'), "the input row must not be the terminal's last line");
+    }
+
+    #[test]
+    fn settings_toggle_tool_and_edit_system_prompt_persist() {
+        let mut app = test_app();
+        typ(&mut app, "/settings");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Settings);
+
+        // Toggle the shell.exec tool off via its row action.
+        let toggle = app
+            .settings_rows()
+            .into_iter()
+            .find_map(|r| match r.action {
+                Some(SettingAction::ToggleTool(i)) if r.label == "shell.exec" => {
+                    Some(SettingAction::ToggleTool(i))
+                }
+                _ => None,
+            })
+            .expect("a shell.exec tool row");
+        app.activate_setting(toggle);
+        assert!(app.config.agent.disabled_tools.iter().any(|t| t == "shell.exec"));
+
+        // Edit the system prompt inline: begin, type, commit.
+        app.activate_setting(SettingAction::Edit(SettingField::SystemPrompt));
+        assert!(app.settings_editing_field().is_some());
+        typ(&mut app, "Be terse.");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.config.agent.system_prompt.as_deref(), Some("Be terse."));
+        assert!(app.settings_editing_field().is_none());
+    }
+
+    #[test]
+    fn model_card_renders_full_wrapped_body_with_controls() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        let long = "This model is a code-specialised transformer. ".repeat(20);
+        app.model_detail = Some(ModelDetail {
+            summary: ModelSummary {
+                id: "acme/coder-7b".into(),
+                author: None,
+                pipeline_tag: Some("text-generation".into()),
+                tags: vec![],
+                likes: Some(10),
+                downloads: Some(1234),
+                last_modified: None,
+                private: None,
+                gated: None,
+            },
+            siblings: vec![],
+            card_data: None,
+            sha: None,
+            card_markdown: Some(format!("# Coder 7B\n\n{long}\n\n## Usage\nUse it well.")),
+            license: Some("apache-2.0".into()),
+            parameter_size: Some("7B".into()),
+            quants: vec![],
+        });
+        let screen = render_to_string(&mut app, 100, 40);
+        // The full card renders under a "model card" header (wrapped, not a
+        // single runaway line), with the controls block still above it.
+        assert!(screen.contains("model card"));
+        assert!(screen.contains("Coder 7B"));
+        assert!(screen.contains("code-specialised transformer"));
+        assert!(screen.contains("acme/coder-7b"));
+        // The deploy button now renders as a pseudographic pill, not `[ deploy ]`.
+        assert!(screen.contains("▐ deploy ▌"));
+    }
+
+    #[test]
+    fn settings_expose_skills_agents_md_mcp_and_prompt() {
+        let mut app = test_app();
+        app.mode = Mode::Settings;
+        let rows = app.settings_rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        for expected in ["system prompt", "use AGENTS.md", "skills dir", "mcp config"] {
+            assert!(labels.contains(&expected), "missing settings row: {expected}");
+        }
+        // The bundled sample skill shows up as an enable/disable toggle.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, SettingsRowKind::Toggle(_)) && r.label.contains("localcode-doctor")));
+        // Every built-in tool is listed as a toggle.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, SettingsRowKind::Toggle(_)) && r.label == "fs.read"));
     }
 }

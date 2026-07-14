@@ -6,10 +6,10 @@
 //! and confirms/errors are inline banners. Two grayscale themes; the only
 //! animated glyph is the braille spinner, shown only while busy.
 
-use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode};
+use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode, SettingAction, SettingsRowKind};
 use crate::markdown;
 use crate::theme;
-use crate::widgets::{banner_height, draw_inline_banner};
+use crate::widgets::{banner_height, button, button_width, draw_inline_banner};
 use localcode_core::runtime::RuntimeStatus;
 use localcode_core::theme::{ThemeMode, ThemeToken};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -104,6 +104,30 @@ fn pad(area: Rect) -> Rect {
     }
 }
 
+/// Build a row `Line` that, when `selected`, gets a full-width selection bar:
+/// the highlight background patches behind every span (per-span `fg` shows
+/// through) and a trailing pad extends the bar to `width`. Use this for rows
+/// that live inside a multi-line `Paragraph`, where a per-widget `.style()`
+/// can't target a single row.
+fn sel_line(
+    th: &localcode_core::Theme,
+    mut spans: Vec<Span<'static>>,
+    width: u16,
+    selected: bool,
+) -> Line<'static> {
+    if selected {
+        let sel = theme::selected(th);
+        for s in spans.iter_mut() {
+            s.style = sel.patch(s.style);
+        }
+        let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
+        if used < width {
+            spans.push(Span::styled(" ".repeat((width - used) as usize), sel));
+        }
+    }
+    Line::from(spans)
+}
+
 // ---------------------------------------------------------------------------
 // Top-level draw
 // ---------------------------------------------------------------------------
@@ -125,14 +149,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Status (1) · rule (1) · working area (min) · omnibar (2: top rule + input).
+    // The omnibar is a multi-line composer: its height grows with the input
+    // (capped by ui.composer_rows and the available height). A one-line hint bar
+    // sits *below* it so the input row is never the terminal's very last line.
+    let cap = app.config.ui.composer_rows.clamp(1, 10);
+    let max_by_area = area.height.saturating_sub(6).max(1);
+    let composer_h = (app.coding_input.split('\n').count().max(1) as u16)
+        .min(cap)
+        .min(max_by_area)
+        .max(1);
+
+    // Status (1) · rule (1) · working area (min) · omnibar (rule + composer) ·
+    // hint bar (1).
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(1 + composer_h),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -146,6 +182,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_working_area(f, main[2], app);
     draw_omnibar(f, main[3], app);
+    draw_hint_bar(f, main[4], app);
 }
 
 /// The working area: an inline banner (if any) at the top, the command list
@@ -237,7 +274,8 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(Paragraph::new(Line::from(left)), inner);
 
-    // Right cluster: version/update · dark / light.
+    // Right cluster: version/update · <theme switcher>. The switcher lists every
+    // selectable theme; the active one is accented, and each is clickable.
     let (ver_text, ver_style, is_update) = if let Some(v) = &app.update_installed {
         (format!("v{v} — restart"), theme::muted(&th), false)
     } else if let Some(info) = &app.update_available {
@@ -245,24 +283,19 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         (format!("v{}", env!("CARGO_PKG_VERSION")), theme::muted(&th), false)
     };
-    let dark_style = if th.mode == ThemeMode::Dark {
-        theme::accent(&th)
-    } else {
-        theme::muted(&th)
-    };
-    let light_style = if th.mode == ThemeMode::Light {
-        theme::accent(&th)
-    } else {
-        theme::muted(&th)
-    };
-    let right: Vec<Span> = vec![
-        Span::styled(ver_text.clone(), ver_style),
-        sep(&th),
-        Span::styled("dark", dark_style),
-        Span::styled(" / ", theme::faint(&th)),
-        Span::styled("light", light_style),
-        Span::raw(" "),
-    ];
+    let mut right: Vec<Span> = vec![Span::styled(ver_text.clone(), ver_style), sep(&th)];
+    for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
+        if i > 0 {
+            right.push(Span::styled(" · ", theme::faint(&th)));
+        }
+        let style = if th.mode == *m {
+            theme::accent(&th).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted(&th)
+        };
+        right.push(Span::styled(m.label(), style));
+    }
+    right.push(Span::raw(" "));
     let rw = spans_width(&right);
     if inner.width > rw + 8 {
         let rx = inner.x + inner.width - rw;
@@ -270,16 +303,21 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
             Paragraph::new(Line::from(right)),
             Rect { x: rx, y: inner.y, width: rw, height: 1 },
         );
-        // Click regions for version badge + theme toggle.
+        // Click regions: version badge, then one per switcher theme.
         let mut cx = rx;
         let ver_w = ver_text.width() as u16;
         if is_update {
             click(app, Rect { x: cx, y: inner.y, width: ver_w, height: 1 }, ClickTarget::UpdateBadge);
         }
         cx += ver_w + sep(&th).width() as u16;
-        click(app, Rect { x: cx, y: inner.y, width: 4, height: 1 }, ClickTarget::ThemeDark);
-        cx += 4 + 3; // "dark" + " / "
-        click(app, Rect { x: cx, y: inner.y, width: 5, height: 1 }, ClickTarget::ThemeLight);
+        for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
+            if i > 0 {
+                cx += 3; // " · "
+            }
+            let lw = m.label().width() as u16;
+            click(app, Rect { x: cx, y: inner.y, width: lw, height: 1 }, ClickTarget::Theme(*m));
+            cx += lw;
+        }
     }
 }
 
@@ -323,50 +361,118 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let commanding = app.slash_active();
-    let mut spans: Vec<Span> = Vec::new();
-    if !commanding && app.mode != Mode::Chat {
-        spans.push(Span::styled(format!("[{}] ", app.mode.tag()), theme::muted(&th)));
-    }
-    spans.push(Span::styled("❯ ", theme::muted(&th)));
 
+    // First-row prefix: an optional [mode] tag then the prompt caret.
+    let mut prefix: Vec<Span> = Vec::new();
+    if !commanding && app.mode != Mode::Chat {
+        prefix.push(Span::styled(format!("[{}] ", app.mode.tag()), theme::muted(&th)));
+    }
+    prefix.push(Span::styled("❯ ", theme::muted(&th)));
+    let prefix_w: usize = prefix.iter().map(|s| s.width()).sum();
+
+    // Empty: show the placeholder on the first row.
     if app.coding_input.is_empty() {
+        let mut spans = prefix;
         let placeholder = if commanding {
             "run a command — ↵ to execute, Esc to cancel"
         } else {
             app.mode.placeholder()
         };
         spans.push(Span::styled(placeholder, theme::faint(&th)));
-    } else {
-        let chars: Vec<char> = app.coding_input.chars().collect();
-        let cur = app.coding_cursor.min(chars.len());
-        let before: String = chars[..cur].iter().collect();
-        let at: String = chars.get(cur).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
-        let after: String = if cur < chars.len() {
-            chars[cur + 1..].iter().collect()
-        } else {
-            String::new()
-        };
-        spans.push(Span::styled(before, fg(&th)));
-        spans.push(Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)));
-        spans.push(Span::styled(after, fg(&th)));
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+        return;
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), row);
 
-    // Right-aligned hint.
-    let hint = if commanding {
-        "↵ run"
-    } else if app.mode == Mode::Models {
-        "search"
+    // Multi-line composer: render a window of `composer_h` lines that keeps the
+    // caret visible, highlighting the caret cell on its line.
+    let composer_h = area.height.saturating_sub(1).max(1) as usize;
+    let lines: Vec<&str> = app.coding_input.split('\n').collect();
+    let (cur_line, cur_col) = app.omnibar_cursor_line_col();
+    let start = if cur_line >= composer_h {
+        cur_line + 1 - composer_h
     } else {
-        "/ commands"
+        0
     };
-    let hw = hint.width() as u16;
-    if row.width > hw + 2 {
+    for (vi, li) in (start..lines.len()).take(composer_h).enumerate() {
+        let y = row.y + vi as u16;
+        let mut spans: Vec<Span> = Vec::new();
+        if li == 0 {
+            spans.extend(prefix.iter().cloned());
+        } else {
+            spans.push(Span::raw(" ".repeat(prefix_w)));
+        }
+        if li == cur_line {
+            let chars: Vec<char> = lines[li].chars().collect();
+            let cc = cur_col.min(chars.len());
+            let before: String = chars[..cc].iter().collect();
+            let at: String = chars
+                .get(cc)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".into());
+            let after: String = if cc < chars.len() {
+                chars[cc + 1..].iter().collect()
+            } else {
+                String::new()
+            };
+            spans.push(Span::styled(before, fg(&th)));
+            spans.push(Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)));
+            spans.push(Span::styled(after, fg(&th)));
+        } else {
+            spans.push(Span::styled(lines[li].to_string(), fg(&th)));
+        }
         f.render_widget(
-            Paragraph::new(Span::styled(hint, theme::faint(&th))),
-            Rect { x: row.x + row.width - hw, y: row.y, width: hw, height: 1 },
+            Paragraph::new(Line::from(spans)),
+            Rect { x: row.x, y, width: row.width, height: 1 },
         );
     }
+}
+
+/// One faint line below the omnibar (so the input row is never the terminal's
+/// last line) that also surfaces the key hints — crucially Shift+Enter.
+fn draw_hint_bar(f: &mut Frame, area: Rect, app: &App) {
+    let th = app.theme;
+    let inner = pad(area);
+    let spans: Vec<Span> = if !app.mouse_capture {
+        vec![Span::styled(
+            "SELECT MODE — drag to select & copy · F2 or /select to resume mouse",
+            theme::accent(&th).add_modifier(Modifier::BOLD),
+        )]
+    } else if app.sudo_prompt().is_some() {
+        vec![Span::styled(
+            "type your sudo password · ↵ run · Esc cancel",
+            theme::faint(&th),
+        )]
+    } else if app.modal.is_some() {
+        vec![Span::styled(
+            "←→ choose · ↵ confirm · Esc dismiss",
+            theme::faint(&th),
+        )]
+    } else if app.slash_active() {
+        vec![Span::styled(
+            "↵ run · ↑↓ select · Esc cancel",
+            theme::faint(&th),
+        )]
+    } else if app.mode == Mode::Settings {
+        vec![Span::styled(
+            "↑↓ move · ↵ toggle/edit · click a row · Esc back",
+            theme::faint(&th),
+        )]
+    } else {
+        let submit = if app.mode == Mode::Models { "↵ search" } else { "↵ send" };
+        vec![
+            Span::styled(submit, theme::faint(&th)),
+            sep(&th),
+            Span::styled("⇧↵ newline", theme::faint(&th)),
+            sep(&th),
+            Span::styled("/ commands", theme::faint(&th)),
+            sep(&th),
+            Span::styled(
+                if app.mode == Mode::Chat { "↑↓ history" } else { "Esc back" },
+                theme::faint(&th),
+            ),
+        ]
+    };
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +513,8 @@ fn draw_command_list(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!("  {desc}"), theme::muted(&th)),
         ]);
         let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        f.render_widget(Paragraph::new(line), rect);
+        let para = Paragraph::new(line);
+        f.render_widget(if marked { para.style(theme::selected(&th)) } else { para }, rect);
         click(app, rect, ClickTarget::CommandItem(i));
     }
 }
@@ -580,7 +687,11 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Some(app.model_selected)
     });
-    f.render_stateful_widget(List::new(items), list_area, &mut app.model_list_state);
+    f.render_stateful_widget(
+        List::new(items).highlight_style(theme::selected(&th)),
+        list_area,
+        &mut app.model_list_state,
+    );
 }
 
 fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
@@ -597,9 +708,15 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
 
+    // Controls block (fixed, no-wrap): id, metrics, quants, backend/ctx, fit,
+    // deploy. Rendered at the top so the click y-positions computed here stay
+    // exact; the scrollable model card fills whatever is left below.
     let s = &d.summary;
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(s.id.clone(), theme::accent(&th).add_modifier(Modifier::BOLD))));
+    let mut ctrl: Vec<Line> = Vec::new();
+    ctrl.push(Line::from(Span::styled(
+        s.id.clone(),
+        theme::accent(&th).add_modifier(Modifier::BOLD),
+    )));
     let mut metrics = format!(
         "{} downloads · {} likes",
         human_count(s.downloads.unwrap_or(0)),
@@ -614,23 +731,15 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(pt) = &s.pipeline_tag {
         metrics.push_str(&format!(" · {pt}"));
     }
-    lines.push(Line::from(Span::styled(metrics, theme::muted(&th))));
-    lines.push(Line::from(""));
-
-    // Two-to-three line model-card excerpt.
-    if let Some(c) = &app.card_cache {
-        for l in c.lines.iter().filter(|l| l.width() > 0).take(3) {
-            lines.push(l.clone());
-        }
-    }
-    lines.push(Line::from(""));
+    ctrl.push(Line::from(Span::styled(metrics, theme::muted(&th))));
+    ctrl.push(Line::from(""));
 
     // Quantizations — record the first row so clicks map to a quant index.
-    lines.push(Line::from(vec![
+    ctrl.push(Line::from(vec![
         Span::styled("quantizations  ", theme::muted(&th)),
         Span::styled("click to select", theme::faint(&th)),
     ]));
-    let quant_first = area.y + lines.len() as u16;
+    let quant_first = area.y + ctrl.len() as u16;
     let total_vram = app.gpu.total_vram();
     let shown = d.quants.len().min(6);
     for q in d.quants.iter().take(shown) {
@@ -662,7 +771,7 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ];
         spans.extend(meter(&th, ratio, 10));
         spans.push(Span::styled(format!(" {fit}"), theme::muted(&th)));
-        lines.push(Line::from(spans));
+        ctrl.push(sel_line(&th, spans, area.width, selected));
     }
     if shown > 0 {
         click(
@@ -671,11 +780,11 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
             ClickTarget::QuantList,
         );
     }
-    lines.push(Line::from(""));
+    ctrl.push(Line::from(""));
 
     // backend ⟳ · context
-    let backend_row = area.y + lines.len() as u16;
-    lines.push(Line::from(vec![
+    let backend_row = area.y + ctrl.len() as u16;
+    ctrl.push(Line::from(vec![
         Span::styled("backend ", theme::muted(&th)),
         Span::styled(format!("{} ⟳", app.deploy_backend.as_str()), theme::accent(&th)),
         Span::styled("    context ", theme::muted(&th)),
@@ -686,7 +795,7 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // vram fit + a wide bar.
     if let Some(fit) = &app.last_fit {
         let ratio = fit.estimated_vram_bytes as f64 / fit.total_vram_bytes.max(1) as f64;
-        lines.push(Line::from(vec![
+        ctrl.push(Line::from(vec![
             Span::styled("vram fit  ", theme::muted(&th)),
             Span::styled(
                 format!(
@@ -698,32 +807,90 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
                 fg(&th),
             ),
         ]));
-        lines.push(Line::from(meter(&th, ratio, 24)));
+        ctrl.push(Line::from(meter(&th, ratio, 24)));
     }
-    lines.push(Line::from(""));
+    ctrl.push(Line::from(""));
 
     // Deploy button / progress.
-    let deploy_row = area.y + lines.len() as u16;
+    let deploy_row = area.y + ctrl.len() as u16;
     if app.deploy_busy.is_some() {
         let mut spans = vec![Span::styled(
             format!("deploying {}%  ", app.deploy_progress),
             theme::accent(&th).add_modifier(Modifier::BOLD),
         )];
         spans.extend(meter(&th, app.deploy_progress as f64 / 100.0, 16));
-        lines.push(Line::from(spans));
+        ctrl.push(Line::from(spans));
     } else {
-        lines.push(Line::from(Span::styled(
-            "[ deploy ]",
-            theme::accent(&th).add_modifier(Modifier::BOLD),
-        )));
-        click(app, Rect { x: area.x, y: deploy_row, width: 10, height: 1 }, ClickTarget::DeployButton);
+        ctrl.push(Line::from(button(&th, "deploy", true)));
+        click(
+            app,
+            Rect { x: area.x, y: deploy_row, width: button_width("deploy"), height: 1 },
+            ClickTarget::DeployButton,
+        );
     }
 
-    app.card_view_height = area.height;
-    app.card_total_lines = lines.len();
-    // No wrap: each logical line is one screen row so the click y-positions
-    // computed above (quants / backend / deploy) stay exact.
-    f.render_widget(Paragraph::new(lines), area);
+    // Render the controls at the top (no wrap → exact click rows).
+    let controls_h = (ctrl.len() as u16).min(area.height);
+    f.render_widget(
+        Paragraph::new(ctrl),
+        Rect { x: area.x, y: area.y, width: area.width, height: controls_h },
+    );
+
+    // The full model card fills the rest: wrapped and scrollable (PgUp/PgDn and
+    // the mouse wheel drive `card_scroll`). This is the proper card view that
+    // was lost in the redesign — long lines wrap instead of running off-screen.
+    let avail = area.height.saturating_sub(controls_h);
+    let card_top = area.y + controls_h;
+    if avail >= 2 {
+        let inner_w = area.width.max(1) as usize;
+        let card_lines: Vec<Line> = app
+            .card_cache
+            .as_ref()
+            .map(|c| c.lines.clone())
+            .unwrap_or_default();
+        let view_h = avail.saturating_sub(1); // header row
+        let wrapped: usize = card_lines
+            .iter()
+            .map(|l| l.width().max(1).div_ceil(inner_w))
+            .sum();
+        app.card_view_height = view_h;
+        app.card_total_lines = wrapped;
+        let max_scroll = wrapped.saturating_sub(view_h as usize);
+        let offset = app.card_scroll.min(max_scroll);
+
+        let shown_to = (offset + view_h as usize).min(wrapped);
+        let more = if wrapped > view_h as usize {
+            format!("   ↑↓ scroll · {shown_to}/{wrapped}")
+        } else {
+            String::new()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("model card", theme::muted(&th)),
+                Span::styled(more, theme::faint(&th)),
+            ])),
+            Rect { x: area.x, y: card_top, width: area.width, height: 1 },
+        );
+        if card_lines.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "no model card provided by the author",
+                    theme::faint(&th),
+                ))),
+                Rect { x: area.x, y: card_top + 1, width: area.width, height: 1 },
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(card_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((offset as u16, 0)),
+                Rect { x: area.x, y: card_top + 1, width: area.width, height: view_h },
+            );
+        }
+    } else {
+        app.card_view_height = 0;
+        app.card_total_lines = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,11 +926,12 @@ fn draw_runtimes(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 fg(&th)
             };
-            lines.push(Line::from(vec![
+            let spans = vec![
                 Span::styled(format!("{:<22} ", r.name), name_style),
                 Span::styled(format!("{:<10}", status_word(r.status)), theme::muted(&th)),
                 Span::styled(format!(" {}", r.base_url), theme::faint(&th)),
-            ]));
+            ];
+            lines.push(sel_line(&th, spans, inner.width, selected));
         }
     }
     let list_rows = runtimes.len().max(1) as u16;
@@ -846,11 +1014,18 @@ fn draw_remote(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             fg(&th)
         };
-        llines.push(Line::from(Span::styled(srv.name.clone(), name_style)));
-        llines.push(Line::from(Span::styled(
-            format!("{word} · {}", srv.host),
-            theme::muted(&th),
-        )));
+        llines.push(sel_line(
+            &th,
+            vec![Span::styled(srv.name.clone(), name_style)],
+            linner.width,
+            selected,
+        ));
+        llines.push(sel_line(
+            &th,
+            vec![Span::styled(format!("{word} · {}", srv.host), theme::muted(&th))],
+            linner.width,
+            selected,
+        ));
     }
     if app.config.remote.servers.is_empty() {
         llines.push(Line::from(Span::styled("(none yet)", theme::muted(&th))));
@@ -866,7 +1041,7 @@ fn draw_remote(f: &mut Frame, area: Rect, app: &mut App) {
 
     let newy = left.y + left.height.saturating_sub(1);
     let newrect = Rect { x: linner.x, y: newy, width: linner.width, height: 1 };
-    f.render_widget(Paragraph::new(Span::styled("+ new server", theme::accent(&th))), newrect);
+    f.render_widget(Paragraph::new(Line::from(button(&th, "+ new server", true))), newrect);
     click(app, newrect, ClickTarget::RemoteNew);
 
     // Right: editable fields + actions + connect progress.
@@ -902,10 +1077,15 @@ fn draw_remote(f: &mut Frame, area: Rect, app: &mut App) {
                 raw
             };
             let val_style = if editing { theme::accent(&th) } else { fg(&th) };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<10} "), theme::muted(&th)),
-                Span::styled(shown, val_style),
-            ]));
+            lines.push(sel_line(
+                &th,
+                vec![
+                    Span::styled(format!("{label:<10} "), theme::muted(&th)),
+                    Span::styled(shown, val_style),
+                ],
+                right.width,
+                selected,
+            ));
         }
         click(
             app,
@@ -923,19 +1103,19 @@ fn draw_remote(f: &mut Frame, area: Rect, app: &mut App) {
     lines.push(Line::from(""));
     let actions_row = right.y + lines.len() as u16;
     let buttons = [
-        ("[ connect ]", ClickTarget::RemoteConnect),
-        ("[ save ]", ClickTarget::RemoteSave),
-        ("[ disconnect ]", ClickTarget::RemoteDisconnect),
-        ("[ delete ]", ClickTarget::RemoteDelete),
+        ("connect", ClickTarget::RemoteConnect),
+        ("save", ClickTarget::RemoteSave),
+        ("disconnect", ClickTarget::RemoteDisconnect),
+        ("delete", ClickTarget::RemoteDelete),
     ];
     let mut bx = right.x;
     let mut bspans: Vec<Span> = Vec::new();
     for (label, target) in buttons {
-        let w = label.width() as u16;
+        let w = button_width(label);
         if bx + w <= right.x + right.width {
             click(app, Rect { x: bx, y: actions_row, width: w, height: 1 }, target);
         }
-        bspans.push(Span::styled(label.to_string(), theme::accent(&th)));
+        bspans.extend(button(&th, label, true));
         bspans.push(Span::raw(" "));
         bx += w + 1;
     }
@@ -1025,18 +1205,17 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
             spans.push(Span::styled(app.install_progress_line.clone(), theme::faint(&th)));
             None
         } else if !ready {
-            spans.push(Span::styled("[ install ]", theme::accent(&th)));
+            spans.extend(button(&th, "install", true));
             Some(ClickTarget::BackendInstall(i))
         } else {
-            spans.push(Span::styled("[ smoke-test ]", theme::accent(&th)));
+            spans.extend(button(&th, "smoke-test", true));
             Some(ClickTarget::BackendSmoke(i))
         };
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
-        );
+        let row_rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let para = Paragraph::new(Line::from(spans));
+        f.render_widget(if selected { para.style(theme::selected(&th)) } else { para }, row_rect);
         if let Some(t) = row_action {
-            click(app, Rect { x: inner.x, y, width: inner.width, height: 1 }, t);
+            click(app, row_rect, t);
         }
         y += 1;
 
@@ -1067,14 +1246,14 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw("  "),
                 ];
                 if has_fix {
-                    l2.push(Span::styled("[ fix ]", theme::accent(&th)));
+                    l2.extend(button(&th, "fix", true));
                 }
                 f.render_widget(
                     Paragraph::new(Line::from(l2)),
                     Rect { x: inner.x, y, width: inner.width, height: 1 },
                 );
                 if has_fix {
-                    let fw = "[ fix ]".width() as u16;
+                    let fw = button_width("fix");
                     let fx = (inner.x + pw).min(inner.x + inner.width.saturating_sub(fw));
                     click(app, Rect { x: fx, y, width: fw, height: 1 }, ClickTarget::BackendFix(i));
                 }
@@ -1085,14 +1264,13 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
 
     y += 1;
     if y < bottom {
-        let redetect = "[ re-detect ]";
         f.render_widget(
-            Paragraph::new(Span::styled(redetect, theme::accent(&th))),
+            Paragraph::new(Line::from(button(&th, "re-detect", true))),
             Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
         click(
             app,
-            Rect { x: inner.x, y, width: redetect.width() as u16, height: 1 },
+            Rect { x: inner.x, y, width: button_width("re-detect"), height: 1 },
             ClickTarget::BackendRedetect,
         );
     }
@@ -1136,15 +1314,15 @@ fn draw_bench(f: &mut Frame, area: Rect, app: &mut App) {
         Span::styled(format!("  · target {target}"), theme::faint(&th)),
     ]);
     f.render_widget(Paragraph::new(suite), Rect { x: inner.x, y: inner.y, width: inner.width.saturating_sub(8), height: 1 });
-    let run = "[ run ]";
-    let rx = inner.x + inner.width - run.width() as u16;
-    f.render_widget(Paragraph::new(Span::styled(run, theme::accent(&th))), Rect { x: rx, y: inner.y, width: run.width() as u16, height: 1 });
-    click(app, Rect { x: rx, y: inner.y, width: run.width() as u16, height: 1 }, ClickTarget::BenchRun);
+    let run_w = button_width("run");
+    let rx = inner.x + inner.width - run_w;
+    f.render_widget(Paragraph::new(Line::from(button(&th, "run", true))), Rect { x: rx, y: inner.y, width: run_w, height: 1 });
+    click(app, Rect { x: rx, y: inner.y, width: run_w, height: 1 }, ClickTarget::BenchRun);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     match &app.last_bench_result {
         None => {
-            lines.push(Line::from(Span::styled("no runs yet — press [ run ]", theme::muted(&th))));
+            lines.push(Line::from(Span::styled("no runs yet — press the run button", theme::muted(&th))));
         }
         Some(r) => {
             let m = &r.metrics;
@@ -1281,19 +1459,19 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
         let mark = if *ok { "[x] " } else { "[ ] " };
         let mark_style = if *ok { theme::muted(&th) } else { theme::faint(&th) };
         let title_style = if *ok { theme::muted(&th) } else { fg(&th) };
-        let action_style = if *ok { theme::faint(&th) } else { theme::accent(&th) };
-        let action_label = format!("[ {action} ]");
-        let aw = action_label.width() as u16;
+        let aw = button_width(action);
         let used = mark.width() + title.width();
         let padn = w.saturating_sub(used + aw as usize);
         let action_x = inner.x + inner.width.saturating_sub(aw);
+        let mut line_spans = vec![
+            Span::styled(mark, mark_style),
+            Span::styled((*title).to_string(), title_style),
+            Span::raw(" ".repeat(padn)),
+        ];
+        // Pending steps get a filled button; completed ones an outline.
+        line_spans.extend(button(&th, action, !*ok));
         rows.push((
-            Line::from(vec![
-                Span::styled(mark, mark_style),
-                Span::styled((*title).to_string(), title_style),
-                Span::raw(" ".repeat(padn)),
-                Span::styled(action_label, action_style),
-            ]),
+            Line::from(line_spans),
             Some((action_x, aw, ClickTarget::SetupStep(*idx))),
         ));
         rows.push((Line::from(Span::styled(format!("    {subtitle}"), theme::muted(&th))), None));
@@ -1301,13 +1479,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Doctor block — probes derived from live state.
     rows.push((Line::from(""), None));
-    let run = "[ run doctor ]";
+    let mut doctor_spans = vec![Span::styled("doctor   ", theme::muted(&th))];
+    doctor_spans.extend(button(&th, "run doctor", true));
     rows.push((
-        Line::from(vec![
-            Span::styled("doctor   ", theme::muted(&th)),
-            Span::styled(run, theme::accent(&th)),
-        ]),
-        Some((inner.x + 9, run.width() as u16, ClickTarget::SetupDoctor)),
+        Line::from(doctor_spans),
+        Some((inner.x + 9, button_width("run doctor"), ClickTarget::SetupDoctor)),
     ));
     let gpu_word = if app.gpu.devices.is_empty() { "none" } else { "ok" };
     let probes = [
@@ -1365,49 +1541,91 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
 // Settings (§7.9)
 // ---------------------------------------------------------------------------
 
-fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
-    let th = &app.theme;
+fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
+    let th = app.theme;
     let inner = pad(area);
-    let row = |label: &str, value: String, hint: &str| -> Line<'static> {
-        let mut spans = vec![
-            Span::styled(format!("{label:<16}"), theme::muted(th)),
-            Span::styled(value, fg(th)),
-        ];
-        if !hint.is_empty() {
-            spans.push(Span::styled(format!("   {hint}"), theme::faint(th)));
+    app.settings_view_height = inner.height;
+
+    let rows = app.settings_rows();
+    let editing = app.settings_editing_field();
+    let sel = app.settings_sel;
+    let scroll = app.settings_scroll as usize;
+    let val_w = inner.width.saturating_sub(26) as usize;
+
+    // Row-by-row with the scroll offset so click y-positions stay exact.
+    let mut act_idx = 0usize;
+    for (i, r) in rows.iter().enumerate() {
+        let is_action = r.action.is_some();
+        if i < scroll {
+            if is_action {
+                act_idx += 1;
+            }
+            continue;
         }
-        Line::from(spans)
-    };
-    let mirrors = if app.config.registry.mirrors.is_empty() {
-        "none".to_string()
-    } else {
-        app.config.registry.mirrors.join(", ")
-    };
-    let lines = vec![
-        Line::from(Span::styled("settings", theme::muted(th))),
-        Line::from(""),
-        row("theme", format!("{:?}", app.config.ui.theme), "/theme"),
-        row("token streaming", app.config.agent.stream.to_string(), "agent.stream"),
-        row(
-            "confirm shell",
-            app.config.agent.confirm_destructive_tools.to_string(),
-            "destructive commands",
-        ),
-        row(
-            "cloud fallback",
-            app.config.agent.allow_cloud_fallback.to_string(),
-            "local-first when off",
-        ),
-        row("default backend", app.config.backends.default.kind.clone(), ""),
-        row("registry", app.config.registry.api_endpoint.clone(), ""),
-        row("hf mirrors", mirrors, ""),
-        row("remote servers", app.config.remote.servers.len().to_string(), ""),
-        row("config file", app.paths.config_file().display().to_string(), "Ctrl+S"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "env overrides: LOCALCODE_API_URL, LOCALCODE_HF_ENDPOINT, HF_TOKEN, OPENROUTER_API_KEY",
-            theme::faint(th),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        let y = inner.y + (i - scroll) as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let selected = is_action && act_idx == sel;
+        let marker = if selected { "› " } else { "  " };
+        let name_style = if selected {
+            theme::accent(&th).add_modifier(Modifier::BOLD)
+        } else {
+            fg(&th)
+        };
+
+        let line = match &r.kind {
+            SettingsRowKind::Header => Line::from(Span::styled(
+                r.label.clone(),
+                theme::muted(&th).add_modifier(Modifier::BOLD),
+            )),
+            SettingsRowKind::Toggle(on) => Line::from(vec![
+                Span::styled(marker, theme::accent(&th)),
+                Span::styled(
+                    if *on { "[x] " } else { "[ ] " },
+                    if *on { theme::accent(&th) } else { theme::faint(&th) },
+                ),
+                Span::styled(format!("{:<18}", clip(&r.label, 18)), name_style),
+                Span::styled(clip(&r.value, val_w), theme::muted(&th)),
+            ]),
+            SettingsRowKind::Text => {
+                let is_editing = matches!(
+                    (editing, r.action),
+                    (Some(a), Some(SettingAction::Edit(b))) if a == b
+                );
+                let value = if is_editing {
+                    Span::styled(format!("{}▌", app.settings_edit_buffer()), theme::accent(&th))
+                } else {
+                    Span::styled(clip(&r.value, val_w), fg(&th))
+                };
+                Line::from(vec![
+                    Span::styled(marker, theme::accent(&th)),
+                    Span::styled(format!("{:<18}", clip(&r.label, 18)), name_style),
+                    value,
+                ])
+            }
+            SettingsRowKind::Action(word) => {
+                let mut spans = vec![
+                    Span::styled(marker, theme::accent(&th)),
+                    Span::styled(format!("{:<18}", clip(&r.label, 18)), name_style),
+                ];
+                spans.extend(button(&th, word, true));
+                spans.push(Span::styled(format!("  {}", clip(&r.value, 28)), theme::faint(&th)));
+                Line::from(spans)
+            }
+            SettingsRowKind::Info => Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<18}", clip(&r.label, 18)), theme::muted(&th)),
+                Span::styled(clip(&r.value, val_w), theme::faint(&th)),
+            ]),
+        };
+
+        let row_rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let para = Paragraph::new(line);
+        f.render_widget(if selected { para.style(theme::selected(&th)) } else { para }, row_rect);
+        if let Some(action) = r.action {
+            click(app, row_rect, ClickTarget::Setting(action));
+            act_idx += 1;
+        }
+    }
 }

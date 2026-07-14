@@ -14,7 +14,7 @@ use crate::diagnose::RepairIntent;
 use crate::BackendKind;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// One step of an install plan.
@@ -41,6 +41,11 @@ pub enum InstallStep {
         args: Vec<String>,
         display: String,
     },
+    /// Download a prebuilt llama.cpp release for this OS and extract it into
+    /// `dest_dir`, then repoint the backend at the extracted `llama-server`
+    /// binary. Runs entirely in-process (HTTP + unzip) so llama.cpp installs
+    /// from the TUI on platforms without a package manager (e.g. Windows).
+    FetchLlamaCpp { dest_dir: PathBuf, display: String },
 }
 
 impl InstallStep {
@@ -92,6 +97,7 @@ impl InstallStep {
             InstallStep::Command { display, .. } => display.clone(),
             InstallStep::PipInstall { package } => format!("python -m pip install {package}"),
             InstallStep::Sudo { display, .. } => display.clone(),
+            InstallStep::FetchLlamaCpp { display, .. } => display.clone(),
         }
     }
 }
@@ -131,10 +137,11 @@ pub fn install_plan(
     os: &str,
     has: &dyn Fn(&str) -> bool,
     has_python: bool,
+    llamacpp_dir: &Path,
 ) -> InstallPlan {
     match kind {
         BackendKind::Ollama => ollama_plan(os, has),
-        BackendKind::LlamaCpp => llamacpp_plan(os, has),
+        BackendKind::LlamaCpp => llamacpp_plan(os, has, llamacpp_dir),
         BackendKind::Vllm => pip_backend_plan("vllm", os, has, has_python),
         BackendKind::Sglang => pip_backend_plan("sglang[all]", os, has, has_python),
     }
@@ -202,12 +209,25 @@ fn ollama_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
     }
 }
 
-fn llamacpp_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
+fn llamacpp_plan(os: &str, has: &dyn Fn(&str) -> bool, dest_dir: &Path) -> InstallPlan {
+    // A package manager gives the cleanest, self-updating install when present.
     if matches!(os, "macos" | "linux") && has("brew") {
         return InstallPlan::automated(vec![InstallStep::command(
             "brew",
             &["install", "llama.cpp"],
         )]);
+    }
+    // Otherwise fetch a prebuilt release and extract it in-app (works on
+    // Windows and package-manager-less Linux/macOS). CPU build: universally
+    // compatible — GPU users can still use Ollama/vLLM.
+    if matches!(os, "windows" | "linux" | "macos") {
+        return InstallPlan::automated(vec![InstallStep::FetchLlamaCpp {
+            dest_dir: dest_dir.to_path_buf(),
+            display: format!(
+                "Download prebuilt llama.cpp (CPU) from github.com/ggml-org/llama.cpp and install to {}",
+                dest_dir.display()
+            ),
+        }]);
     }
     InstallPlan::Manual {
         summary: "Download a prebuilt llama.cpp server binary and point config at it.".into(),
@@ -249,10 +269,22 @@ fn pip_backend_plan(
     InstallPlan::automated(steps)
 }
 
+/// The app-managed directory a fetched llama.cpp release is extracted into.
+pub fn llamacpp_managed_dir(paths: &AppPaths) -> PathBuf {
+    paths.data_dir.join("backends").join("llamacpp")
+}
+
 /// Resolve an install plan against the real environment.
-pub fn resolve_install_plan(kind: BackendKind) -> InstallPlan {
+pub fn resolve_install_plan(kind: BackendKind, paths: &AppPaths) -> InstallPlan {
     let has = |b: &str| which::which(b).is_ok();
-    let plan = install_plan(kind, std::env::consts::OS, &has, discover_python().is_some());
+    let llamacpp_dir = llamacpp_managed_dir(paths);
+    let plan = install_plan(
+        kind,
+        std::env::consts::OS,
+        &has,
+        discover_python().is_some(),
+        &llamacpp_dir,
+    );
     // The official Ollama Linux installer runs `sudo` internally. Our install
     // steps spawn with stdin null, so if we can't elevate without a password
     // that `sudo` just fails ("a password is required") — a confusing failure.
@@ -341,11 +373,12 @@ pub fn discover_python() -> Option<PathBuf> {
 
 /// Run an automated install plan, forwarding each output line through
 /// `progress`. `Manual` plans are handled by the caller (the UI shows steps),
-/// so passing one here is an error.
+/// so passing one here is an error. Returns an optional [`Repoint`] when a step
+/// installed a managed binary (llama.cpp fetch) the backend must be pointed at.
 pub async fn run_install(
     plan: &InstallPlan,
     progress: UnboundedSender<String>,
-) -> Result<(), LocalCodeError> {
+) -> Result<Option<Repoint>, LocalCodeError> {
     let InstallPlan::Automated { steps, .. } = plan else {
         return Err(LocalCodeError::new(
             ErrorCode::BackendInstallFailed,
@@ -354,10 +387,19 @@ pub async fn run_install(
         .with_hint("Follow the manual steps shown in the Backends panel"));
     };
     let cid = localcode_core::CorrelationId::new();
+    let mut repoint = None;
     for step in steps {
-        run_step(step, &progress, cid).await?;
+        if let InstallStep::FetchLlamaCpp { dest_dir, .. } = step {
+            let bin = fetch_llamacpp(dest_dir, &progress, cid).await?;
+            repoint = Some(Repoint {
+                kind: BackendKind::LlamaCpp,
+                bin,
+            });
+        } else {
+            run_step(step, &progress, cid).await?;
+        }
     }
-    Ok(())
+    Ok(repoint)
 }
 
 async fn run_step(
@@ -403,6 +445,15 @@ async fn run_step(
             .with_correlation(cid)
             .with_cause(format!("step: {display}")));
         }
+        // Handled by `run_install` directly (it needs to capture the repoint).
+        InstallStep::FetchLlamaCpp { display, .. } => {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendInstallFailed,
+                "Internal: a fetch step reached the generic step runner",
+            )
+            .with_correlation(cid)
+            .with_cause(format!("step: {display}")));
+        }
     };
 
     let _ = progress.send(format!("$ {display}"));
@@ -443,6 +494,204 @@ async fn run_step(
         .retryable(true));
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// llama.cpp prebuilt fetch (in-app download + extract, no package manager)
+// ----------------------------------------------------------------------------
+
+/// GitHub API for the latest llama.cpp release.
+const LLAMACPP_RELEASES_API: &str =
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+/// Download and extract a prebuilt llama.cpp release into `dest_dir`, returning
+/// the absolute path to the extracted `llama-server` binary. Honest failure — a
+/// clear, retryable error when no matching asset exists or extraction fails —
+/// never a fabricated success.
+async fn fetch_llamacpp(
+    dest_dir: &Path,
+    progress: &UnboundedSender<String>,
+    cid: localcode_core::CorrelationId,
+) -> Result<String, LocalCodeError> {
+    let fail = |msg: String| {
+        LocalCodeError::new(ErrorCode::BackendInstallFailed, msg)
+            .with_correlation(cid)
+            .with_hint("Or install llama.cpp manually from github.com/ggml-org/llama.cpp/releases")
+            .retryable(true)
+    };
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // GitHub's API rejects requests without a User-Agent.
+        .user_agent("localcode-installer")
+        .build()
+        .map_err(|e| fail(e.to_string()))?;
+
+    let _ = progress.send("$ querying github.com/ggml-org/llama.cpp for the latest release".into());
+    let resp = client
+        .get(LLAMACPP_RELEASES_API)
+        .send()
+        .await
+        .map_err(|e| fail(format!("Couldn't reach the GitHub releases API: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(fail(format!(
+            "GitHub releases API returned {} (it may be rate-limiting)",
+            resp.status()
+        )));
+    }
+    let release: serde_json::Value = resp.json().await.map_err(|e| fail(e.to_string()))?;
+    let assets: Vec<(String, String)> = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let name = a.get("name")?.as_str()?.to_string();
+                    let url = a.get("browser_download_url")?.as_str()?.to_string();
+                    Some((name, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (asset_name, asset_url) =
+        pick_llamacpp_asset(&assets, std::env::consts::OS, std::env::consts::ARCH).ok_or_else(
+            || fail("The latest release has no prebuilt CPU build for this OS/arch".into()),
+        )?;
+
+    let _ = progress.send(format!("$ downloading {asset_name}"));
+    let bytes = client
+        .get(&asset_url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| fail(format!("Download failed: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| fail(format!("Download interrupted: {e}")))?
+        .to_vec();
+
+    let _ = progress.send(format!("$ extracting {} ({} MiB)", asset_name, bytes.len() / 1_048_576));
+    let dest = dest_dir.to_path_buf();
+    let bin = tokio::task::spawn_blocking(move || extract_llamacpp_zip(&bytes, &dest))
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .map_err(fail)?;
+
+    let _ = progress.send(format!("llama-server installed to {}", bin.display()));
+    Ok(bin.display().to_string())
+}
+
+/// Pick the CPU release asset matching this OS/arch, preferring the most
+/// specific name. Pure so the matching rules are unit-tested. Returns
+/// `(name, download_url)`. GPU builds (CUDA/HIP/Vulkan/…) are excluded — the CPU
+/// build runs everywhere; GPU users can use Ollama/vLLM instead.
+fn pick_llamacpp_asset(
+    assets: &[(String, String)],
+    os: &str,
+    arch: &str,
+) -> Option<(String, String)> {
+    const GPU_MARKERS: [&str; 9] = [
+        "cuda", "cu11", "cu12", "hip", "rocm", "vulkan", "sycl", "musa", "kompute",
+    ];
+    let cpu_zip = |n: &str| {
+        let l = n.to_lowercase();
+        l.ends_with(".zip") && !GPU_MARKERS.iter().any(|m| l.contains(m))
+    };
+    let all = |n: &str, pats: &[&str]| {
+        let l = n.to_lowercase();
+        pats.iter().all(|p| l.contains(p))
+    };
+    let prefs: Vec<Vec<&str>> = match (os, arch) {
+        ("windows", "aarch64") => vec![vec!["win", "arm64"], vec!["bin-win"]],
+        ("windows", _) => vec![vec!["win", "x64"], vec!["bin-win"]],
+        ("linux", "aarch64") => vec![vec!["ubuntu", "arm64"], vec!["linux", "arm64"]],
+        ("linux", _) => vec![vec!["ubuntu", "x64"], vec!["ubuntu"], vec!["linux", "x64"]],
+        ("macos", "aarch64") => vec![vec!["macos", "arm64"], vec!["bin-macos"]],
+        ("macos", _) => vec![vec!["macos", "x64"], vec!["bin-macos"]],
+        _ => return None,
+    };
+    for pats in &prefs {
+        if let Some((n, u)) = assets
+            .iter()
+            .find(|(n, _)| cpu_zip(n) && all(n, pats))
+        {
+            return Some((n.clone(), u.clone()));
+        }
+    }
+    None
+}
+
+/// Extract a llama.cpp release zip into `dest_dir` (zip-slip safe) and return the
+/// path to the `llama-server` binary within it. Sync — run on a blocking task.
+fn extract_llamacpp_zip(bytes: &[u8], dest_dir: &Path) -> Result<PathBuf, String> {
+    use std::io::Read;
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("open archive: {e}"))?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        // Sanitize: no absolute paths, no `..` traversal (zip-slip).
+        let name = entry.name().replace('\\', "/");
+        if name.starts_with('/') || name.split('/').any(|c| c == "..") {
+            continue;
+        }
+        let out = dest_dir.join(&name);
+        if name.ends_with('/') {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        std::fs::write(&out, &buf).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+
+    let bin_name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let found = find_file(dest_dir, bin_name)
+        .ok_or_else(|| format!("{bin_name} was not found inside the downloaded archive"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(found)
+}
+
+/// Depth-first search for a file named `name` (case-insensitive) under `dir`.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------
@@ -780,9 +1029,19 @@ mod tests {
         }
     }
 
+    /// `install_plan` with a throwaway managed dir for llama.cpp fetch steps.
+    fn ip(
+        kind: BackendKind,
+        os: &str,
+        has: &dyn Fn(&str) -> bool,
+        has_python: bool,
+    ) -> InstallPlan {
+        install_plan(kind, os, has, has_python, std::path::Path::new("/managed/llamacpp"))
+    }
+
     #[test]
     fn ollama_linux_uses_official_script() {
-        let steps = automated(install_plan(BackendKind::Ollama, "linux", &no, false));
+        let steps = automated(ip(BackendKind::Ollama, "linux", &no, false));
         assert_eq!(steps.len(), 1);
         assert!(steps[0].display().contains("ollama.com/install.sh"));
     }
@@ -790,7 +1049,7 @@ mod tests {
     #[test]
     fn ollama_windows_winget() {
         let has = |b: &str| b == "winget";
-        let steps = automated(install_plan(BackendKind::Ollama, "windows", &has, false));
+        let steps = automated(ip(BackendKind::Ollama, "windows", &has, false));
         let d = steps[0].display();
         assert!(d.contains("winget"));
         assert!(d.contains("Ollama.Ollama"));
@@ -801,21 +1060,21 @@ mod tests {
 
     #[test]
     fn ollama_windows_without_winget_is_manual() {
-        let plan = install_plan(BackendKind::Ollama, "windows", &no, false);
+        let plan = ip(BackendKind::Ollama, "windows", &no, false);
         assert!(matches!(plan, InstallPlan::Manual { .. }));
     }
 
     #[test]
     fn ollama_macos_brew() {
         let has = |b: &str| b == "brew";
-        let steps = automated(install_plan(BackendKind::Ollama, "macos", &has, false));
+        let steps = automated(ip(BackendKind::Ollama, "macos", &has, false));
         assert!(steps[0].display().contains("brew install ollama"));
     }
 
     #[test]
     fn vllm_prepends_python_when_missing_on_windows() {
         let has = |b: &str| b == "winget";
-        let steps = automated(install_plan(BackendKind::Vllm, "windows", &has, false));
+        let steps = automated(ip(BackendKind::Vllm, "windows", &has, false));
         assert_eq!(steps.len(), 2);
         assert!(steps[0].display().to_lowercase().contains("python"));
         assert!(matches!(&steps[1], InstallStep::PipInstall { package } if package == "vllm"));
@@ -824,14 +1083,14 @@ mod tests {
     #[test]
     fn vllm_macos_brew_installs_python_prereq() {
         let has = |b: &str| b == "brew";
-        let steps = automated(install_plan(BackendKind::Vllm, "macos", &has, false));
+        let steps = automated(ip(BackendKind::Vllm, "macos", &has, false));
         assert_eq!(steps.len(), 2);
         assert!(steps[0].display().contains("brew install python"));
     }
 
     #[test]
     fn vllm_single_step_when_python_present() {
-        let steps = automated(install_plan(BackendKind::Vllm, "windows", &no, true));
+        let steps = automated(ip(BackendKind::Vllm, "windows", &no, true));
         assert_eq!(steps.len(), 1);
         assert!(matches!(&steps[0], InstallStep::PipInstall { .. }));
     }
@@ -839,27 +1098,102 @@ mod tests {
     #[test]
     fn vllm_linux_without_python_is_manual() {
         // No package manager can install Python non-interactively (needs sudo).
-        let plan = install_plan(BackendKind::Vllm, "linux", &no, false);
+        let plan = ip(BackendKind::Vllm, "linux", &no, false);
         assert!(matches!(plan, InstallPlan::Manual { .. }));
     }
 
     #[test]
     fn sglang_pip_package_has_all_extra() {
-        let steps = automated(install_plan(BackendKind::Sglang, "linux", &no, true));
+        let steps = automated(ip(BackendKind::Sglang, "linux", &no, true));
         assert!(matches!(&steps[0], InstallStep::PipInstall { package } if package == "sglang[all]"));
     }
 
     #[test]
     fn llamacpp_brew_when_available() {
         let has = |b: &str| b == "brew";
-        let steps = automated(install_plan(BackendKind::LlamaCpp, "macos", &has, false));
+        let steps = automated(ip(BackendKind::LlamaCpp, "macos", &has, false));
         assert!(steps[0].display().contains("brew install llama.cpp"));
     }
 
     #[test]
-    fn llamacpp_windows_is_manual() {
-        let plan = install_plan(BackendKind::LlamaCpp, "windows", &no, false);
-        assert!(matches!(plan, InstallPlan::Manual { .. }));
+    fn llamacpp_windows_fetches_prebuilt_in_app() {
+        // No package manager on Windows: install by downloading a prebuilt
+        // release in-app, so the user never has to leave the TUI.
+        let steps = automated(ip(BackendKind::LlamaCpp, "windows", &no, false));
+        assert!(matches!(&steps[0], InstallStep::FetchLlamaCpp { .. }));
+        assert!(steps[0].display().contains("llama.cpp"));
+    }
+
+    #[test]
+    fn llamacpp_linux_without_brew_fetches_prebuilt() {
+        let steps = automated(ip(BackendKind::LlamaCpp, "linux", &no, false));
+        assert!(matches!(&steps[0], InstallStep::FetchLlamaCpp { .. }));
+    }
+
+    #[test]
+    fn picks_cpu_windows_asset_over_gpu_builds() {
+        let assets = vec![
+            ("llama-b100-bin-win-cuda-12.4-x64.zip".to_string(), "cuda-url".to_string()),
+            ("llama-b100-bin-win-cpu-x64.zip".to_string(), "cpu-url".to_string()),
+            ("llama-b100-bin-ubuntu-x64.zip".to_string(), "linux-url".to_string()),
+        ];
+        let (name, url) = pick_llamacpp_asset(&assets, "windows", "x86_64").unwrap();
+        assert_eq!(url, "cpu-url");
+        assert!(name.contains("cpu"));
+    }
+
+    #[test]
+    fn picks_ubuntu_for_linux_and_nothing_for_unknown_os() {
+        let assets = vec![
+            ("llama-b100-bin-ubuntu-x64.zip".to_string(), "linux-url".to_string()),
+            ("llama-b100-bin-win-cpu-x64.zip".to_string(), "win-url".to_string()),
+        ];
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "linux", "x86_64").unwrap().1,
+            "linux-url"
+        );
+        assert!(pick_llamacpp_asset(&assets, "freebsd", "x86_64").is_none());
+    }
+
+    #[test]
+    fn refuses_to_pick_a_gpu_only_release() {
+        // No CPU asset available → no silent GPU install; caller shows an error.
+        let assets = vec![
+            ("llama-b100-bin-win-cuda-x64.zip".to_string(), "c".to_string()),
+            ("llama-b100-bin-win-vulkan-x64.zip".to_string(), "v".to_string()),
+        ];
+        assert!(pick_llamacpp_asset(&assets, "windows", "x86_64").is_none());
+    }
+
+    #[test]
+    fn extract_finds_server_binary_and_is_zip_slip_safe() {
+        use std::io::Write;
+        let mut cur = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cur);
+            let opts = zip::write::SimpleFileOptions::default();
+            let server = if cfg!(windows) {
+                "build/bin/llama-server.exe"
+            } else {
+                "build/bin/llama-server"
+            };
+            w.start_file(server, opts).unwrap();
+            w.write_all(b"binary").unwrap();
+            // A traversal entry that must be skipped, not written outside dest.
+            w.start_file("../evil.txt", opts).unwrap();
+            w.write_all(b"nope").unwrap();
+            w.finish().unwrap();
+        }
+        let bytes = cur.into_inner();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = extract_llamacpp_zip(&bytes, dir.path()).unwrap();
+        assert!(bin.exists());
+        assert!(bin
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("llama-server"));
+        assert!(!dir.path().parent().unwrap().join("evil.txt").exists());
     }
 
     // ---- repair resolution (path manipulation only; no filesystem / no sudo) ----

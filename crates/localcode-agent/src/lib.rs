@@ -157,7 +157,7 @@ impl CodingAgent {
             .unwrap_or_default();
 
         Self {
-            tools: ToolRegistry::default_tools(),
+            tools: ToolRegistry::new(config.disabled_tools.clone()),
             skills: SkillLoader::new(skills_dir),
             mcp: McpManager::new(mcp_path),
             config,
@@ -278,22 +278,48 @@ impl CodingAgent {
     }
 
     fn build_system_prompt(&self, session: &AgentSession) -> String {
-        let mut parts = vec![
-            "You are LocalCode coding agent. Work inside the user workspace.".into(),
-            format!("Workspace: {}", session.workspace_root.display()),
-            "Use tools to read/search/edit files. fs.apply_patch does exact string replacement."
-                .into(),
-            "Be concise. When tools fail, explain causes and next steps.".into(),
-            "Subagents are not available in this build; do the work yourself.".into(),
-        ];
+        let mut parts: Vec<String> = Vec::new();
+
+        // A custom system prompt (Settings) replaces the built-in preamble;
+        // otherwise the default identity/instructions are used. Either way the
+        // workspace path, skills and AGENTS.md are appended below.
+        match self.config.system_prompt.as_deref().map(str::trim) {
+            Some(custom) if !custom.is_empty() => parts.push(custom.to_string()),
+            _ => {
+                parts.push(
+                    "You are LocalCode coding agent. Work inside the user workspace.".into(),
+                );
+                parts.push(
+                    "Use tools to read/search/edit files. fs.apply_patch does exact string replacement."
+                        .into(),
+                );
+                parts.push("Be concise. When tools fail, explain causes and next steps.".into());
+                parts.push("Subagents are not available in this build; do the work yourself.".into());
+            }
+        }
+
+        parts.push(format!("Workspace: {}", session.workspace_root.display()));
+
+        // Available skills, minus any the user disabled in Settings.
         for skill in self.skills.list() {
-            if skill.enabled {
+            let disabled = self.config.disabled_skills.iter().any(|d| d == &skill.name);
+            if skill.enabled && !disabled {
                 parts.push(format!(
                     "Skill available: {} — {}",
                     skill.name, skill.description
                 ));
             }
         }
+
+        // Project-specific instructions from an AGENTS.md at the workspace root.
+        if self.config.use_agents_md {
+            if let Some(agents) = read_agents_md(&session.workspace_root) {
+                parts.push(String::new());
+                parts.push("Project instructions from AGENTS.md (follow these for this repo):".into());
+                parts.push(agents);
+            }
+        }
+
         parts.join("\n")
     }
 
@@ -663,6 +689,31 @@ struct LlmResponse {
     streamed: bool,
 }
 
+/// Read a project `AGENTS.md` from the workspace root (or `.localcode/AGENTS.md`),
+/// truncated so a huge file can't blow a small local model's context window.
+fn read_agents_md(workspace: &std::path::Path) -> Option<String> {
+    const MAX: usize = 8_000;
+    for path in [
+        workspace.join("AGENTS.md"),
+        workspace.join(".localcode").join("AGENTS.md"),
+    ] {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if body.chars().count() > MAX {
+            let mut s: String = body.chars().take(MAX).collect();
+            s.push_str("\n… (AGENTS.md truncated)");
+            return Some(s);
+        }
+        return Some(body.to_string());
+    }
+    None
+}
+
 /// Parse a pseudo tool call. Anchored to a line start so a model merely
 /// *mentioning* `tool:foo {}` mid-sentence doesn't trigger execution.
 fn parse_pseudo_tool(text: &str) -> Option<ToolCall> {
@@ -694,6 +745,57 @@ pub async fn run_headless(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_md_is_read_into_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Always run cargo fmt before commits.")
+            .unwrap();
+        let agent = CodingAgent::new(AgentConfig::default());
+        let session = AgentSession::new(dir.path().to_path_buf(), false);
+        let prompt = agent.build_system_prompt(&session);
+        assert!(prompt.contains("Always run cargo fmt"), "{prompt}");
+        assert!(prompt.contains("AGENTS.md"));
+
+        // Off switch is honored.
+        let agent = CodingAgent::new(AgentConfig {
+            use_agents_md: false,
+            ..AgentConfig::default()
+        });
+        let prompt = agent.build_system_prompt(&session);
+        assert!(!prompt.contains("Always run cargo fmt"));
+    }
+
+    #[test]
+    fn custom_system_prompt_replaces_preamble_but_keeps_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = CodingAgent::new(AgentConfig {
+            system_prompt: Some("You are Grover, a terse assistant.".into()),
+            ..AgentConfig::default()
+        });
+        let session = AgentSession::new(dir.path().to_path_buf(), false);
+        let prompt = agent.build_system_prompt(&session);
+        assert!(prompt.contains("Grover"));
+        assert!(!prompt.contains("LocalCode coding agent"));
+        assert!(prompt.contains("Workspace:"));
+    }
+
+    #[test]
+    fn disabled_tools_are_hidden_from_schema() {
+        let agent = CodingAgent::new(AgentConfig {
+            disabled_tools: vec!["shell.exec".into()],
+            ..AgentConfig::default()
+        });
+        let schema = agent.tools.openai_tools_schema();
+        let names: Vec<String> = schema
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!names.iter().any(|n| n == "shell.exec"), "{names:?}");
+        assert!(names.iter().any(|n| n == "fs.read"));
+    }
 
     #[test]
     fn pseudo_tool_requires_line_start() {

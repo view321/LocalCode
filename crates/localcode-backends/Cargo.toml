@@ -18,6 +18,7 @@ uuid = { workspace = true }
 which = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
