@@ -4,7 +4,9 @@
 //! status bar. Views with multiple panes take their split from
 //! `App::pane_ratios` so `[`/`]` (and `{`/`}`) resizing persists.
 
-use crate::app::{App, BusyKind, EntryKind, ModelsPane, Tab};
+use crate::app::{
+    App, BusyKind, ClickRegion, ClickTarget, EntryKind, ModelsPane, ResizeBorder, Tab,
+};
 use crate::markdown;
 use crate::theme;
 use crate::widgets::{draw_modal, draw_palette};
@@ -47,8 +49,42 @@ fn ratio_constraints(ratios: &[f32]) -> Vec<Constraint> {
         .collect()
 }
 
+/// The area inside a pane's border — where list rows and content actually
+/// render. Used so a click maps to the right row (row 0 sits at `area.y + 1`).
+fn inner_rect(a: Rect) -> Rect {
+    Rect {
+        x: a.x.saturating_add(1),
+        y: a.y.saturating_add(1),
+        width: a.width.saturating_sub(2),
+        height: a.height.saturating_sub(2),
+    }
+}
+
+/// Record a clickable region for this frame.
+fn click(app: &mut App, rect: Rect, target: ClickTarget) {
+    app.click_regions.push(ClickRegion { rect, target });
+}
+
+/// Record a draggable vertical seam between panes `idx` and `idx + 1` of
+/// `view`, spanning the full height of `area` at column `x`.
+fn border(app: &mut App, x: u16, area: Rect, view: &'static str, idx: usize) {
+    app.resize_borders.push(ResizeBorder {
+        x,
+        y0: area.y,
+        y1: area.y.saturating_add(area.height),
+        view,
+        idx,
+        area,
+    });
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+
+    // Hit regions are rebuilt every frame. Clear before the small-terminal
+    // early return so a shrink can never leave stale zones that fire on click.
+    app.click_regions.clear();
+    app.resize_borders.clear();
 
     // Paint the themed background/foreground over the whole frame so light
     // and high-contrast modes don't depend on the terminal's own colors.
@@ -81,18 +117,35 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_view(f, main[2], app);
     draw_status(f, main[3], app);
 
-    if let Some(modal) = &app.modal {
-        draw_modal(f, area, modal, &app.theme);
+    // The backends manager sits under the modal layer so an install-confirm
+    // dialog overlays it (and its regions, recorded later, win the scan).
+    if app.backends_open {
+        draw_backend_manager(f, area, app);
     }
+
+    // Overlays are recorded last so their click regions win the reverse scan.
+    let modal_btns = if let Some(modal) = &app.modal {
+        draw_modal(f, area, modal, &app.theme)
+    } else {
+        vec![]
+    };
+    for (rect, i) in modal_btns {
+        click(app, rect, ClickTarget::ModalButton(i));
+    }
+
     if app.palette_open {
-        draw_palette(
+        let items = app.palette_items();
+        let hits = draw_palette(
             f,
             area,
             &app.palette_query,
-            &app.palette_items(),
+            &items,
             app.palette_selected,
             &app.theme,
         );
+        for (rect, i) in hits {
+            click(app, rect, ClickTarget::PaletteItem(i));
+        }
     }
     if app.assistant_open {
         draw_assistant_dock(f, area, app);
@@ -210,10 +263,10 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &mut App) {
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     let mut x = area.x + 1;
-    for (i, t) in Tab::all().into_iter().enumerate() {
-        let mut label = format!(" {} {} ", i + 1, tab_label(t));
+    for t in Tab::all() {
+        let mut label = format!(" {} ", tab_label(t));
         if t == Tab::Notifications && !app.notifications.is_empty() {
-            label = format!(" {} {}({}) ", i + 1, tab_label(t), app.notifications.len());
+            label = format!(" {}({}) ", tab_label(t), app.notifications.len());
         }
         let w = label.width() as u16;
         let active = app.tab == t;
@@ -238,12 +291,14 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn tab_hint(tab: Tab) -> &'static str {
     match tab {
-        Tab::Dashboard => "j/k select · x stop · [/] resize · ? help",
-        Tab::Models => "←/→ focus · / search · Enter detail · d deploy · ? help",
-        Tab::Coding => "i type · n new · +/- composer · PgUp/PgDn · ? help",
+        Tab::Dashboard => "click a runtime · drag border to resize · scroll · x stop · ? help",
+        Tab::Models => {
+            "click a model to open · click card · drag borders · scroll · d deploy · ? help"
+        }
+        Tab::Coding => "click composer to type · scroll transcript · n new · ? help",
         Tab::Benchmarks => "r run · ? help",
-        Tab::Setup => "d doctor · r redetect · ? help",
-        Tab::Notifications => "j/k · c clear · ? help",
+        Tab::Setup => "scroll · m manage backends · d doctor · r redetect · ? help",
+        Tab::Notifications => "click or scroll to select · c clear · ? help",
         Tab::Settings => "t theme · Ctrl+S save · ? help",
     }
 }
@@ -258,7 +313,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             b.label.clone()
         };
         (
-            format!("{frame} {} ({}s) — Esc cancels", label, b.started.elapsed().as_secs()),
+            format!(
+                "{frame} {} ({}s) — Esc cancels",
+                label,
+                b.started.elapsed().as_secs()
+            ),
             theme::accent(th),
         )
     } else if let Some(b) = &app.deploy_busy {
@@ -279,6 +338,17 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 "{frame} {}: {} ({}s) — Esc cancels",
                 b.label,
                 app.update_progress_line,
+                b.started.elapsed().as_secs()
+            ),
+            theme::accent(th),
+        )
+    } else if let Some(b) = &app.install_busy {
+        let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
+        (
+            format!(
+                "{frame} {}: {} ({}s) — Esc cancels",
+                b.label,
+                app.install_progress_line,
                 b.started.elapsed().as_secs()
             ),
             theme::accent(th),
@@ -364,12 +434,15 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints(ratio_constraints(&ratios))
         .split(area);
 
+    click(app, inner_rect(cols[0]), ClickTarget::RuntimeList);
+    border(app, cols[1].x, area, "dashboard", 0);
+
     let th = app.theme;
     let items: Vec<ListItem> = if app.runtimes.is_empty() {
         vec![
             ListItem::new("No active runtimes.").style(theme::muted(&th)),
             ListItem::new(""),
-            ListItem::new("Deploy a model from [2] models — one keypress (d)")
+            ListItem::new("Deploy a model from the models tab — press d there")
                 .style(theme::muted(&th)),
         ]
     } else {
@@ -403,7 +476,11 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
     });
 
     f.render_stateful_widget(
-        List::new(items).block(pane(app, " Runtimes — j/k select · x stop ".into(), true)),
+        List::new(items).block(pane(
+            app,
+            " Runtimes — click or scroll · x stop ".into(),
+            true,
+        )),
         cols[0],
         &mut app.runtime_list_state,
     );
@@ -449,7 +526,7 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
         if app.assistant_configured {
             "configured"
         } else {
-            "not configured (see [5] setup)"
+            "not configured (see the setup tab)"
         }
     )));
     right.push(Line::from(""));
@@ -457,8 +534,12 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
         "Quick actions",
         theme::accent(th).add_modifier(Modifier::BOLD),
     )));
-    right.push(Line::from("  [2] deploy a model    [4] code with it"));
-    right.push(Line::from("  [3] benchmark         [5] setup & doctor"));
+    right.push(Line::from(
+        "  models: deploy a model    coding: code with it",
+    ));
+    right.push(Line::from(
+        "  bench: benchmark          setup: setup & doctor",
+    ));
     right.push(Line::from("  Ctrl+K command palette"));
     if !app.notifications.is_empty() {
         right.push(Line::from(""));
@@ -481,9 +562,11 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     f.render_widget(
-        Paragraph::new(right)
-            .wrap(Wrap { trim: true })
-            .block(pane(app, " Overview ".into(), false)),
+        Paragraph::new(right).wrap(Wrap { trim: true }).block(pane(
+            app,
+            " Overview ".into(),
+            false,
+        )),
         cols[1],
     );
 }
@@ -501,9 +584,10 @@ fn draw_models(f: &mut Frame, area: Rect, app: &mut App) {
     };
     if stale {
         if let Some(d) = &app.model_detail {
-            let md = d.card_markdown.clone().unwrap_or_else(|| {
-                "*(no model card — see quants and deploy panel)*".to_string()
-            });
+            let md = d
+                .card_markdown
+                .clone()
+                .unwrap_or_else(|| "*(no model card — see quants and deploy panel)*".to_string());
             app.card_cache = Some(crate::app::CardCache {
                 model_id: d.summary.id.clone(),
                 mode: app.theme.mode,
@@ -518,6 +602,9 @@ fn draw_models(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints(ratio_constraints(&ratios))
         .split(area);
 
+    border(app, panes3[1].x, area, "models", 0);
+    border(app, panes3[2].x, area, "models", 1);
+
     draw_models_list(f, panes3[0], app);
     draw_models_card(f, panes3[1], app);
     draw_models_deploy(f, panes3[2], app);
@@ -529,6 +616,9 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(3)])
         .split(area);
+
+    click(app, left[0], ClickTarget::ModelSearch);
+    click(app, inner_rect(left[1]), ClickTarget::ModelList);
 
     let search_style = if app.model_search_focus {
         theme::accent(&th)
@@ -546,7 +636,7 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Search [/] · p popular · t trending ")
+                .title(" Search — click to type · p popular · t trending ")
                 .border_style(search_style),
         ),
         left[0],
@@ -595,7 +685,7 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(
         List::new(items).block(pane(
             app,
-            format!(" Models ({}) — Enter opens card ", app.models.len()),
+            format!(" Models ({}) — click to open ", app.models.len()),
             focused,
         )),
         left[1],
@@ -605,6 +695,7 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// Metadata chips + rendered markdown card, scrollable.
 fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, area, ClickTarget::ModelCard);
     let th = &app.theme;
     let focused = app.models_focus == ModelsPane::Card;
 
@@ -618,7 +709,7 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  The full model card renders here — → to focus, j/k to scroll.",
+                    "  The full model card renders here — click it to focus, scroll to read.",
                     theme::muted(th),
                 )),
             ])
@@ -639,7 +730,10 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
         s.id.clone(),
         theme::accent(th).add_modifier(Modifier::BOLD),
     )];
-    if s.gated.as_ref().is_some_and(|g| g != &serde_json::Value::Bool(false)) {
+    if s.gated
+        .as_ref()
+        .is_some_and(|g| g != &serde_json::Value::Bool(false))
+    {
         chip_line1.push(Span::styled("  ⚠ gated", theme::warn(th)));
     }
 
@@ -671,9 +765,18 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
 
     let header = vec![
         Line::from(chip_line1),
-        Line::from(Span::styled(chips2, Style::default().fg(theme::color(th, ThemeToken::Fg)))),
-        Line::from(Span::styled(format!("tags: {}", tags.join(", ")), theme::muted(th))),
-        Line::from(Span::styled(format!("updated: {updated}"), theme::muted(th))),
+        Line::from(Span::styled(
+            chips2,
+            Style::default().fg(theme::color(th, ThemeToken::Fg)),
+        )),
+        Line::from(Span::styled(
+            format!("tags: {}", tags.join(", ")),
+            theme::muted(th),
+        )),
+        Line::from(Span::styled(
+            format!("updated: {updated}"),
+            theme::muted(th),
+        )),
     ];
     f.render_widget(
         Paragraph::new(header).block(
@@ -708,9 +811,9 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
 
     let pct = (offset * 100).checked_div(max_scroll).unwrap_or(100);
     let title = if focused {
-        format!(" Model card — j/k scroll · {pct}% ")
+        format!(" Model card — scroll · {pct}% ")
     } else {
-        " Model card — → to focus ".to_string()
+        " Model card — click to focus ".to_string()
     };
     f.render_widget(
         Paragraph::new(lines)
@@ -722,6 +825,7 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, area, ClickTarget::DeployPane);
     let th = &app.theme;
     let deploying = app.deploy_busy.is_some();
     let chunks = if deploying {
@@ -819,7 +923,10 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
         "[d] one-click deploy",
         theme::accent(th).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::styled("[ ] and { } resize panes", theme::muted(th))));
+    lines.push(Line::from(Span::styled(
+        "[ ] and { } resize panes",
+        theme::muted(th),
+    )));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -854,6 +961,9 @@ fn draw_coding(f: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(area);
 
+    click(app, chunks[1], ClickTarget::Transcript);
+    click(app, chunks[2], ClickTarget::Composer);
+
     let th = &app.theme;
     let stream_chip = if app.config.agent.stream {
         Span::styled("streaming ✓", theme::ok(th))
@@ -870,7 +980,10 @@ fn draw_coding(f: &mut Frame, area: Rect, app: &mut App) {
         stream_chip,
         Span::styled(" │ ", theme::border(th)),
         Span::styled(
-            format!("skills {} · mcp {}", app.skill_count, app.mcp_status_summary),
+            format!(
+                "skills {} · mcp {}",
+                app.skill_count, app.mcp_status_summary
+            ),
             theme::muted(th),
         ),
     ]);
@@ -902,19 +1015,24 @@ fn draw_coding(f: &mut Frame, area: Rect, app: &mut App) {
             String::new()
         };
         spans.push(Span::raw(before));
-        spans.push(Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)));
+        spans.push(Span::styled(
+            at,
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
         spans.push(Span::raw(after));
     } else {
         spans.push(Span::raw(app.coding_input.clone()));
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Composer — i type · Enter send · ↑ history · Ctrl+↑/↓ height ")
-                .border_style(composer_style),
-        ),
+        Paragraph::new(Line::from(spans))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Composer — click to type · Enter send · ↑ history ")
+                    .border_style(composer_style),
+            ),
         chunks[2],
     );
 }
@@ -925,7 +1043,10 @@ fn draw_transcript(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let inner_h = area.height.saturating_sub(2);
-    let agent_running = app.busy.as_ref().is_some_and(|b| b.kind == BusyKind::Coding);
+    let agent_running = app
+        .busy
+        .as_ref()
+        .is_some_and(|b| b.kind == BusyKind::Coding);
 
     let fg = Style::default().fg(theme::color(&th, ThemeToken::Fg));
     let mut lines: Vec<Line> = Vec::new();
@@ -1037,7 +1158,8 @@ fn draw_benchmarks(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
+fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, area, ClickTarget::SetupBody);
     let th = &app.theme;
     let mut lines = vec![
         Line::from(Span::styled(
@@ -1066,6 +1188,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             style,
         )));
     }
+    let manage_line_idx = lines.len();
+    lines.push(Line::from(Span::styled(
+        "   [m] Manage & install backends — configure URL/bin/port · one-click install",
+        theme::accent(th).add_modifier(Modifier::BOLD),
+    )));
     lines.push(Line::from("3. HF token: set HF_TOKEN env for gated models"));
     lines.push(Line::from(format!(
         "   endpoint: {}",
@@ -1088,7 +1215,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from("   or run `localcode update` in a terminal"));
     lines.push(Line::from(""));
     lines.push(Line::from(
-        "[d] Run doctor   [r] Refresh detection   PgUp/PgDn scroll",
+        "[m] Manage backends   [d] Run doctor   [r] Refresh detection   PgUp/PgDn scroll",
     ));
     if let Some(doc) = &app.doctor_summary {
         lines.push(Line::from(""));
@@ -1097,6 +1224,26 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(l.to_string()));
         }
     }
+
+    // Make the "Manage backends" line clickable (recorded after SetupBody so it
+    // wins the reverse-scan for that row). Skipped when scrolled out of view.
+    let inner = inner_rect(area);
+    if (manage_line_idx as u16) >= app.setup_scroll {
+        let ry = inner.y + (manage_line_idx as u16 - app.setup_scroll);
+        if ry < inner.y.saturating_add(inner.height) {
+            click(
+                app,
+                Rect {
+                    x: inner.x,
+                    y: ry,
+                    width: inner.width,
+                    height: 1,
+                },
+                ClickTarget::SetupManageBackends,
+            );
+        }
+    }
+
     f.render_widget(
         Paragraph::new(lines)
             .scroll((app.setup_scroll, 0))
@@ -1106,6 +1253,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_notifications(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, inner_rect(area), ClickTarget::NotificationList);
     let th = app.theme;
     let items: Vec<ListItem> = if app.notifications.is_empty() {
         vec![ListItem::new("No notifications").style(theme::muted(&th))]
@@ -1137,11 +1285,12 @@ fn draw_notifications(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect()
     };
-    app.notif_list_state.select(if app.notifications.is_empty() {
-        None
-    } else {
-        Some(app.notif_selected.min(app.notifications.len() - 1))
-    });
+    app.notif_list_state
+        .select(if app.notifications.is_empty() {
+            None
+        } else {
+            Some(app.notif_selected.min(app.notifications.len() - 1))
+        });
     f.render_stateful_widget(
         List::new(items).block(pane(
             app,
@@ -1196,7 +1345,10 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         head("Services"),
-        Line::from(format!("  Default backend: {}", app.config.backends.default.kind)),
+        Line::from(format!(
+            "  Default backend: {}",
+            app.config.backends.default.kind
+        )),
         Line::from(format!("  Log level: {}", app.config.log_level())),
         Line::from(format!(
             "  Redact secrets in logs: {}",
@@ -1222,9 +1374,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         )),
     ];
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(pane(app, " Settings ".into(), false)),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(pane(
+            app,
+            " Settings ".into(),
+            false,
+        )),
         area,
     );
 }
@@ -1250,5 +1404,229 @@ fn draw_assistant_dock(f: &mut Frame, area: Rect, app: &App) {
                     .border_style(theme::accent(&app.theme)),
             ),
         rect,
+    );
+}
+
+/// The backends manager: install (with prerequisites) and configure each
+/// backend. Left column lists the four backends with live status; the right
+/// column shows detection detail, editable config fields, the resolved install
+/// plan, and Install / Save / Re-detect actions.
+fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
+    use crate::app::BACKEND_ORDER;
+    use crate::widgets::centered_rect;
+    use ratatui::widgets::Clear;
+
+    let th = app.theme;
+    let rect = centered_rect(85, 82, area);
+    f.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Backends — install & configure · Esc close ")
+        .border_style(theme::accent(&th));
+    let inner = outer.inner(rect);
+    f.render_widget(outer, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(18), Constraint::Min(24)])
+        .split(inner);
+
+    // --- Left column: the four backends with a status glyph.
+    let list_block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme::border(&th));
+    let list_inner = list_block.inner(cols[0]);
+    f.render_widget(list_block, cols[0]);
+    click(app, list_inner, ClickTarget::BackendMgrItem);
+
+    let spin = app
+        .install_busy
+        .as_ref()
+        .map(|b| SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]);
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, kind) in BACKEND_ORDER.iter().enumerate() {
+        let report = app.backend_reports.iter().find(|r| r.kind == *kind);
+        let (glyph, gstyle) = if app.installing_kind == Some(*kind) {
+            (spin.unwrap_or('◐').to_string(), theme::accent(&th))
+        } else if report.map(|r| r.ready).unwrap_or(false) {
+            ("✓".to_string(), theme::ok(&th))
+        } else if report.map(|r| r.installed).unwrap_or(false) {
+            ("◐".to_string(), theme::warn(&th))
+        } else {
+            ("·".to_string(), theme::muted(&th))
+        };
+        let name_style = if i == app.backend_sel {
+            theme::nav_active(&th)
+        } else {
+            Style::default().fg(theme::color(&th, ThemeToken::Fg))
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!(" {glyph} "), gstyle),
+            Span::styled(kind.as_str().to_string(), name_style),
+        ])));
+    }
+    f.render_widget(List::new(items), list_inner);
+
+    // --- Right column: detail for the selected backend.
+    let kind = app.backend_sel_kind();
+    let labels = App::backend_field_labels(kind);
+    let nfields = labels.len() as u16;
+    let right = Rect {
+        x: cols[1].x + 1,
+        y: cols[1].y,
+        width: cols[1].width.saturating_sub(2),
+        height: cols[1].height,
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),           // detection
+            Constraint::Length(nfields.max(1)), // config fields
+            Constraint::Length(4),           // install plan
+            Constraint::Length(1),           // action buttons
+            Constraint::Min(1),              // progress / hint
+        ])
+        .split(right);
+
+    // Detection detail (owned clone so no borrow lingers across click()).
+    let report = app.backend_reports.iter().find(|r| r.kind == kind).cloned();
+    let status = match &report {
+        Some(r) if r.ready => "ready",
+        Some(r) if r.installed => "installed, not running",
+        Some(_) => "not installed",
+        None => "detecting…",
+    };
+    let mut info: Vec<Line> = vec![Line::from(vec![
+        Span::styled(
+            kind.as_str().to_string(),
+            theme::accent(&th).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  — {status}"), theme::muted(&th)),
+    ])];
+    if let Some(r) = &report {
+        if let Some(v) = &r.version {
+            info.push(Line::from(Span::styled(
+                format!("version: {v}"),
+                theme::muted(&th),
+            )));
+        }
+        if let Some(p) = &r.binary_path {
+            info.push(Line::from(Span::styled(
+                format!("path: {p}"),
+                theme::muted(&th),
+            )));
+        }
+        if let Some(u) = &r.base_url {
+            info.push(Line::from(Span::styled(
+                format!("url:  {u}"),
+                theme::muted(&th),
+            )));
+        }
+        if let Some(n) = r.notes.first() {
+            info.push(Line::from(Span::styled(n.clone(), theme::muted(&th))));
+        }
+    } else {
+        info.push(Line::from(Span::styled(
+            "press [r] to re-detect",
+            theme::muted(&th),
+        )));
+    }
+    f.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), rows[0]);
+
+    // Editable config fields — one clickable region over exactly the field rows.
+    click(app, rows[1], ClickTarget::BackendMgrField);
+    let mut field_lines: Vec<Line> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let selected = i == app.backend_field;
+        let editing = selected && app.backend_editing;
+        let value = if editing {
+            format!("{}▌", app.backend_field_edit)
+        } else {
+            app.backend_field_value(kind, i)
+        };
+        let mark = if selected { "▶" } else { " " };
+        let label_style = if selected {
+            theme::accent(&th).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted(&th)
+        };
+        let val_style = if editing {
+            theme::accent(&th)
+        } else {
+            Style::default().fg(theme::color(&th, ThemeToken::Fg))
+        };
+        field_lines.push(Line::from(vec![
+            Span::styled(format!("{mark} {label:<9} "), label_style),
+            Span::styled(value, val_style),
+        ]));
+    }
+    f.render_widget(Paragraph::new(field_lines), rows[1]);
+
+    // Resolved install plan preview.
+    let preview = if app.backend_plan_preview.is_empty() {
+        "—".to_string()
+    } else {
+        app.backend_plan_preview.clone()
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("Install plan", theme::muted(&th))),
+            Line::from(Span::styled(
+                preview,
+                Style::default().fg(theme::color(&th, ThemeToken::Fg)),
+            )),
+        ])
+        .wrap(Wrap { trim: true }),
+        rows[2],
+    );
+
+    // Action buttons.
+    let buttons = [
+        ("[i] Install", ClickTarget::BackendMgrInstall),
+        ("[s] Save", ClickTarget::BackendMgrSave),
+        ("[r] Re-detect", ClickTarget::BackendMgrRedetect),
+    ];
+    let mut x = rows[3].x;
+    let mut spans: Vec<Span> = Vec::new();
+    for (label, target) in buttons {
+        let w = label.width() as u16;
+        if x + w <= rows[3].x + rows[3].width {
+            click(
+                app,
+                Rect {
+                    x,
+                    y: rows[3].y,
+                    width: w,
+                    height: 1,
+                },
+                target,
+            );
+        }
+        spans.push(Span::styled(
+            label.to_string(),
+            theme::accent(&th).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+        x = x.saturating_add(w + 2);
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[3]);
+
+    // Progress / hint line.
+    let hint = if let Some(b) = &app.install_busy {
+        format!("{}: {}", b.label, app.install_progress_line)
+    } else if app.backend_editing {
+        "editing — type, Enter/Esc to commit".to_string()
+    } else {
+        "Tab switch · ↑/↓ field · Enter/click edit · i install · s save · r re-detect".to_string()
+    };
+    let hint_style = if app.install_busy.is_some() {
+        theme::accent(&th)
+    } else {
+        theme::muted(&th)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, hint_style)).wrap(Wrap { trim: true }),
+        rows[4],
     );
 }

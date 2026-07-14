@@ -20,6 +20,7 @@ Stable machine-readable codes used in `LocalCodeError.code`. User surfaces alway
 | `BACKEND_START_FAILED` | Process spawn/start failed | Check binary, CUDA, logs |
 | `BACKEND_HEALTH_TIMEOUT` | Health poll timed out | Smaller model; check OOM |
 | `BACKEND_BINARY_MISSING` | Binary not on PATH | Install backend; set config path |
+| `BACKEND_INSTALL_FAILED` | Backend/prerequisite install failed | Causes in error; run the shown command manually |
 | `DEPLOY_DISK_LOW` | Low disk warning | Free space |
 | `DEPLOY_DOWNLOAD_FAILED` | Weight pull/create failed | Network, path, library name |
 | `DEPLOY_OVERSIZED_WARNING` | VRAM fit warning (not a hard stop) | Continue or smaller quant |

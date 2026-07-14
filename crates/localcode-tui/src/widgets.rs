@@ -1,5 +1,6 @@
 //! Shared TUI widgets: modal, command palette, status strip helpers.
 
+use localcode_backends::BackendKind;
 use localcode_core::error::LocalCodeError;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -8,6 +9,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragr
 use ratatui::Frame;
 
 use crate::theme;
+use unicode_width::UnicodeWidthStr;
 
 /// What a Confirm modal's "Confirm" button actually does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +20,8 @@ pub enum ConfirmAction {
     ToolApproval,
     /// Fetch + rebuild + swap the binary in the background.
     InstallUpdate,
+    /// Run the platform installer for a backend (after showing the command).
+    InstallBackend(BackendKind),
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +145,14 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_core::Theme) {
+/// Returns the on-screen rect of each button (with its index) so the caller can
+/// register click regions that map to `modal.buttons()`.
+pub fn draw_modal(
+    f: &mut Frame,
+    area: Rect,
+    modal: &ModalState,
+    th: &localcode_core::Theme,
+) -> Vec<(Rect, usize)> {
     let rect = centered_rect(70, 60, area);
     f.render_widget(Clear, rect);
 
@@ -180,7 +191,11 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
             body.lines().map(|l| Line::from(l.to_string())).collect(),
             theme::accent(th),
         ),
-        ModalKind::Payment { title, body, amount } => (
+        ModalKind::Payment {
+            title,
+            body,
+            amount,
+        } => (
             title.as_str(),
             vec![
                 Line::from(body.as_str()),
@@ -219,28 +234,40 @@ pub fn draw_modal(f: &mut Frame, area: Rect, modal: &ModalState, th: &localcode_
     );
 
     let buttons = modal.buttons();
-    let btn_line: Vec<Span> = buttons
-        .iter()
-        .enumerate()
-        .flat_map(|(i, b)| {
-            let selected = i == modal.selected.min(buttons.len().saturating_sub(1));
-            let st = if selected {
-                Style::default()
-                    .fg(theme::color(th, localcode_core::theme::ThemeToken::Bg))
-                    .bg(theme::color(th, localcode_core::theme::ThemeToken::Accent))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                theme::muted(th)
-            };
-            vec![
-                Span::styled(format!(" [{b}] "), st),
-                Span::raw(" "),
-            ]
-        })
-        .collect();
-    f.render_widget(Paragraph::new(Line::from(btn_line)), chunks[1]);
+    let sel = modal.selected.min(buttons.len().saturating_sub(1));
+    let mut spans: Vec<Span> = Vec::new();
+    let mut hits: Vec<(Rect, usize)> = Vec::new();
+    let mut x = chunks[1].x;
+    for (i, b) in buttons.iter().enumerate() {
+        let st = if i == sel {
+            Style::default()
+                .fg(theme::color(th, localcode_core::theme::ThemeToken::Bg))
+                .bg(theme::color(th, localcode_core::theme::ThemeToken::Accent))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted(th)
+        };
+        let label = format!(" [{b}] ");
+        let w = label.width() as u16;
+        hits.push((
+            Rect {
+                x,
+                y: chunks[1].y,
+                width: w,
+                height: 1,
+            },
+            i,
+        ));
+        spans.push(Span::styled(label, st));
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(w + 1);
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
+    hits
 }
 
+/// Returns the on-screen rect of each visible item (with its index) so the
+/// caller can register click regions.
 pub fn draw_palette(
     f: &mut Frame,
     area: Rect,
@@ -248,7 +275,7 @@ pub fn draw_palette(
     items: &[String],
     selected: usize,
     th: &localcode_core::Theme,
-) {
+) -> Vec<(Rect, usize)> {
     let rect = centered_rect(60, 50, area);
     f.render_widget(Clear, rect);
     let block = Block::default()
@@ -282,4 +309,23 @@ pub fn draw_palette(
         })
         .collect();
     f.render_widget(List::new(list_items), chunks[1]);
+
+    // One click rect per visible row (the list has no scroll offset).
+    let mut hits: Vec<(Rect, usize)> = Vec::new();
+    for i in 0..items.len() {
+        let y = chunks[1].y.saturating_add(i as u16);
+        if y >= chunks[1].y.saturating_add(chunks[1].height) {
+            break;
+        }
+        hits.push((
+            Rect {
+                x: chunks[1].x,
+                y,
+                width: chunks[1].width,
+                height: 1,
+            },
+            i,
+        ));
+    }
+    hits
 }

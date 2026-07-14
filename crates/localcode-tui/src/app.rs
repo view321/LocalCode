@@ -22,7 +22,8 @@ use localcode_agent::{AgentEvent, AgentSession, CodingAgent, ToolApprover};
 use localcode_api_client::ApiClient;
 use localcode_assistant::{Assistant, AssistantRequest};
 use localcode_backends::{
-    BackendKind, BackendRegistry, DeployRequest, DeployService, DetectReport,
+    resolve_install_plan, run_install, BackendKind, BackendRegistry, DeployRequest, DeployService,
+    DetectReport, InstallPlan,
 };
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
 use localcode_core::config::Config;
@@ -35,6 +36,7 @@ use localcode_gpu::{discover, predict_fit, FitPrediction, FitRequest, GpuInvento
 use localcode_hf::{HfClient, ModelDetail, ModelSummary};
 use localcode_upgrade::{SelfUpdater, UpdateChecker, UpdateInfo, UpdateReport};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use ratatui::Terminal;
 use std::io;
@@ -136,6 +138,59 @@ pub enum ModelsPane {
     Card,
 }
 
+/// A clickable/scrollable region recorded during draw so the mouse handler
+/// acts on exactly what is on screen (mirrors the `tab_hit` pattern). Lists
+/// record a single region over their inner rect; the row index is derived in
+/// the handler from `ListState::offset()` so scrolling stays correct.
+#[derive(Debug, Clone, Copy)]
+pub struct ClickRegion {
+    pub rect: Rect,
+    pub target: ClickTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickTarget {
+    RuntimeList,
+    ModelSearch,
+    ModelList,
+    ModelCard,
+    DeployPane,
+    Transcript,
+    Composer,
+    NotificationList,
+    SetupBody,
+    SetupManageBackends,
+    ModalButton(usize),
+    PaletteItem(usize),
+    // Backends overlay
+    BackendMgrItem,
+    BackendMgrField,
+    BackendMgrInstall,
+    BackendMgrSave,
+    BackendMgrRedetect,
+}
+
+/// A draggable vertical seam between two horizontal panes, recorded during
+/// draw. `area` is the full span of the split so drags map a column back to a
+/// fraction; `idx` is the boundary between panes `idx` and `idx + 1`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeBorder {
+    pub x: u16,
+    pub y0: u16,
+    pub y1: u16,
+    pub view: &'static str,
+    pub idx: usize,
+    pub area: Rect,
+}
+
+/// An in-progress border drag.
+#[derive(Debug, Clone, Copy)]
+pub struct DragState {
+    pub view: &'static str,
+    pub idx: usize,
+    pub area: Rect,
+}
+
 /// Memoized rendered model card — markdown is parsed once per model/theme,
 /// not on every frame of the ~10fps draw loop.
 pub struct CardCache {
@@ -154,6 +209,7 @@ pub enum BusyKind {
     Assistant,
     Doctor,
     Update,
+    Install,
 }
 
 pub struct Busy {
@@ -174,6 +230,7 @@ pub enum RetryAction {
     AskAssistant,
     CheckUpdate,
     InstallUpdate,
+    InstallBackend(BackendKind),
 }
 
 pub enum DeployOutcome {
@@ -208,6 +265,12 @@ pub enum BgMsg {
     },
     UpdateProgress(String),
     UpdateDone(Result<UpdateReport, LocalCodeError>),
+    /// A backend install: streamed output lines, then the terminal result.
+    InstallProgress(String),
+    InstallDone {
+        kind: BackendKind,
+        result: Result<(), LocalCodeError>,
+    },
 }
 
 /// Bridges the agent's destructive-command approval to a TUI modal.
@@ -243,6 +306,11 @@ pub struct App {
     pub tab_hit: Vec<(u16, u16, Tab)>,
     pub tab_strip_row: u16,
     pub tab_hover: Option<Tab>,
+    /// Clickable regions and draggable pane borders for the current frame,
+    /// refilled every draw so the mouse handler never recomputes layout.
+    pub click_regions: Vec<ClickRegion>,
+    pub resize_borders: Vec<ResizeBorder>,
+    pub dragging: Option<DragState>,
     pub status_line: String,
     pub status_is_error: bool,
     pub last_error: Option<LocalCodeError>,
@@ -269,6 +337,18 @@ pub struct App {
     pub detecting: bool,
     pub doctor_summary: Option<String>,
     pub setup_scroll: u16,
+    // Backends manager overlay
+    pub backends_open: bool,
+    pub backend_sel: usize,
+    pub backend_field: usize,
+    pub backend_field_edit: String,
+    pub backend_editing: bool,
+    /// Cached install-plan preview for the selected backend (recomputed on
+    /// selection change, not per-frame).
+    pub backend_plan_preview: String,
+    pub install_busy: Option<Busy>,
+    pub install_progress_line: String,
+    pub installing_kind: Option<BackendKind>,
     // Models
     pub model_query: String,
     pub model_search_focus: bool,
@@ -369,6 +449,9 @@ impl App {
             tab: Tab::Dashboard,
             tab_hit: vec![],
             tab_strip_row: 0,
+            click_regions: vec![],
+            resize_borders: vec![],
+            dragging: None,
             tab_hover: None,
             status_line: "Ready — one-click local models, no account required".into(),
             status_is_error: false,
@@ -395,6 +478,15 @@ impl App {
             detecting: false,
             doctor_summary: None,
             setup_scroll: 0,
+            backends_open: false,
+            backend_sel: 0,
+            backend_field: 0,
+            backend_field_edit: String::new(),
+            backend_editing: false,
+            backend_plan_preview: String::new(),
+            install_busy: None,
+            install_progress_line: String::new(),
+            installing_kind: None,
             model_query: String::new(),
             model_search_focus: false,
             models: vec![],
@@ -421,7 +513,7 @@ impl App {
             coding_hist_idx: None,
             coding_transcript: vec![TranscriptEntry::new(
                 EntryKind::System,
-                "Welcome to LocalCode Coding. Deploy a runtime ([2] Models), then type a message.",
+                "Welcome to LocalCode Coding. Deploy a runtime (Models tab), then type a message.",
             )],
             coding_scroll: 0,
             coding_follow: true,
@@ -487,8 +579,8 @@ impl App {
             .get(view)
             .cloned()
             .unwrap_or_else(|| default.to_vec());
-        let valid = ratios.len() == default.len()
-            && ratios.iter().all(|r| r.is_finite() && *r > 0.0);
+        let valid =
+            ratios.len() == default.len() && ratios.iter().all(|r| r.is_finite() && *r > 0.0);
         if valid {
             ratios
         } else {
@@ -553,6 +645,22 @@ impl App {
             b.handle.abort();
             self.update_progress_line.clear();
             self.set_status("Update cancelled — installed binary untouched", false);
+        } else if self.install_busy.is_some() {
+            self.cancel_install();
+        }
+    }
+
+    /// Abort a running backend install (kill_on_drop stops the child when the
+    /// aborted task's Command is dropped). Returns whether one was running.
+    fn cancel_install(&mut self) -> bool {
+        if let Some(b) = self.install_busy.take() {
+            b.handle.abort();
+            self.installing_kind = None;
+            self.install_progress_line.clear();
+            self.set_status("Install cancelled", false);
+            true
+        } else {
+            false
         }
     }
 
@@ -672,6 +780,7 @@ impl App {
             Some(RetryAction::AskAssistant) => self.start_assistant(),
             Some(RetryAction::CheckUpdate) => self.start_update_check(true),
             Some(RetryAction::InstallUpdate) => self.start_install_update(),
+            Some(RetryAction::InstallBackend(kind)) => self.start_install(kind),
             None => self.set_status("Nothing to retry", false),
         }
     }
@@ -874,9 +983,7 @@ impl App {
             let continue_oversize = req.continue_despite_oversize;
             let outcome = match svc.deploy(req.clone()).await {
                 Ok(_) => DeployOutcome::Done,
-                Err(e)
-                    if e.code == ErrorCode::DeployOversizedWarning && !continue_oversize =>
-                {
+                Err(e) if e.code == ErrorCode::DeployOversizedWarning && !continue_oversize => {
                     DeployOutcome::Oversize(Box::new((req, e)))
                 }
                 // Other failures already published a DeployFailed event.
@@ -904,7 +1011,10 @@ impl App {
         let suite = sample_coding_suite();
         let subject = Subject {
             hf_model_id: runtime.model_id.clone().unwrap_or_else(|| "unknown".into()),
-            quantization: runtime.quantization.clone().unwrap_or_else(|| "unknown".into()),
+            quantization: runtime
+                .quantization
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
             weight_source: "local".into(),
             backend: format!("{:?}", runtime.kind),
             backend_version: "unknown".into(),
@@ -931,7 +1041,7 @@ impl App {
     fn start_assistant(&mut self) {
         if !self.assistant_configured {
             self.set_status(
-                "Assistant not configured — set OPENROUTER_API_KEY (or a self-hosted URL), see [5] Setup",
+                "Assistant not configured — set OPENROUTER_API_KEY (or a self-hosted URL), see the Setup tab",
                 true,
             );
             return;
@@ -962,13 +1072,9 @@ impl App {
         });
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
-            let logs = localcode_log::read_recent_logs(
-                &paths.log_dir,
-                80,
-                correlation.as_deref(),
-                redact,
-            )
-            .ok();
+            let logs =
+                localcode_log::read_recent_logs(&paths.log_dir, 80, correlation.as_deref(), redact)
+                    .ok();
             let doctor = run_doctor(&paths, &config).await;
             let req = AssistantRequest {
                 user_message,
@@ -1038,10 +1144,10 @@ impl App {
                 } else {
                     self.coding_transcript.push(TranscriptEntry::new(
                         EntryKind::System,
-                        "no runtime. Deploy one from [2] Models — or set agent.allow_cloud_fallback=true to use the cloud assistant provider.",
+                        "no runtime. Deploy one from the Models tab — or set agent.allow_cloud_fallback=true to use the cloud assistant provider.",
                     ));
                     self.coding_follow = true;
-                    self.set_status("No runtime — deploy a model first ([2] Models)", true);
+                    self.set_status("No runtime — deploy a model first (Models tab)", true);
                     return;
                 }
             }
@@ -1104,7 +1210,10 @@ impl App {
             self.workspace_path(),
             false,
         )));
-        self.coding_transcript = vec![TranscriptEntry::new(EntryKind::System, "new session started")];
+        self.coding_transcript = vec![TranscriptEntry::new(
+            EntryKind::System,
+            "new session started",
+        )];
         self.coding_scroll = 0;
         self.coding_follow = true;
         self.set_status("New coding session", false);
@@ -1127,24 +1236,287 @@ impl App {
     }
 
     // ------------------------------------------------------------------
+    // Backends manager (configure + install)
+    // ------------------------------------------------------------------
+
+    fn open_backend_manager(&mut self) {
+        self.backends_open = true;
+        self.assistant_open = false;
+        self.backend_sel = 0;
+        self.backend_field = 0;
+        self.backend_editing = false;
+        self.load_field_edit();
+        self.refresh_plan_preview();
+        if self.backend_reports.is_empty() && !self.detecting {
+            self.start_detect();
+        }
+        self.set_status(
+            "Backends — Tab switch · ↑/↓ field · Enter edit · i install · s save · r re-detect · Esc close",
+            false,
+        );
+    }
+
+    pub(crate) fn backend_sel_kind(&self) -> BackendKind {
+        BACKEND_ORDER[self.backend_sel.min(BACKEND_ORDER.len() - 1)]
+    }
+
+    /// Recompute the cached install-plan preview for the selected backend.
+    fn refresh_plan_preview(&mut self) {
+        let kind = self.backend_sel_kind();
+        self.backend_plan_preview = match resolve_install_plan(kind) {
+            InstallPlan::Automated { display, .. } => display,
+            InstallPlan::Manual { url, .. } => format!("manual — {url}"),
+        };
+    }
+
+    /// Editable config field labels for a backend.
+    pub(crate) fn backend_field_labels(kind: BackendKind) -> &'static [&'static str] {
+        match kind {
+            BackendKind::Ollama => &["base_url"],
+            _ => &["bin", "host", "port"],
+        }
+    }
+
+    fn backend_field_count(&self) -> usize {
+        Self::backend_field_labels(self.backend_sel_kind()).len()
+    }
+
+    /// Current value of a backend's config field, read from `config.backends`.
+    pub(crate) fn backend_field_value(&self, kind: BackendKind, idx: usize) -> String {
+        let b = &self.config.backends;
+        match (kind, idx) {
+            (BackendKind::Ollama, 0) => b.ollama.base_url.clone(),
+            (BackendKind::LlamaCpp, 0) => b.llamacpp.bin.clone(),
+            (BackendKind::LlamaCpp, 1) => b.llamacpp.host.clone(),
+            (BackendKind::LlamaCpp, 2) => b.llamacpp.port.to_string(),
+            (BackendKind::Vllm, 0) => b.vllm.bin.clone(),
+            (BackendKind::Vllm, 1) => b.vllm.host.clone(),
+            (BackendKind::Vllm, 2) => b.vllm.port.to_string(),
+            (BackendKind::Sglang, 0) => b.sglang.bin.clone(),
+            (BackendKind::Sglang, 1) => b.sglang.host.clone(),
+            (BackendKind::Sglang, 2) => b.sglang.port.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write a field back into `config.backends`. Ports that don't parse are
+    /// ignored (the last valid value stays).
+    fn set_backend_field_value(&mut self, kind: BackendKind, idx: usize, val: &str) {
+        let v = val.trim().to_string();
+        let b = &mut self.config.backends;
+        match (kind, idx) {
+            (BackendKind::Ollama, 0) => b.ollama.base_url = v,
+            (BackendKind::LlamaCpp, 0) => b.llamacpp.bin = v,
+            (BackendKind::LlamaCpp, 1) => b.llamacpp.host = v,
+            (BackendKind::LlamaCpp, 2) => {
+                if let Ok(p) = v.parse() {
+                    b.llamacpp.port = p;
+                }
+            }
+            (BackendKind::Vllm, 0) => b.vllm.bin = v,
+            (BackendKind::Vllm, 1) => b.vllm.host = v,
+            (BackendKind::Vllm, 2) => {
+                if let Ok(p) = v.parse() {
+                    b.vllm.port = p;
+                }
+            }
+            (BackendKind::Sglang, 0) => b.sglang.bin = v,
+            (BackendKind::Sglang, 1) => b.sglang.host = v,
+            (BackendKind::Sglang, 2) => {
+                if let Ok(p) = v.parse() {
+                    b.sglang.port = p;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Load the selected field's current value into the edit buffer.
+    fn load_field_edit(&mut self) {
+        let k = self.backend_sel_kind();
+        self.backend_field_edit = self.backend_field_value(k, self.backend_field);
+    }
+
+    /// Commit the edit buffer back into config for the selected field.
+    fn commit_field_edit(&mut self) {
+        let k = self.backend_sel_kind();
+        let v = self.backend_field_edit.clone();
+        self.set_backend_field_value(k, self.backend_field, &v);
+    }
+
+    fn save_backend_config(&mut self) {
+        self.commit_field_edit();
+        if let Err(e) = self.config.save(&self.paths) {
+            self.raise_error(e);
+            return;
+        }
+        // Rebuilding the registry drops backend Arcs; for a backend with a
+        // managed child that would kill it (kill_on_drop). Only rebuild when no
+        // runtime is active — otherwise persist and defer to a restart.
+        if self.runtimes.is_empty() {
+            self.registry = Arc::new(BackendRegistry::from_config(&self.config));
+            self.start_detect();
+            self.set_status("Backend config saved & applied", false);
+        } else {
+            self.set_status(
+                "Backend config saved — restart LocalCode (or stop runtimes) to apply",
+                false,
+            );
+        }
+    }
+
+    /// Show the install plan: automated plans go through a confirm dialog that
+    /// prints the exact commands; unautomatable ones show honest manual steps.
+    fn start_install(&mut self, kind: BackendKind) {
+        if self.install_busy.is_some() {
+            self.set_status("An install is already running (Esc to cancel)", false);
+            return;
+        }
+        match resolve_install_plan(kind) {
+            InstallPlan::Automated { display, .. } => {
+                let body = format!(
+                    "LocalCode will run:\n\n{display}\n\n{}Esc cancels — nothing runs until you confirm.",
+                    install_caveat(kind),
+                );
+                self.modal = Some(ModalState::confirm(
+                    format!("Install {}?", kind.as_str()),
+                    body,
+                    ConfirmAction::InstallBackend(kind),
+                ));
+            }
+            InstallPlan::Manual {
+                summary,
+                steps,
+                url,
+            } => {
+                let mut body = format!("{summary}\n\n");
+                for s in &steps {
+                    body.push_str(&format!("• {s}\n"));
+                }
+                body.push_str(&format!("\n{url}"));
+                self.modal = Some(ModalState::info(
+                    format!("Install {} — manual steps", kind.as_str()),
+                    body,
+                ));
+            }
+        }
+    }
+
+    /// Spawn the install (called after the confirm dialog). Streams output lines
+    /// through `InstallProgress`; Esc aborts (kill_on_drop stops the child).
+    fn spawn_install(&mut self, kind: BackendKind) {
+        if self.install_busy.is_some() {
+            self.set_status("An install is already running (Esc to cancel)", false);
+            return;
+        }
+        let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+        let fwd = self.bg_tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = prx.recv().await {
+                if fwd.send(BgMsg::InstallProgress(line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let tx = self.bg_tx.clone();
+        let handle = tokio::spawn(async move {
+            let plan = resolve_install_plan(kind);
+            let result = run_install(&plan, ptx).await;
+            let _ = tx.send(BgMsg::InstallDone { kind, result });
+        });
+        self.installing_kind = Some(kind);
+        self.install_progress_line = "starting…".into();
+        self.install_busy = Some(Busy {
+            kind: BusyKind::Install,
+            label: format!("Installing {}", kind.as_str()),
+            started: Instant::now(),
+            handle,
+        });
+    }
+
+    fn handle_backends_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.backend_editing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.commit_field_edit();
+                    self.backend_editing = false;
+                }
+                KeyCode::Backspace => {
+                    self.backend_field_edit.pop();
+                }
+                KeyCode::Char(c) => self.backend_field_edit.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            // Esc cancels a running install first (the status bar promises so);
+            // only closes the overlay when nothing is installing.
+            KeyCode::Esc => {
+                if !self.cancel_install() {
+                    self.backends_open = false;
+                }
+            }
+            KeyCode::Tab => {
+                self.backend_sel = (self.backend_sel + 1) % BACKEND_ORDER.len();
+                self.backend_field = 0;
+                self.load_field_edit();
+                self.refresh_plan_preview();
+            }
+            KeyCode::BackTab => {
+                self.backend_sel = (self.backend_sel + BACKEND_ORDER.len() - 1) % BACKEND_ORDER.len();
+                self.backend_field = 0;
+                self.load_field_edit();
+                self.refresh_plan_preview();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let n = self.backend_field_count();
+                if n > 0 {
+                    self.backend_field = (self.backend_field + n - 1) % n;
+                    self.load_field_edit();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let n = self.backend_field_count();
+                if n > 0 {
+                    self.backend_field = (self.backend_field + 1) % n;
+                    self.load_field_edit();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                self.load_field_edit();
+                self.backend_editing = true;
+            }
+            KeyCode::Char('i') => {
+                let k = self.backend_sel_kind();
+                self.start_install(k);
+            }
+            KeyCode::Char('s') => self.save_backend_config(),
+            KeyCode::Char('r') => {
+                self.start_detect();
+                self.set_status("Re-detecting backends…", false);
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Updates
     // ------------------------------------------------------------------
 
     /// Background version check. Startup checks (`manual=false`) stay quiet
     /// unless an update exists; manual checks always report the outcome.
     pub fn start_update_check(&mut self, manual: bool) {
-        let checker = match UpdateChecker::new(
-            &self.config.updates.repo_url,
-            &self.config.updates.branch,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                if manual {
-                    self.raise_error(e);
+        let checker =
+            match UpdateChecker::new(&self.config.updates.repo_url, &self.config.updates.branch) {
+                Ok(c) => c,
+                Err(e) => {
+                    if manual {
+                        self.raise_error(e);
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
         if manual {
             self.set_status("Checking for updates…", false);
         }
@@ -1157,7 +1529,10 @@ impl App {
 
     fn open_update_modal(&mut self) {
         if let Some(v) = &self.update_installed {
-            self.set_status(format!("v{v} already installed — restart LocalCode to apply"), false);
+            self.set_status(
+                format!("v{v} already installed — restart LocalCode to apply"),
+                false,
+            );
             return;
         }
         if self.update_busy.is_some() {
@@ -1248,8 +1623,7 @@ impl App {
                     self.finish_busy();
                     match result {
                         Ok(detail) => {
-                            self.selected_quant =
-                                detail.quants.first().map(|q| q.label.clone());
+                            self.selected_quant = detail.quants.first().map(|q| q.label.clone());
                             self.model_detail = Some(detail);
                             self.card_scroll = 0;
                             self.refresh_fit();
@@ -1426,10 +1800,7 @@ impl App {
                             self.push_notification(
                                 Severity::Success,
                                 "Update installed",
-                                &format!(
-                                    "v{} — restart LocalCode to apply",
-                                    report.version
-                                ),
+                                &format!("v{} — restart LocalCode to apply", report.version),
                             );
                             self.modal = Some(ModalState::info(
                                 "Update installed",
@@ -1442,6 +1813,34 @@ impl App {
                         }
                         Err(e) => {
                             self.last_failed_action = Some(RetryAction::InstallUpdate);
+                            self.raise_error(e);
+                        }
+                    }
+                }
+                BgMsg::InstallProgress(line) => {
+                    self.install_progress_line = line;
+                }
+                BgMsg::InstallDone { kind, result } => {
+                    self.install_busy = None;
+                    self.installing_kind = None;
+                    self.install_progress_line.clear();
+                    match result {
+                        Ok(()) => {
+                            self.push_notification(
+                                Severity::Success,
+                                "Backend installed",
+                                &format!("{} installed — re-detecting", kind.as_str()),
+                            );
+                            self.set_status(
+                                format!("{} installed — re-detecting…", kind.as_str()),
+                                false,
+                            );
+                            // Freshly-installed binary is picked up by detect()
+                            // (which::which is live); no registry rebuild needed.
+                            self.start_detect();
+                        }
+                        Err(e) => {
+                            self.last_failed_action = Some(RetryAction::InstallBackend(kind));
                             self.raise_error(e);
                         }
                     }
@@ -1523,6 +1922,7 @@ impl App {
             "Deploy selected model".into(),
             "New coding session".into(),
             "Run doctor".into(),
+            "Manage backends".into(),
             "Refresh backend detection".into(),
             "Check for updates".into(),
             "Clear notifications".into(),
@@ -1558,6 +1958,7 @@ impl App {
                 self.start_doctor();
                 self.set_tab(Tab::Setup);
             }
+            "Manage backends" => self.open_backend_manager(),
             "Refresh backend detection" => self.start_detect(),
             "Check for updates" => self.start_update_check(true),
             "Install update" => self.open_update_modal(),
@@ -1582,21 +1983,21 @@ impl App {
     fn open_help(&mut self) {
         let tab_help = match self.tab {
             Tab::Models => {
-                "Models:\n  / search   p popular   t trending\n  ←/→ focus list or card   j/k move / scroll\n  Enter open detail   PgUp/PgDn·g/G scroll card\n  ,/. pick quant   +/- context size\n  b cycle backend   d deploy\n  [ ] resize list/card   { } resize card/deploy"
+                "Models:\n  Click a model to open it · click the card to focus\n  Drag the pane borders to resize · scroll to move/read\n  / search   p popular   t trending\n  ,/. quant   +/- context   b backend   d deploy"
             }
             Tab::Coding => {
-                "Coding:\n  i or Enter focus composer   Esc unfocus\n  ↑/↓ input history (while typing)\n  PgUp/PgDn scroll transcript   End follow\n  Ctrl+↑/↓ (or +/-) composer height\n  n new session"
+                "Coding:\n  Click the composer to type · click the transcript to scroll\n  Enter send   ↑/↓ input history   Esc unfocus\n  Ctrl+↑/↓ (or +/-) composer height   n new session"
             }
             Tab::Benchmarks => "Benchmarks:\n  r run sample suite   p publish (sign-in)",
-            Tab::Dashboard => "Dashboard:\n  j/k select runtime   x stop runtime\n  [ ] resize columns",
-            Tab::Setup => "Setup:\n  d run doctor   r refresh detection\n  PgUp/PgDn scroll",
-            Tab::Notifications => "Notifications:\n  j/k select   c clear all",
+            Tab::Dashboard => "Dashboard:\n  Click or scroll to select a runtime · x stop\n  Drag the pane border to resize",
+            Tab::Setup => "Setup:\n  Scroll to read · m manage & install backends · d run doctor · r refresh detection",
+            Tab::Notifications => "Notifications:\n  Click or scroll to select   c clear all",
             Tab::Settings => "Settings:\n  t cycle theme   Ctrl+S save config",
         };
         let body = format!(
-            "Global:\n  1-7 switch tab   Tab/Shift+Tab cycle tabs (click them too)\n  Ctrl+K palette   ? this help\n  a ask assistant   u install update   e last error details\n  l show log path   Esc cancel running task\n  q quit   Ctrl+C force quit   Ctrl+S save config\n\n{tab_help}"
+            "Global:\n  Click a tab (or Tab/Shift+Tab) to switch\n  Mouse: click to focus/select · drag borders to resize · wheel to scroll\n  Ctrl+K palette   ? this help\n  a ask assistant   u install update   e last error details\n  l show log path   Esc cancel running task\n  q quit   Ctrl+C force quit   Ctrl+S save config\n\n{tab_help}"
         );
-        self.modal = Some(ModalState::info("Keyboard shortcuts", body));
+        self.modal = Some(ModalState::info("Controls", body));
     }
 
     fn request_quit(&mut self) {
@@ -1637,6 +2038,10 @@ impl App {
                     return;
                 }
                 KeyCode::Char('s') => {
+                    // Keep the in-progress backend field edit in the saved file.
+                    if self.backends_open {
+                        self.commit_field_edit();
+                    }
                     if let Err(e) = self.config.save(&self.paths) {
                         self.raise_error(e);
                     } else {
@@ -1672,14 +2077,17 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => self.assistant_open = false,
                 KeyCode::Up => self.assistant_scroll = self.assistant_scroll.saturating_sub(1),
                 KeyCode::Down => self.assistant_scroll = self.assistant_scroll.saturating_add(1),
-                KeyCode::PageUp => {
-                    self.assistant_scroll = self.assistant_scroll.saturating_sub(10)
-                }
+                KeyCode::PageUp => self.assistant_scroll = self.assistant_scroll.saturating_sub(10),
                 KeyCode::PageDown => {
                     self.assistant_scroll = self.assistant_scroll.saturating_add(10)
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if self.backends_open {
+            self.handle_backends_key(key);
             return;
         }
 
@@ -1710,13 +2118,6 @@ impl App {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('e') => self.open_error_modal(),
-            KeyCode::Char('1') => self.set_tab(Tab::Dashboard),
-            KeyCode::Char('2') => self.set_tab(Tab::Models),
-            KeyCode::Char('3') => self.set_tab(Tab::Benchmarks),
-            KeyCode::Char('4') => self.set_tab(Tab::Coding),
-            KeyCode::Char('5') => self.set_tab(Tab::Setup),
-            KeyCode::Char('6') => self.set_tab(Tab::Notifications),
-            KeyCode::Char('7') => self.set_tab(Tab::Settings),
             KeyCode::Tab => {
                 let idx = (self.tab.index() + 1) % 7;
                 self.set_tab(Tab::from_index(idx));
@@ -1840,9 +2241,7 @@ impl App {
                     ModelsPane::Card => self.scroll_card(1),
                 },
                 KeyCode::Up | KeyCode::Char('k') => match self.models_focus {
-                    ModelsPane::List => {
-                        self.model_selected = self.model_selected.saturating_sub(1)
-                    }
+                    ModelsPane::List => self.model_selected = self.model_selected.saturating_sub(1),
                     ModelsPane::Card => self.scroll_card(-1),
                 },
                 KeyCode::PageDown => self.scroll_card(self.card_view_height.max(1) as i64),
@@ -1885,7 +2284,11 @@ impl App {
                     let max = self
                         .coding_total_lines
                         .saturating_sub(self.coding_view_height as usize);
-                    let cur = if self.coding_follow { max } else { self.coding_scroll };
+                    let cur = if self.coding_follow {
+                        max
+                    } else {
+                        self.coding_scroll
+                    };
                     self.coding_scroll =
                         cur.saturating_sub(self.coding_view_height.max(1) as usize);
                     self.coding_follow = false;
@@ -1894,9 +2297,8 @@ impl App {
                     let max = self
                         .coding_total_lines
                         .saturating_sub(self.coding_view_height as usize);
-                    self.coding_scroll = (self.coding_scroll
-                        + self.coding_view_height.max(1) as usize)
-                        .min(max);
+                    self.coding_scroll =
+                        (self.coding_scroll + self.coding_view_height.max(1) as usize).min(max);
                     if self.coding_scroll >= max {
                         self.coding_follow = true;
                     }
@@ -1928,6 +2330,7 @@ impl App {
             },
             Tab::Setup => match code {
                 KeyCode::Char('d') => self.start_doctor(),
+                KeyCode::Char('m') => self.open_backend_manager(),
                 KeyCode::Char('r') => {
                     self.start_detect();
                     self.set_status("Re-detecting backends…", false);
@@ -2031,55 +2434,66 @@ impl App {
                 }
                 self.modal = None;
             }
-            KeyCode::Enter => {
-                let label = modal.selected_button();
-                let kind = modal.kind.clone();
-                self.modal = None;
-                match (&kind, label) {
-                    (ModalKind::Error { .. }, "Retry") => self.retry_last(),
-                    (ModalKind::Error { .. }, "Open logs") => {
-                        self.set_status(
-                            format!("Logs: {}", self.paths.log_dir.display()),
-                            false,
-                        );
-                    }
-                    (ModalKind::Error { .. }, "Ask assistant") => self.start_assistant(),
-                    (ModalKind::Warning { .. }, "Continue") => {
-                        if let Some(mut req) = self.pending_oversize_deploy.take() {
-                            req.continue_despite_oversize = true;
-                            self.spawn_deploy(req);
-                        }
-                    }
-                    (ModalKind::Warning { .. }, "Cancel") => {
-                        self.pending_oversize_deploy = None;
-                        self.set_status("Deploy cancelled", false);
-                    }
-                    (
-                        ModalKind::Confirm {
-                            action: ConfirmAction::Quit,
-                            ..
-                        },
-                        "Confirm",
-                    ) => self.should_quit = true,
-                    (
-                        ModalKind::Confirm {
-                            action: ConfirmAction::InstallUpdate,
-                            ..
-                        },
-                        "Confirm",
-                    ) => self.start_install_update(),
-                    (
-                        ModalKind::Confirm {
-                            action: ConfirmAction::ToolApproval,
-                            ..
-                        },
-                        label,
-                    ) => self.respond_tool_confirm(label == "Confirm"),
-                    (ModalKind::Payment { .. }, "Confirm pay") => {
-                        self.set_status("Confirmed", false);
-                    }
-                    _ => {}
+            KeyCode::Enter => self.activate_modal_button(),
+            _ => {}
+        }
+    }
+
+    /// Run the currently-selected modal button's action. Shared by the Enter
+    /// key and by clicking a button (which sets `selected` first).
+    fn activate_modal_button(&mut self) {
+        let Some(modal) = self.modal.clone() else {
+            return;
+        };
+        let label = modal.selected_button();
+        let kind = modal.kind.clone();
+        self.modal = None;
+        match (&kind, label) {
+            (ModalKind::Error { .. }, "Retry") => self.retry_last(),
+            (ModalKind::Error { .. }, "Open logs") => {
+                self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false);
+            }
+            (ModalKind::Error { .. }, "Ask assistant") => self.start_assistant(),
+            (ModalKind::Warning { .. }, "Continue") => {
+                if let Some(mut req) = self.pending_oversize_deploy.take() {
+                    req.continue_despite_oversize = true;
+                    self.spawn_deploy(req);
                 }
+            }
+            (ModalKind::Warning { .. }, "Cancel") => {
+                self.pending_oversize_deploy = None;
+                self.set_status("Deploy cancelled", false);
+            }
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::Quit,
+                    ..
+                },
+                "Confirm",
+            ) => self.should_quit = true,
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::InstallUpdate,
+                    ..
+                },
+                "Confirm",
+            ) => self.start_install_update(),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::InstallBackend(kind),
+                    ..
+                },
+                "Confirm",
+            ) => self.spawn_install(*kind),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::ToolApproval,
+                    ..
+                },
+                label,
+            ) => self.respond_tool_confirm(label == "Confirm"),
+            (ModalKind::Payment { .. }, "Confirm pay") => {
+                self.set_status("Confirmed", false);
             }
             _ => {}
         }
@@ -2102,13 +2516,7 @@ impl App {
             KeyCode::Backspace => {
                 self.palette_query.pop();
             }
-            KeyCode::Enter => {
-                let items = self.palette_items();
-                if let Some(item) = items.get(self.palette_selected).cloned() {
-                    self.palette_open = false;
-                    self.run_palette_action(&item);
-                }
-            }
+            KeyCode::Enter => self.run_selected_palette_item(),
             KeyCode::Char(c) => {
                 self.palette_query.push(c);
                 self.palette_selected = 0;
@@ -2117,56 +2525,314 @@ impl App {
         }
     }
 
+    /// Run the currently-selected palette item. Shared by Enter and by clicking
+    /// an item (which sets `palette_selected` first).
+    fn run_selected_palette_item(&mut self) {
+        let items = self.palette_items();
+        if let Some(item) = items.get(self.palette_selected).cloned() {
+            self.palette_open = false;
+            self.run_palette_action(&item);
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        // Tab strip hit ranges are recorded during draw, so clicks always
+        use event::MouseButton::Left;
+        let (col, row) = (mouse.column, mouse.row);
+
+        // Tab strip hit ranges are recorded during draw, so clicks/hover always
         // match what is actually on screen.
-        self.tab_hover = if mouse.row == self.tab_strip_row {
+        self.tab_hover = if row == self.tab_strip_row {
             self.tab_hit
                 .iter()
-                .find(|(x0, x1, _)| mouse.column >= *x0 && mouse.column < *x1)
+                .find(|(x0, x1, _)| col >= *x0 && col < *x1)
                 .map(|(_, _, t)| *t)
         } else {
             None
         };
 
+        // While an overlay owns the screen, the view underneath is inert —
+        // tab clicks and border drags are suppressed (matches the key path,
+        // which routes to the overlay and returns).
+        let overlay =
+            self.modal.is_some() || self.palette_open || self.assistant_open || self.backends_open;
+
         match mouse.kind {
-            MouseEventKind::Down(event::MouseButton::Left) => {
-                if let Some(t) = self.tab_hover {
-                    self.set_tab(t);
+            MouseEventKind::Down(Left) => {
+                if !overlay {
+                    // Tabs first, then a draggable pane seam, then a normal click.
+                    if let Some(t) = self.tab_hover {
+                        self.set_tab(t);
+                        return;
+                    }
+                    if let Some(b) = self.hit_resize_border(col, row) {
+                        self.dragging = Some(DragState {
+                            view: b.view,
+                            idx: b.idx,
+                            area: b.area,
+                        });
+                        self.set_pane_boundary(b.view, b.idx, col, b.area);
+                        self.set_status("Resizing pane — drag the border, saved on quit", false);
+                        return;
+                    }
+                }
+                self.handle_left_click(col, row);
+            }
+            MouseEventKind::Drag(Left) => {
+                if let Some(d) = self.dragging {
+                    self.set_pane_boundary(d.view, d.idx, col, d.area);
                 }
             }
-            MouseEventKind::ScrollUp => self.wheel_scroll(-3),
-            MouseEventKind::ScrollDown => self.wheel_scroll(3),
+            MouseEventKind::Up(Left) => self.dragging = None,
+            MouseEventKind::ScrollUp => self.wheel_scroll_at(-3, col, row),
+            MouseEventKind::ScrollDown => self.wheel_scroll_at(3, col, row),
             _ => {}
         }
     }
 
-    /// Route the mouse wheel to the current view's main scrollable.
+    /// The draggable pane seam under `(col, row)`, if any. A ±1 column
+    /// tolerance makes the 1-cell border easy to grab.
+    fn hit_resize_border(&self, col: u16, row: u16) -> Option<ResizeBorder> {
+        self.resize_borders
+            .iter()
+            .copied()
+            .find(|b| row >= b.y0 && row < b.y1 && b.x.abs_diff(col) <= 1)
+    }
+
+    /// The topmost click region under `(col, row)`, if any. Regions recorded
+    /// later in the frame (overlays) win, hence the reverse scan.
+    fn region_at(&self, col: u16, row: u16) -> Option<ClickRegion> {
+        self.click_regions.iter().rev().copied().find(|r| {
+            col >= r.rect.x
+                && col < r.rect.x.saturating_add(r.rect.width)
+                && row >= r.rect.y
+                && row < r.rect.y.saturating_add(r.rect.height)
+        })
+    }
+
+    /// Move the seam between panes `idx` and `idx + 1` of `view` so it lands
+    /// under column `col`, trading width only between those two panes (others
+    /// stay fixed), with a 0.15 floor each side. Persisted like `[`/`]`.
+    fn set_pane_boundary(&mut self, view: &'static str, idx: usize, col: u16, area: Rect) {
+        let mut ratios = self.pane_ratios(view, Self::pane_defaults(view));
+        if idx + 1 >= ratios.len() || area.width == 0 {
+            return;
+        }
+        let left_frac: f32 = ratios[..idx].iter().sum();
+        let pair = ratios[idx] + ratios[idx + 1];
+        let raw = col.saturating_sub(area.x) as f32 / area.width as f32;
+        let mut a = (raw - left_frac).clamp(0.15, pair - 0.15);
+        if !a.is_finite() {
+            a = pair * 0.5; // pair < 0.30: degenerate, split evenly
+        }
+        ratios[idx] = a;
+        ratios[idx + 1] = pair - a;
+        let sum: f32 = ratios.iter().sum();
+        if sum > 0.0 {
+            for r in &mut ratios {
+                *r /= sum;
+            }
+        }
+        self.config.panes.views.insert(view.into(), ratios);
+    }
+
+    /// Dispatch a left click to whatever region it landed on. While a modal or
+    /// palette is open, only that overlay's controls are actionable.
+    fn handle_left_click(&mut self, col: u16, row: u16) {
+        // The assistant dock covers the view and is dismissed with Esc/q; it
+        // has no click controls, so swallow clicks rather than passing them
+        // through to whatever is drawn underneath.
+        if self.assistant_open {
+            return;
+        }
+        let Some(region) = self.region_at(col, row) else {
+            return;
+        };
+
+        if self.modal.is_some() {
+            if let ClickTarget::ModalButton(i) = region.target {
+                if let Some(m) = &mut self.modal {
+                    m.selected = i;
+                }
+                self.activate_modal_button();
+            }
+            return;
+        }
+        if self.palette_open {
+            if let ClickTarget::PaletteItem(i) = region.target {
+                self.palette_selected = i;
+                self.run_selected_palette_item();
+            }
+            return;
+        }
+        if self.backends_open {
+            let rel_row = row.saturating_sub(region.rect.y) as usize;
+            match region.target {
+                ClickTarget::BackendMgrItem => {
+                    if rel_row < BACKEND_ORDER.len() {
+                        self.commit_field_edit();
+                        self.backend_sel = rel_row;
+                        self.backend_field = 0;
+                        self.backend_editing = false;
+                        self.load_field_edit();
+                        self.refresh_plan_preview();
+                    }
+                }
+                ClickTarget::BackendMgrField => {
+                    if rel_row < self.backend_field_count() {
+                        self.commit_field_edit();
+                        self.backend_field = rel_row;
+                        self.load_field_edit();
+                        self.backend_editing = true;
+                    }
+                }
+                ClickTarget::BackendMgrInstall => {
+                    let k = self.backend_sel_kind();
+                    self.start_install(k);
+                }
+                ClickTarget::BackendMgrSave => self.save_backend_config(),
+                ClickTarget::BackendMgrRedetect => {
+                    self.start_detect();
+                    self.set_status("Re-detecting backends…", false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Row index within a list = first visible row + click offset.
+        let rel_row = row.saturating_sub(region.rect.y) as usize;
+        match region.target {
+            ClickTarget::RuntimeList => {
+                if !self.runtimes.is_empty() {
+                    let idx = self.runtime_list_state.offset() + rel_row;
+                    if idx < self.runtimes.len() {
+                        self.runtime_selected = idx;
+                    }
+                }
+            }
+            ClickTarget::ModelSearch => self.model_search_focus = true,
+            ClickTarget::ModelList => {
+                self.model_search_focus = false;
+                self.models_focus = ModelsPane::List;
+                if !self.models.is_empty() {
+                    let idx = self.model_list_state.offset() + rel_row;
+                    if idx < self.models.len() {
+                        self.model_selected = idx;
+                        self.start_load_detail(); // single-click opens the card
+                    }
+                }
+            }
+            ClickTarget::ModelCard => {
+                if self.model_detail.is_some() {
+                    self.models_focus = ModelsPane::Card;
+                }
+            }
+            ClickTarget::SetupManageBackends => self.open_backend_manager(),
+            ClickTarget::Composer => self.coding_input_focus = true,
+            ClickTarget::Transcript => self.coding_input_focus = false,
+            ClickTarget::NotificationList => {
+                if !self.notifications.is_empty() {
+                    let idx = self.notif_list_state.offset() + rel_row;
+                    if idx < self.notifications.len() {
+                        self.notif_selected = idx;
+                    }
+                }
+            }
+            // Panels with no per-click action (their keys still work).
+            ClickTarget::DeployPane | ClickTarget::SetupBody => {}
+            ClickTarget::ModalButton(_) | ClickTarget::PaletteItem(_) => {}
+            // Handled above in the `backends_open` branch.
+            ClickTarget::BackendMgrItem
+            | ClickTarget::BackendMgrField
+            | ClickTarget::BackendMgrInstall
+            | ClickTarget::BackendMgrSave
+            | ClickTarget::BackendMgrRedetect => {}
+        }
+    }
+
+    /// Route the wheel to whatever scrollable is under the cursor, falling back
+    /// to the active tab's main scrollable.
+    fn wheel_scroll_at(&mut self, delta: i64, col: u16, row: u16) {
+        match self.region_at(col, row).map(|r| r.target) {
+            Some(ClickTarget::ModelList) => self.scroll_list_models(delta),
+            Some(ClickTarget::ModelCard) | Some(ClickTarget::DeployPane) => self.scroll_card(delta),
+            Some(ClickTarget::Transcript) => self.scroll_transcript(delta),
+            Some(ClickTarget::SetupBody) => {
+                self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
+            }
+            Some(ClickTarget::NotificationList) => self.scroll_notifs(delta),
+            Some(ClickTarget::RuntimeList) => self.scroll_runtimes(delta),
+            _ => self.wheel_scroll(delta),
+        }
+    }
+
+    /// Fallback wheel routing by active tab (cursor not over a known region).
     fn wheel_scroll(&mut self, delta: i64) {
         match self.tab {
-            Tab::Coding => {
-                let max = self
-                    .coding_total_lines
-                    .saturating_sub(self.coding_view_height as usize);
-                let cur = if self.coding_follow {
-                    max
-                } else {
-                    self.coding_scroll
-                };
-                self.coding_scroll = (cur as i64 + delta).clamp(0, max as i64) as usize;
-                self.coding_follow = self.coding_scroll >= max;
-            }
+            Tab::Coding => self.scroll_transcript(delta),
             Tab::Models => self.scroll_card(delta),
             Tab::Setup => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
             }
-            Tab::Notifications if !self.notifications.is_empty() => {
-                let max = self.notifications.len() as i64 - 1;
-                self.notif_selected =
-                    (self.notif_selected as i64 + delta.signum()).clamp(0, max) as usize;
-            }
+            Tab::Notifications => self.scroll_notifs(delta),
             _ => {}
         }
+    }
+
+    fn scroll_transcript(&mut self, delta: i64) {
+        let max = self
+            .coding_total_lines
+            .saturating_sub(self.coding_view_height as usize);
+        let cur = if self.coding_follow {
+            max
+        } else {
+            self.coding_scroll
+        };
+        self.coding_scroll = (cur as i64 + delta).clamp(0, max as i64) as usize;
+        self.coding_follow = self.coding_scroll >= max;
+    }
+
+    fn scroll_notifs(&mut self, delta: i64) {
+        if self.notifications.is_empty() {
+            return;
+        }
+        let max = self.notifications.len() as i64 - 1;
+        self.notif_selected = (self.notif_selected as i64 + delta.signum()).clamp(0, max) as usize;
+    }
+
+    fn scroll_list_models(&mut self, delta: i64) {
+        if self.models.is_empty() {
+            return;
+        }
+        let max = self.models.len() as i64 - 1;
+        self.model_selected = (self.model_selected as i64 + delta.signum()).clamp(0, max) as usize;
+    }
+
+    fn scroll_runtimes(&mut self, delta: i64) {
+        if self.runtimes.is_empty() {
+            return;
+        }
+        let max = self.runtimes.len() as i64 - 1;
+        self.runtime_selected =
+            (self.runtime_selected as i64 + delta.signum()).clamp(0, max) as usize;
+    }
+}
+
+/// Fixed display order of backends in the manager overlay.
+pub(crate) const BACKEND_ORDER: [BackendKind; 4] = [
+    BackendKind::Ollama,
+    BackendKind::LlamaCpp,
+    BackendKind::Vllm,
+    BackendKind::Sglang,
+];
+
+/// Extra context shown above the install confirm command, per backend.
+fn install_caveat(kind: BackendKind) -> String {
+    match kind {
+        BackendKind::Vllm | BackendKind::Sglang => {
+            "Note: vLLM and SGLang are Linux-preferred; on Windows this is best-effort.\n\n".into()
+        }
+        _ => String::new(),
     }
 }
 
@@ -2245,4 +2911,63 @@ async fn run_loop(
     // Persist pane ratios etc.
     let _ = app.config.save(&app.paths);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn test_app() -> App {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        App::new(paths, Config::default())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn backend_manager_open_navigate_edit_and_install_modal() {
+        let mut app = test_app();
+        // Skip the detect spawn (this sync test has no tokio runtime).
+        app.detecting = true;
+
+        app.open_backend_manager();
+        assert!(app.backends_open);
+        assert_eq!(app.backend_sel_kind(), BackendKind::Ollama);
+
+        // Tab cycles backends and resets the field selection.
+        app.handle_backends_key(key(KeyCode::Tab));
+        assert_eq!(app.backend_sel_kind(), BackendKind::LlamaCpp);
+        assert_eq!(app.backend_field, 0);
+        app.handle_backends_key(key(KeyCode::BackTab));
+        assert_eq!(app.backend_sel_kind(), BackendKind::Ollama);
+
+        // Edit base_url: 'e' focuses the field, Enter commits to config.
+        app.handle_backends_key(key(KeyCode::Char('e')));
+        assert!(app.backend_editing);
+        app.backend_field_edit = "http://host:1234".into();
+        app.handle_backends_key(key(KeyCode::Enter));
+        assert!(!app.backend_editing);
+        assert_eq!(app.config.backends.ollama.base_url, "http://host:1234");
+
+        // Install shows a modal (confirm or manual) but never spawns here.
+        app.start_install(BackendKind::Ollama);
+        assert!(app.modal.is_some());
+        assert!(app.install_busy.is_none());
+
+        // With no install running, Esc closes the overlay.
+        app.modal = None;
+        app.handle_backends_key(key(KeyCode::Esc));
+        assert!(!app.backends_open);
+    }
+
+    #[test]
+    fn llamacpp_has_three_editable_fields() {
+        assert_eq!(App::backend_field_labels(BackendKind::LlamaCpp).len(), 3);
+        assert_eq!(App::backend_field_labels(BackendKind::Ollama), &["base_url"]);
+    }
 }

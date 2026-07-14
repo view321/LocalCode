@@ -1,6 +1,7 @@
 //! Local inference backend adapters.
 
 mod deploy;
+mod install;
 mod ollama;
 mod llamacpp;
 mod vllm;
@@ -8,6 +9,7 @@ mod sglang;
 mod registry;
 
 pub use deploy::{DeployJob, DeployProgress, DeployRequest, DeployService};
+pub use install::{resolve_install_plan, run_install, InstallPlan, InstallStep};
 pub use registry::BackendRegistry;
 pub use ollama::OllamaBackend;
 pub use llamacpp::LlamaCppBackend;
