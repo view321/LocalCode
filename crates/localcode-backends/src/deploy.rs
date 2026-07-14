@@ -142,6 +142,21 @@ impl DeployService {
     ) -> Result<DeployJob, LocalCodeError> {
         self.emit_progress(job_id, cid, 5, "Preflight checks");
 
+        // Fail fast on a format the backend can't load, before we spawn a server
+        // and hand the user a Python traceback. vLLM/SGLang serve HF checkpoints
+        // (safetensors/AWQ/GPTQ); a GGUF repo sends vLLM down its experimental
+        // GGUF path, which on many builds crashes at import.
+        if is_gguf_on_transformers_backend(req) {
+            return Err(LocalCodeError::new(
+                ErrorCode::DeployUnsupportedFormat,
+                format!("{} can't serve GGUF weights", req.backend.as_str()),
+            )
+            .with_correlation(*cid)
+            .with_cause("GGUF is a llama.cpp format; vLLM/SGLang load safetensors/AWQ/GPTQ checkpoints")
+            .with_hint("Deploy this GGUF model with the llama.cpp or Ollama backend (/backend)")
+            .with_hint("For vLLM, pick a full-precision or AWQ/GPTQ (safetensors) model"));
+        }
+
         self.emit_progress(job_id, cid, 10, "Ensuring backend ready");
         let backend = self.registry.get(req.backend)?;
         backend.ensure_ready().await?;
@@ -428,6 +443,27 @@ fn expand_mirror_candidates(url: &str, hosts: &[String]) -> Vec<String> {
     vec![url.to_string()]
 }
 
+/// True when a GGUF model is being deployed to a backend that loads HF
+/// transformers checkpoints rather than GGUF. Detected from the weight
+/// filenames (definitive) or a GGUF-style quant label (fallback when a model id
+/// is deployed without file metadata).
+fn is_gguf_on_transformers_backend(req: &DeployRequest) -> bool {
+    if !matches!(req.backend, BackendKind::Vllm | BackendKind::Sglang) {
+        return false;
+    }
+    let file_is_gguf = req
+        .weight_files
+        .iter()
+        .any(|f| f.to_lowercase().ends_with(".gguf"));
+    let label_is_gguf = req.quantization.as_deref().is_some_and(|q| {
+        let u = q.to_uppercase();
+        // GGUF K-quants (Q4_K_M, Q8_0, …) and I-quants (IQ4_XS, …); AWQ/GPTQ/
+        // FP16/INT8 (vLLM-servable safetensors labels) don't match.
+        u.contains("GGUF") || u.starts_with("IQ") || u.starts_with('Q')
+    });
+    file_is_gguf || label_is_gguf
+}
+
 fn sanitize_dir(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -476,5 +512,59 @@ mod tests {
         assert_eq!(download_percent(0, 0), 25);
         assert_eq!(download_percent(0, 100), 15);
         assert_eq!(download_percent(100, 100), 38);
+    }
+
+    fn req(backend: BackendKind, files: &[&str], quant: Option<&str>) -> DeployRequest {
+        DeployRequest {
+            model_id: "org/model".into(),
+            quantization: quant.map(Into::into),
+            weight_bytes: 0,
+            weight_files: files.iter().map(|s| s.to_string()).collect(),
+            download_urls: vec![],
+            local_path: None,
+            backend,
+            port: None,
+            context_length: 8192,
+            continue_despite_oversize: false,
+        }
+    }
+
+    #[test]
+    fn gguf_rejected_on_transformers_backends() {
+        assert!(is_gguf_on_transformers_backend(&req(
+            BackendKind::Vllm,
+            &["model-Q4_K_M.gguf"],
+            Some("Q4_K_M"),
+        )));
+        // Detected from the file even without a label.
+        assert!(is_gguf_on_transformers_backend(&req(
+            BackendKind::Sglang,
+            &["a.gguf"],
+            None,
+        )));
+    }
+
+    #[test]
+    fn safetensors_allowed_on_vllm() {
+        assert!(!is_gguf_on_transformers_backend(&req(
+            BackendKind::Vllm,
+            &["model.safetensors"],
+            Some("FP16"),
+        )));
+        assert!(!is_gguf_on_transformers_backend(&req(
+            BackendKind::Vllm,
+            &["model.safetensors"],
+            Some("AWQ"),
+        )));
+    }
+
+    #[test]
+    fn gguf_allowed_on_llamacpp() {
+        // The guard is transformers-backends only; llama.cpp wants GGUF.
+        assert!(!is_gguf_on_transformers_backend(&req(
+            BackendKind::LlamaCpp,
+            &["a.gguf"],
+            Some("Q4_K_M"),
+        )));
     }
 }

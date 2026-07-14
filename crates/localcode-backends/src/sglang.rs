@@ -26,7 +26,14 @@ impl SglangBackend {
         }
     }
 
-    fn python_bin() -> Option<std::path::PathBuf> {
+    /// Resolve the interpreter to launch SGLang with. After a clean-venv repair
+    /// `cfg.bin` is the venv's python (an absolute path); honor it so the repair
+    /// actually takes effect. Otherwise fall back to `python3`/`python` on PATH.
+    fn python_bin(&self) -> Option<std::path::PathBuf> {
+        let configured = std::path::PathBuf::from(&self.cfg.bin);
+        if configured.is_absolute() && configured.exists() {
+            return Some(configured);
+        }
         which::which("python3")
             .or_else(|_| which::which("python"))
             .ok()
@@ -34,8 +41,8 @@ impl SglangBackend {
 
     /// SGLang launches as `python -m sglang.launch_server`, so readiness means
     /// "the python interpreter can import sglang" — not a `sglang` binary.
-    async fn sglang_importable() -> bool {
-        let Some(py) = Self::python_bin() else {
+    async fn sglang_importable(&self) -> bool {
+        let Some(py) = self.python_bin() else {
             return false;
         };
         let check = tokio::process::Command::new(py)
@@ -58,8 +65,8 @@ impl InferenceBackend for SglangBackend {
     }
 
     async fn detect(&self) -> DetectReport {
-        let python = Self::python_bin().map(|p| p.display().to_string());
-        let importable = Self::sglang_importable().await;
+        let python = self.python_bin().map(|p| p.display().to_string());
+        let importable = self.sglang_importable().await;
         let mut notes = vec![
             "SGLang is launched via: python -m sglang.launch_server".into(),
             "Linux preferred host for SGLang".into(),
@@ -117,7 +124,7 @@ impl InferenceBackend for SglangBackend {
             .retryable(true));
         }
 
-        let py = Self::python_bin().ok_or_else(|| {
+        let py = self.python_bin().ok_or_else(|| {
             LocalCodeError::new(ErrorCode::BackendBinaryMissing, "python not found")
                 .with_correlation(cid)
         })?;

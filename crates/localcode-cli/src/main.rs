@@ -440,6 +440,26 @@ fn print_doctor_human(report: &serde_json::Value) {
             );
         }
     }
+    if let Some(smoke) = report.get("smoke").and_then(|s| s.as_array()) {
+        if !smoke.is_empty() {
+            println!("\nSmoke tests:");
+            for s in smoke {
+                let ok = s["ok"].as_bool().unwrap_or(false);
+                let mark = if ok { "✓" } else { "✗" };
+                println!(
+                    "  {mark} {} — {}",
+                    s["kind"].as_str().unwrap_or("?"),
+                    s["checked"].as_str().unwrap_or(""),
+                );
+                if let Some(dg) = s.get("diagnosis").filter(|d| !d.is_null()) {
+                    println!("      → {}", dg["summary"].as_str().unwrap_or(""));
+                    if dg.get("repair").is_some_and(|r| !r.is_null()) {
+                        println!("      → fix available: open LocalCode and click Fix (or /backends)");
+                    }
+                }
+            }
+        }
+    }
     if let Some(hf) = report.get("huggingface") {
         println!(
             "\nHugging Face: reachable={} token_set={}",

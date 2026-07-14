@@ -32,6 +32,7 @@ pub enum ErrorCode {
     DeployDiskLow,
     DeployDownloadFailed,
     DeployOversizedWarning,
+    DeployUnsupportedFormat,
     // Agent
     AgentToolFailed,
     AgentWorkspaceMissing,
@@ -88,6 +89,7 @@ impl ErrorCode {
             Self::DeployDiskLow => "DEPLOY_DISK_LOW",
             Self::DeployDownloadFailed => "DEPLOY_DOWNLOAD_FAILED",
             Self::DeployOversizedWarning => "DEPLOY_OVERSIZED_WARNING",
+            Self::DeployUnsupportedFormat => "DEPLOY_UNSUPPORTED_FORMAT",
             Self::AgentToolFailed => "AGENT_TOOL_FAILED",
             Self::AgentWorkspaceMissing => "AGENT_WORKSPACE_MISSING",
             Self::AgentMcpFailed => "AGENT_MCP_FAILED",

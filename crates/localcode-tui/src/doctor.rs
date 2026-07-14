@@ -1,6 +1,6 @@
 //! Doctor diagnostics for CLI and Setup.
 
-use localcode_backends::BackendRegistry;
+use localcode_backends::{smoke_test, BackendRegistry};
 use localcode_core::config::Config;
 use localcode_core::paths::AppPaths;
 use localcode_gpu::discover;
@@ -16,6 +16,17 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
 
     let registry = Arc::new(BackendRegistry::from_config(cfg));
     let backends = registry.detect_all().await;
+
+    // Smoke-test only *installed* backends (nothing to run otherwise). Each
+    // probe is timeout-bounded internally; running them concurrently keeps the
+    // added latency ≈ the slowest single probe rather than their sum.
+    let smoke = futures::future::join_all(
+        backends
+            .iter()
+            .filter(|r| r.installed)
+            .map(|r| smoke_test(r, cfg)),
+    )
+    .await;
 
     // Use the same env-resolved endpoints the actual clients use.
     let (hf_endpoint, hf_api_endpoint) = cfg.hf_endpoints();
@@ -35,6 +46,7 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
         },
         "gpu": gpu,
         "backends": backends,
+        "smoke": smoke,
         "huggingface": {
             "endpoint": hf_endpoint,
             "api_endpoint": hf_api_endpoint,

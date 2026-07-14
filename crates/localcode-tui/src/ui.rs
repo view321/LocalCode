@@ -303,6 +303,25 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
         height: 1,
     };
 
+    // A pending sudo password prompt takes over the omnibar: masked input, plus
+    // the exact command it authorizes (re-shown from the confirm banner).
+    if let Some((len, cmd)) = app.sudo_prompt() {
+        let label = "sudo password: ";
+        let dots = "•".repeat(len.min(64));
+        let hint = " ↵ run · Esc cancel";
+        let used = label.width() + dots.width() + hint.width() + 6;
+        let cmd_room = (row.width as usize).saturating_sub(used);
+        let cmd_clip = clip(&cmd, cmd_room);
+        let spans = vec![
+            Span::styled(label, theme::muted(&th)),
+            Span::styled(dots, fg(&th)),
+            Span::styled(format!("   {cmd_clip}"), theme::faint(&th)),
+            Span::styled(hint, theme::faint(&th)),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+        return;
+    }
+
     let commanding = app.slash_active();
     let mut spans: Vec<Span> = Vec::new();
     if !commanding && app.mode != Mode::Chat {
@@ -964,15 +983,19 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
     use crate::app::BACKEND_ORDER;
     let th = app.theme;
     let inner = pad(area);
-    // Header (row 0). Rows are rendered directly at known y so click regions
-    // map exactly, regardless of terminal width.
+    // Rows are rendered directly at a running y so click regions map exactly,
+    // regardless of terminal width or the variable-height smoke result row.
     f.render_widget(
         Paragraph::new(Span::styled("backends", theme::muted(&th))),
         Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
     );
-    let row0 = inner.y + 2;
+    let bottom = inner.y + inner.height;
     let spin = spinner_frame(app);
+    let mut y = inner.y + 2;
     for (i, kind) in BACKEND_ORDER.iter().enumerate() {
+        if y >= bottom {
+            break;
+        }
         let report = app.backend_reports.iter().find(|r| r.kind == *kind);
         let installing = app.installing_kind == Some(*kind);
         let (status, ready) = if installing {
@@ -994,42 +1017,104 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!("{:<10}", kind.as_str()), name_style),
             Span::styled(format!("{status:<14}"), theme::muted(&th)),
         ];
-        let note = report.and_then(|r| r.notes.first().cloned()).unwrap_or_default();
-        if installing {
+        // Primary-row action: install (not ready) or smoke-test (ready).
+        let row_action = if installing {
             if let Some(c) = spin {
                 spans.push(Span::styled(format!("{c} "), theme::work(&th)));
             }
             spans.push(Span::styled(app.install_progress_line.clone(), theme::faint(&th)));
+            None
         } else if !ready {
             spans.push(Span::styled("[ install ]", theme::accent(&th)));
-        } else if !note.is_empty() {
-            spans.push(Span::styled(note, theme::faint(&th)));
+            Some(ClickTarget::BackendInstall(i))
+        } else {
+            spans.push(Span::styled("[ smoke-test ]", theme::accent(&th)));
+            Some(ClickTarget::BackendSmoke(i))
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
+        );
+        if let Some(t) = row_action {
+            click(app, Rect { x: inner.x, y, width: inner.width, height: 1 }, t);
         }
-        let ry = row0 + i as u16;
-        if ry < inner.y + inner.height {
-            f.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect { x: inner.x, y: ry, width: inner.width, height: 1 },
-            );
-            if !ready && !installing {
-                click(app, Rect { x: inner.x, y: ry, width: inner.width, height: 1 }, ClickTarget::BackendInstall(i));
+        y += 1;
+
+        // Secondary row: the smoke result for this backend, if we have one.
+        if y < bottom {
+            if let Some(sr) = app.smoke_reports.iter().find(|r| r.kind == *kind) {
+                let (glyph, gstyle) = if sr.ok {
+                    ("✓", theme::accent(&th))
+                } else {
+                    ("✗", fg(&th))
+                };
+                let raw = sr
+                    .diagnosis
+                    .as_ref()
+                    .map(|d| d.summary.clone())
+                    .unwrap_or_else(|| if sr.ok { "passed".into() } else { sr.checked.clone() });
+                let summary = clip(&raw, inner.width.saturating_sub(20) as usize);
+                let prefix = format!("    {glyph} {summary}  ");
+                let pw = prefix.width() as u16;
+                let has_fix = sr
+                    .diagnosis
+                    .as_ref()
+                    .and_then(|d| d.repair.as_ref())
+                    .is_some();
+                let mut l2 = vec![
+                    Span::styled(format!("    {glyph} "), gstyle),
+                    Span::styled(summary, theme::faint(&th)),
+                    Span::raw("  "),
+                ];
+                if has_fix {
+                    l2.push(Span::styled("[ fix ]", theme::accent(&th)));
+                }
+                f.render_widget(
+                    Paragraph::new(Line::from(l2)),
+                    Rect { x: inner.x, y, width: inner.width, height: 1 },
+                );
+                if has_fix {
+                    let fw = "[ fix ]".width() as u16;
+                    let fx = (inner.x + pw).min(inner.x + inner.width.saturating_sub(fw));
+                    click(app, Rect { x: fx, y, width: fw, height: 1 }, ClickTarget::BackendFix(i));
+                }
+                y += 1;
             }
         }
     }
 
-    let hint_y = row0 + BACKEND_ORDER.len() as u16 + 1;
-    if hint_y < inner.y + inner.height {
+    y += 1;
+    if y < bottom {
         let redetect = "[ re-detect ]";
         f.render_widget(
             Paragraph::new(Span::styled(redetect, theme::accent(&th))),
-            Rect { x: inner.x, y: hint_y, width: inner.width, height: 1 },
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
         click(
             app,
-            Rect { x: inner.x, y: hint_y, width: redetect.width() as u16, height: 1 },
+            Rect { x: inner.x, y, width: redetect.width() as u16, height: 1 },
             ClickTarget::BackendRedetect,
         );
     }
+}
+
+/// Truncate to at most `max` display columns, adding an ellipsis when clipped.
+fn clip(s: &str, max: usize) -> String {
+    if max == 0 || s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = c.to_string().width();
+        if w + cw + 1 > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------

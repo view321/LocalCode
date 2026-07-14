@@ -1846,6 +1846,7 @@ dependencies = [
  "tracing",
  "unicode-width 0.2.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

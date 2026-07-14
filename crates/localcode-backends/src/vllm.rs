@@ -160,15 +160,19 @@ impl InferenceBackend for VllmBackend {
                 }
             }
             if let Ok(Some(st)) = child.try_wait() {
+                let t = tail(12);
                 let mut err = LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
                     format!("vLLM exited: {st}"),
                 )
                 .with_correlation(cid)
-                .with_cause("vLLM stopped before serving the model")
-                .with_hint("GGUF-only repos aren't served by vLLM — pick a full (safetensors) model")
-                .with_hint("A too-large context or low VRAM can OOM at startup — try /context");
-                let t = tail(10);
+                .with_cause("vLLM stopped before serving the model");
+                // Hints depend on *why* it died — the output tells us. Getting
+                // this wrong is how a torch/vLLM install bug gets misread as a
+                // model-format problem.
+                for h in failure_hints(&t) {
+                    err = err.with_hint(h);
+                }
                 if !t.trim().is_empty() {
                     err = err.with_cause(format!("vLLM output:\n{t}"));
                 }
@@ -262,9 +266,50 @@ fn serve_args(model: &str, host: &str, port: u16, context_length: u32) -> Vec<St
     args
 }
 
+/// Map vLLM's dying output to targeted hints via the shared diagnosis engine.
+///
+/// The duplicate custom-op registration — `vllm::_fused_mul_mat_gguf`
+/// "registered ... multiple times" — is a broken or version-mismatched install,
+/// **not** a model-format problem: it fires while vLLM imports its quantization
+/// ops at startup, which happens for any model (safetensors included). Reporting
+/// it as "GGUF isn't supported" sends the user chasing the wrong thing. The
+/// classification now lives in `diagnose::classify` so it is shared with the
+/// smoke test and the Fix flow; only the vLLM-specific fallback stays here.
+fn failure_hints(output: &str) -> Vec<&'static str> {
+    let hints = crate::diagnose::classify(output).hints();
+    if hints.is_empty() {
+        // Nothing recognized — fall back to the format / VRAM guesses.
+        vec![
+            "GGUF-only repos aren't served by vLLM — pick a full (safetensors) model",
+            "A too-large context or low VRAM can OOM at startup — try /context",
+        ]
+    } else {
+        hints
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_crash_is_not_blamed_on_format() {
+        let out = "RuntimeError: Tried to register an operator (vllm::_fused_mul_mat_gguf(...)) \
+                   with the same name and overload name multiple times.";
+        let hints = failure_hints(out);
+        assert!(hints.iter().any(|h| h.contains("version-mismatched")));
+        assert!(
+            !hints.iter().any(|h| h.contains("GGUF-only")),
+            "must not misreport an install bug as a format problem"
+        );
+    }
+
+    #[test]
+    fn generic_exit_keeps_format_and_vram_hints() {
+        let hints = failure_hints("ValueError: model architecture not supported");
+        assert!(hints.iter().any(|h| h.contains("GGUF-only")));
+        assert!(hints.iter().any(|h| h.contains("/context")));
+    }
 
     #[test]
     fn serve_args_bound_kv_cache_to_context() {

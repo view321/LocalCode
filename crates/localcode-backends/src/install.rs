@@ -10,8 +10,10 @@
 //! would hang a stdin-null child waiting for a password — the plan is `Manual`
 //! with copy-paste steps, never a fabricated success.
 
+use crate::diagnose::RepairIntent;
 use crate::BackendKind;
 use localcode_core::error::{ErrorCode, LocalCodeError};
+use localcode_core::paths::AppPaths;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -29,6 +31,16 @@ pub enum InstallStep {
     /// time* (not plan time) so a Python installed by an earlier step is found
     /// even though this process's PATH was captured before that install.
     PipInstall { package: String },
+    /// A command that must run with elevated privileges. On Unix this runs as
+    /// `sudo [-n|-S] <program> <args>`; it is **never emitted on Windows**
+    /// (repairs there don't need elevation), so the non-elevated runner never
+    /// sees one. `display` is the `sudo …` form shown for approval — the
+    /// password (when one is needed) goes to stdin, never into `display`.
+    Sudo {
+        program: String,
+        args: Vec<String>,
+        display: String,
+    },
 }
 
 impl InstallStep {
@@ -36,6 +48,28 @@ impl InstallStep {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let display = format!("{program} {}", args.join(" "));
         InstallStep::Command {
+            program: program.to_string(),
+            args,
+            display,
+        }
+    }
+
+    /// Like [`command`](Self::command) but for programs/args only known at
+    /// resolve time (e.g. an absolute venv interpreter path).
+    fn command_owned(program: String, args: Vec<String>) -> Self {
+        let display = format!("{program} {}", args.join(" "));
+        InstallStep::Command {
+            program,
+            args,
+            display,
+        }
+    }
+
+    /// An elevated command. `display` is the `sudo …` preview shown for approval.
+    fn sudo(program: &str, args: &[&str]) -> Self {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let display = format!("sudo {program} {}", args.join(" "));
+        InstallStep::Sudo {
             program: program.to_string(),
             args,
             display,
@@ -57,6 +91,7 @@ impl InstallStep {
         match self {
             InstallStep::Command { display, .. } => display.clone(),
             InstallStep::PipInstall { package } => format!("python -m pip install {package}"),
+            InstallStep::Sudo { display, .. } => display.clone(),
         }
     }
 }
@@ -243,8 +278,9 @@ pub fn resolve_install_plan(kind: BackendKind) -> InstallPlan {
 
 /// Whether this process can gain root without an interactive password prompt:
 /// either it is already root, or `sudo` is configured passwordless. Used to
-/// decide whether a `sudo`-requiring installer can run non-interactively.
-fn can_elevate_noninteractively() -> bool {
+/// decide whether a `sudo`-requiring installer can run non-interactively — and
+/// by the repair flow to skip the password prompt entirely.
+pub fn can_elevate_noninteractively() -> bool {
     use std::process::{Command, Stdio};
     if let Ok(o) = Command::new("id").arg("-u").output() {
         if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0" {
@@ -357,6 +393,16 @@ async fn run_step(
                 format!("{} -m pip install {package}", py.display()),
             )
         }
+        // Elevated steps only appear in repair plans and are executed by
+        // `run_repair` (which has the password); they never reach this runner.
+        InstallStep::Sudo { display, .. } => {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendInstallFailed,
+                "Internal: an elevated step reached the non-elevated runner",
+            )
+            .with_correlation(cid)
+            .with_cause(format!("step: {display}")));
+        }
     };
 
     let _ = progress.send(format!("$ {display}"));
@@ -397,6 +443,308 @@ async fn run_step(
         .retryable(true));
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Repair plans (diagnosis → concrete fix)
+// ----------------------------------------------------------------------------
+
+/// After a repair's steps succeed, point a backend's `bin` at a new path and
+/// persist — how the managed-venv repair actually takes effect.
+#[derive(Debug, Clone)]
+pub struct Repoint {
+    pub kind: BackendKind,
+    pub bin: String,
+}
+
+/// A concrete, resolved repair: ordered steps plus an optional post-step
+/// repoint. Built from an abstract [`RepairIntent`] by [`resolve_repair`].
+#[derive(Debug, Clone)]
+pub struct RepairPlan {
+    pub title: String,
+    pub steps: Vec<InstallStep>,
+    /// Extra note shown above the command preview (e.g. "re-downloads wheels").
+    pub caveat: Option<String>,
+    pub repoint: Option<Repoint>,
+}
+
+impl RepairPlan {
+    /// True if any step needs elevation — the single source of truth for
+    /// whether the UI must collect a sudo password.
+    pub fn requires_sudo(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|s| matches!(s, InstallStep::Sudo { .. }))
+    }
+
+    /// One step per line for the confirm / preview banner.
+    pub fn display(&self) -> String {
+        self.steps
+            .iter()
+            .map(InstallStep::display)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Resolve an abstract [`RepairIntent`] into concrete commands for this machine.
+/// Impure (reads OS, PATH, Python); the pure counterpart is `diagnose`. Mirrors
+/// the `install_plan` / `resolve_install_plan` split.
+pub fn resolve_repair(
+    intent: &RepairIntent,
+    kind: BackendKind,
+    paths: &AppPaths,
+) -> Result<RepairPlan, LocalCodeError> {
+    let has = |b: &str| which::which(b).is_ok();
+    resolve_repair_with(
+        intent,
+        kind,
+        paths,
+        std::env::consts::OS,
+        &has,
+        discover_python(),
+    )
+}
+
+/// Testable core: OS, tool availability and the base interpreter are injected.
+fn resolve_repair_with(
+    intent: &RepairIntent,
+    kind: BackendKind,
+    paths: &AppPaths,
+    os: &str,
+    has: &dyn Fn(&str) -> bool,
+    base_python: Option<PathBuf>,
+) -> Result<RepairPlan, LocalCodeError> {
+    match intent {
+        RepairIntent::CleanVenvReinstall => clean_venv_reinstall(kind, paths, os, base_python),
+        RepairIntent::StartOllamaService => start_ollama_service(os, has),
+        RepairIntent::ReinstallFormula(formula) => reinstall_formula(formula, has),
+    }
+}
+
+/// Build a fresh venv under the app data dir, install the backend into it, and
+/// repoint the backend at that venv — the robust fix for a polluted global
+/// Python (the op-registration bug).
+fn clean_venv_reinstall(
+    kind: BackendKind,
+    paths: &AppPaths,
+    os: &str,
+    base_python: Option<PathBuf>,
+) -> Result<RepairPlan, LocalCodeError> {
+    let py = base_python.ok_or_else(|| {
+        LocalCodeError::new(
+            ErrorCode::BackendInstallFailed,
+            "No Python interpreter found to build a clean environment",
+        )
+        .with_hint("Install Python 3.10+ and put it on PATH, then try Fix again")
+    })?;
+    let windows = os == "windows";
+    let dir = paths.data_dir.join("venvs").join(kind.as_str());
+    let (bin_sub, exe_ext) = if windows { ("Scripts", ".exe") } else { ("bin", "") };
+    let venv_py = dir.join(bin_sub).join(format!("python{exe_ext}"));
+    let venv_py_s = venv_py.display().to_string();
+
+    let package = match kind {
+        BackendKind::Sglang => "sglang[all]",
+        _ => "vllm",
+    };
+
+    let steps = vec![
+        InstallStep::command_owned(
+            py.display().to_string(),
+            vec!["-m".into(), "venv".into(), dir.display().to_string()],
+        ),
+        InstallStep::command_owned(
+            venv_py_s.clone(),
+            vec![
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "--upgrade".into(),
+                "pip".into(),
+            ],
+        ),
+        InstallStep::command_owned(
+            venv_py_s.clone(),
+            vec![
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                package.into(),
+            ],
+        ),
+    ];
+
+    // vLLM is invoked as its own console script; SGLang as `<python> -m
+    // sglang.launch_server`, so its bin IS the venv interpreter.
+    let bin = match kind {
+        BackendKind::Vllm => dir
+            .join(bin_sub)
+            .join(format!("vllm{exe_ext}"))
+            .display()
+            .to_string(),
+        _ => venv_py_s,
+    };
+
+    Ok(RepairPlan {
+        title: format!("Reinstall {} in a clean environment", kind.as_str()),
+        steps,
+        caveat: Some("Builds a fresh virtualenv — re-downloads wheels (several minutes).".into()),
+        repoint: Some(Repoint { kind, bin }),
+    })
+}
+
+fn start_ollama_service(
+    os: &str,
+    has: &dyn Fn(&str) -> bool,
+) -> Result<RepairPlan, LocalCodeError> {
+    let steps = match os {
+        "linux" => vec![InstallStep::sudo("systemctl", &["start", "ollama"])],
+        "macos" if has("brew") => {
+            vec![InstallStep::command("brew", &["services", "start", "ollama"])]
+        }
+        _ => {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendInstallFailed,
+                "Can't start the Ollama service automatically here",
+            )
+            .with_hint("Start the Ollama app, then press re-detect"));
+        }
+    };
+    Ok(RepairPlan {
+        title: "Start the Ollama service".into(),
+        steps,
+        caveat: None,
+        repoint: None,
+    })
+}
+
+fn reinstall_formula(
+    formula: &str,
+    has: &dyn Fn(&str) -> bool,
+) -> Result<RepairPlan, LocalCodeError> {
+    if !has("brew") {
+        return Err(LocalCodeError::new(
+            ErrorCode::BackendInstallFailed,
+            "Homebrew isn't available to reinstall this formula",
+        )
+        .with_hint(format!("Reinstall {formula} with your system package manager")));
+    }
+    Ok(RepairPlan {
+        title: format!("Reinstall {formula}"),
+        steps: vec![InstallStep::command("brew", &["reinstall", formula])],
+        caveat: None,
+        repoint: None,
+    })
+}
+
+/// Run a repair plan's steps in order, streaming output. Elevated (`Sudo`) steps
+/// use `sudo -n` when passwordless elevation works, else `sudo -S` with
+/// `sudo_password` fed to stdin — which is NEVER forwarded to `progress` or
+/// logged.
+pub async fn run_repair(
+    plan: &RepairPlan,
+    sudo_password: Option<&str>,
+    progress: UnboundedSender<String>,
+) -> Result<(), LocalCodeError> {
+    let cid = localcode_core::CorrelationId::new();
+    for step in &plan.steps {
+        match step {
+            InstallStep::Sudo {
+                program,
+                args,
+                display,
+            } => {
+                run_sudo_step(program, args, display, sudo_password, &progress, cid).await?;
+            }
+            other => run_step(other, &progress, cid).await?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_sudo_step(
+    program: &str,
+    args: &[String],
+    display: &str,
+    password: Option<&str>,
+    progress: &UnboundedSender<String>,
+    cid: localcode_core::CorrelationId,
+) -> Result<(), LocalCodeError> {
+    use tokio::io::AsyncWriteExt;
+    let _ = progress.send(format!("$ {display}"));
+
+    let mut cmd = tokio::process::Command::new("sudo");
+    if password.is_some() {
+        // -S reads the password from stdin; -p "" silences the prompt text.
+        cmd.arg("-S").arg("-p").arg("");
+    } else {
+        cmd.arg("-n"); // passwordless sudo / already root
+    }
+    cmd.arg(program)
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        LocalCodeError::new(
+            ErrorCode::BackendInstallFailed,
+            format!("Failed to run sudo: {e}"),
+        )
+        .with_correlation(cid)
+        .with_hint(format!("Run it manually: {display}"))
+    })?;
+
+    // Feed the password to stdin then close it (EOF) so sudo proceeds. The
+    // password only ever travels this pipe — never `progress`, never tracing.
+    if let Some(pw) = password {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(pw.as_bytes()).await;
+            let _ = stdin.write_all(b"\n").await;
+            let _ = stdin.flush().await;
+        }
+    }
+
+    forward_lines(child.stdout.take(), progress.clone());
+    forward_lines(child.stderr.take(), progress.clone());
+
+    let status = child.wait().await.map_err(|e| {
+        LocalCodeError::new(ErrorCode::BackendInstallFailed, e.to_string()).with_correlation(cid)
+    })?;
+    if !status.success() {
+        return Err(LocalCodeError::new(
+            ErrorCode::BackendInstallFailed,
+            format!("Elevated step failed ({status})"),
+        )
+        .with_correlation(cid)
+        .with_cause("sudo returned non-zero (wrong password, or not permitted)")
+        .with_hint(format!("Run it manually: {display}"))
+        .retryable(true));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_sudo_step(
+    program: &str,
+    args: &[String],
+    display: &str,
+    password: Option<&str>,
+    _progress: &UnboundedSender<String>,
+    cid: localcode_core::CorrelationId,
+) -> Result<(), LocalCodeError> {
+    // Repairs never emit Sudo steps on Windows; this arm exists only to keep
+    // the runner total. Honest failure rather than a fabricated success.
+    let _ = (program, args, password);
+    Err(LocalCodeError::new(
+        ErrorCode::BackendInstallFailed,
+        "Elevated commands aren't supported on this platform",
+    )
+    .with_correlation(cid)
+    .with_hint(format!("Run it manually: {display}")))
 }
 
 fn forward_lines<R>(reader: Option<R>, tx: UnboundedSender<String>)
@@ -512,5 +860,98 @@ mod tests {
     fn llamacpp_windows_is_manual() {
         let plan = install_plan(BackendKind::LlamaCpp, "windows", &no, false);
         assert!(matches!(plan, InstallPlan::Manual { .. }));
+    }
+
+    // ---- repair resolution (path manipulation only; no filesystem / no sudo) ----
+
+    use std::path::Path;
+
+    fn paths() -> AppPaths {
+        // from_home does no IO; resolve_repair only joins path strings.
+        AppPaths::from_home(PathBuf::from("/home/test/.localcode"))
+    }
+
+    #[test]
+    fn venv_repair_builds_three_steps_and_repoints_vllm() {
+        let plan = resolve_repair_with(
+            &RepairIntent::CleanVenvReinstall,
+            BackendKind::Vllm,
+            &paths(),
+            "linux",
+            &no,
+            Some(PathBuf::from("/usr/bin/python3")),
+        )
+        .unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        assert!(plan.steps[0].display().contains("-m venv"));
+        assert!(plan.steps[0].display().contains("venvs"));
+        assert!(plan.steps[2].display().contains("install vllm"));
+        assert!(!plan.requires_sudo());
+        let rp = plan.repoint.expect("repoint");
+        assert_eq!(rp.kind, BackendKind::Vllm);
+        assert!(Path::new(&rp.bin).ends_with("vllm"));
+        assert!(rp.bin.contains("bin"));
+    }
+
+    #[test]
+    fn venv_repair_uses_sglang_all_and_repoints_python() {
+        let plan = resolve_repair_with(
+            &RepairIntent::CleanVenvReinstall,
+            BackendKind::Sglang,
+            &paths(),
+            "linux",
+            &no,
+            Some(PathBuf::from("/usr/bin/python3")),
+        )
+        .unwrap();
+        assert!(plan.steps[2].display().contains("sglang[all]"));
+        // SGLang launches via `<python> -m sglang.launch_server`, so its bin is
+        // the venv interpreter, not a console script.
+        assert!(Path::new(&plan.repoint.unwrap().bin).ends_with("python"));
+    }
+
+    #[test]
+    fn venv_repair_without_python_errors() {
+        let err = resolve_repair_with(
+            &RepairIntent::CleanVenvReinstall,
+            BackendKind::Vllm,
+            &paths(),
+            "linux",
+            &no,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::BackendInstallFailed);
+    }
+
+    #[test]
+    fn ollama_service_repair_is_sudo_on_linux_and_leaks_no_password() {
+        let plan = resolve_repair_with(
+            &RepairIntent::StartOllamaService,
+            BackendKind::Ollama,
+            &paths(),
+            "linux",
+            &no,
+            None,
+        )
+        .unwrap();
+        assert!(plan.requires_sudo());
+        assert!(plan.steps[0].display().starts_with("sudo systemctl start ollama"));
+        // The approval preview must never contain the word "password".
+        assert!(!plan.display().to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn ollama_service_repair_manual_when_no_service_manager() {
+        // Windows / macOS-without-brew: no automated start.
+        assert!(resolve_repair_with(
+            &RepairIntent::StartOllamaService,
+            BackendKind::Ollama,
+            &paths(),
+            "windows",
+            &no,
+            None,
+        )
+        .is_err());
     }
 }

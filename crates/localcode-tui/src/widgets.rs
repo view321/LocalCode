@@ -27,6 +27,8 @@ pub enum ConfirmAction {
     InstallUpdate,
     /// Run the platform installer for a backend (after showing the command).
     InstallBackend(BackendKind),
+    /// Apply a diagnosed repair (after showing the exact commands it will run).
+    ApplyRepair,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,8 @@ pub enum ModalKind {
     },
     Error {
         error: LocalCodeError,
+        /// A diagnosed, auto-applicable repair exists → show a `Fix` button.
+        has_repair: bool,
     },
     Info {
         title: String,
@@ -56,9 +60,9 @@ pub struct ModalState {
 }
 
 impl ModalState {
-    pub fn error(error: LocalCodeError) -> Self {
+    pub fn error(error: LocalCodeError, has_repair: bool) -> Self {
         Self {
-            kind: ModalKind::Error { error },
+            kind: ModalKind::Error { error, has_repair },
             selected: 0,
         }
     }
@@ -103,12 +107,18 @@ impl ModalState {
     /// label — not its index — is what handlers should match on.
     pub fn buttons(&self) -> Vec<&'static str> {
         match &self.kind {
-            ModalKind::Error { error } => {
-                if error.retryable {
-                    vec!["Retry", "Open logs", "Ask assistant", "Dismiss"]
-                } else {
-                    vec!["Open logs", "Ask assistant", "Dismiss"]
+            ModalKind::Error { error, has_repair } => {
+                // Fix leads (the recommended action) when a repair is available;
+                // Retry only when the operation itself is retryable.
+                let mut b = Vec::new();
+                if *has_repair {
+                    b.push("Fix");
                 }
+                if error.retryable {
+                    b.push("Retry");
+                }
+                b.extend(["Open logs", "Ask assistant", "Dismiss"]);
+                b
             }
             ModalKind::Warning { .. } => vec!["Continue", "Cancel"],
             ModalKind::Confirm { .. } => vec!["Confirm", "Cancel"],
@@ -131,7 +141,7 @@ fn content_rows(modal: &ModalState, th: &localcode_core::Theme) -> Vec<Line<'sta
     let fg = Style::default().fg(theme::color(th, ThemeToken::Fg));
     let bold = fg.add_modifier(Modifier::BOLD);
     match &modal.kind {
-        ModalKind::Error { error } => {
+        ModalKind::Error { error, .. } => {
             let mut lines = vec![Line::from(Span::styled(
                 format!("{}: {}", error.code, error.message),
                 bold,

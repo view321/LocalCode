@@ -1,16 +1,23 @@
 //! Local inference backend adapters.
 
 mod deploy;
+mod diagnose;
 mod install;
 mod ollama;
 mod llamacpp;
+mod smoke;
 mod vllm;
 mod sglang;
 mod registry;
 
 pub use deploy::{DeployJob, DeployProgress, DeployRequest, DeployService};
-pub use install::{resolve_install_plan, run_install, InstallPlan, InstallStep};
+pub use diagnose::{classify, diagnose, Confidence, Diagnosis, FailureClass, RepairIntent};
+pub use install::{
+    can_elevate_noninteractively, resolve_install_plan, resolve_repair, run_install, run_repair,
+    InstallPlan, InstallStep, RepairPlan, Repoint,
+};
 pub use registry::BackendRegistry;
+pub use smoke::{smoke_test, SmokeReport};
 pub use ollama::OllamaBackend;
 pub use llamacpp::LlamaCppBackend;
 pub use vllm::VllmBackend;

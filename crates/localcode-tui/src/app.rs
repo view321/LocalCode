@@ -22,8 +22,9 @@ use localcode_agent::{AgentEvent, AgentSession, CodingAgent, ToolApprover};
 use localcode_api_client::ApiClient;
 use localcode_assistant::{Assistant, AssistantRequest};
 use localcode_backends::{
-    resolve_install_plan, run_install, BackendKind, BackendRegistry, DeployRequest, DeployService,
-    DetectReport, InstallPlan,
+    can_elevate_noninteractively, diagnose, resolve_install_plan, resolve_repair, run_install,
+    run_repair, smoke_test, BackendKind, BackendRegistry, DeployRequest, DeployService, DetectReport,
+    Diagnosis, InstallPlan, RepairPlan, Repoint, SmokeReport,
 };
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
 use localcode_core::config::Config;
@@ -47,6 +48,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tracing::info;
+use zeroize::Zeroizing;
 
 const MAX_INPUT_HISTORY: usize = 100;
 
@@ -149,6 +151,8 @@ pub enum ClickTarget {
     RuntimeList,
     // Backends — index into BACKEND_ORDER
     BackendInstall(usize),
+    BackendSmoke(usize),
+    BackendFix(usize),
     BackendRedetect,
     // Remote (two-pane)
     RemoteList,
@@ -207,6 +211,15 @@ pub enum RetryAction {
     InstallUpdate,
     InstallBackend(BackendKind),
     ConnectRemote(usize),
+    ApplyRepair,
+}
+
+/// A diagnosed repair blocked on a sudo password. The password lives ONLY here
+/// (a `Zeroizing<String>`, wiped on drop) until the user submits it; it is never
+/// stored on `App` afterward, never crosses the `BgMsg` channel, never logged.
+struct PendingSudo {
+    plan: RepairPlan,
+    buf: Zeroizing<String>,
 }
 
 pub enum DeployOutcome {
@@ -247,6 +260,15 @@ pub enum BgMsg {
         kind: BackendKind,
         result: Result<(), LocalCodeError>,
     },
+    /// A diagnosed repair: streamed output lines, then the terminal result. On
+    /// success the `repoint` (if any) points the backend at the repaired install.
+    RepairProgress(String),
+    RepairDone {
+        result: Result<(), LocalCodeError>,
+        repoint: Option<Repoint>,
+    },
+    /// A single backend's smoke-test finished (Backends view / doctor probe).
+    SmokeDone(SmokeReport),
     /// A remote SSH GPU server connection finished (setup + tunnel).
     RemoteConnected {
         server_idx: usize,
@@ -290,6 +312,13 @@ pub struct App {
     pub status_is_error: bool,
     pub last_error: Option<LocalCodeError>,
     pub last_failed_action: Option<RetryAction>,
+    /// Diagnosis of the last error (drives the Fix button + inline explanation).
+    pub last_diagnosis: Option<Diagnosis>,
+    /// Which backend the last error came from — set by callers right before
+    /// `raise_error`, consumed there, so the Fix button knows what to repair.
+    pub error_backend: Option<BackendKind>,
+    /// The resolved repair for the last error, if one applies on this machine.
+    last_repair: Option<RepairPlan>,
     /// The inline banner (confirm / warning / error / info), rendered at the top
     /// of the working area. Replaces the old centered modal.
     pub modal: Option<ModalState>,
@@ -313,6 +342,13 @@ pub struct App {
     pub install_busy: Option<Busy>,
     pub install_progress_line: String,
     pub installing_kind: Option<BackendKind>,
+    /// A diagnosed repair in progress (mirrors `install_busy`).
+    pub repair_busy: Option<Busy>,
+    pub repair_progress_line: String,
+    /// Collecting a sudo password for a repair that needs elevation.
+    pending_sudo: Option<PendingSudo>,
+    /// Latest per-backend smoke results, shown in the Backends view.
+    pub smoke_reports: Vec<SmokeReport>,
     // Remote SSH GPU servers
     pub remote_sessions: Vec<RemoteSession>,
     pub remote_selected: usize,
@@ -424,6 +460,9 @@ impl App {
             status_is_error: false,
             last_error: None,
             last_failed_action: None,
+            last_diagnosis: None,
+            error_backend: None,
+            last_repair: None,
             modal: None,
             pending_tool_confirm: None,
             palette_selected: 0,
@@ -441,6 +480,10 @@ impl App {
             install_busy: None,
             install_progress_line: String::new(),
             installing_kind: None,
+            repair_busy: None,
+            repair_progress_line: String::new(),
+            pending_sudo: None,
+            smoke_reports: vec![],
             remote_sessions: vec![],
             remote_selected: 0,
             remote_field: 0,
@@ -600,6 +643,11 @@ impl App {
             b.handle.abort();
             self.update_progress_line.clear();
             self.set_status("Update cancelled — installed binary untouched", false);
+        } else if let Some(b) = self.repair_busy.take() {
+            // kill_on_drop stops the child when the aborted task's Command drops.
+            b.handle.abort();
+            self.repair_progress_line.clear();
+            self.set_status("Fix cancelled", false);
         } else if self.install_busy.is_some() {
             self.cancel_install();
         }
@@ -696,11 +744,33 @@ impl App {
     // Error surface: status line + an inline error banner.
     // ------------------------------------------------------------------
 
-    fn raise_error(&mut self, err: LocalCodeError) {
+    fn raise_error(&mut self, mut err: LocalCodeError) {
         self.status_line = format!("{}: {}", err.code, err.message);
         self.status_is_error = true;
+        // Diagnose using the backend the error came from (a caller sets
+        // `error_backend` right before raising; we consume it so it can't leak
+        // to an unrelated error).
+        let backend = self.error_backend.take();
+        let diagnosis = backend.and_then(|b| diagnose(b, &err));
+        // Resolve the repair now so the Fix button appears only when the fix is
+        // actually applicable on this machine (right OS, Python present, …).
+        self.last_repair = match (&diagnosis, backend) {
+            (Some(d), Some(b)) => d
+                .repair
+                .as_ref()
+                .and_then(|intent| resolve_repair(intent, b, &self.paths).ok()),
+            _ => None,
+        };
+        // Attach the structured diagnosis so "Ask assistant" sees it too.
+        if let Some(d) = &diagnosis {
+            if let Ok(v) = serde_json::to_value(d) {
+                err = err.with_details(serde_json::json!({ "diagnosis": v }));
+            }
+        }
+        let has_repair = self.last_repair.is_some();
+        self.last_diagnosis = diagnosis;
         self.last_error = Some(err.clone());
-        self.modal = Some(ModalState::error(err));
+        self.modal = Some(ModalState::error(err, has_repair));
     }
 
     fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
@@ -710,7 +780,7 @@ impl App {
 
     fn open_error_modal(&mut self) {
         if let Some(err) = self.last_error.clone() {
-            self.modal = Some(ModalState::error(err));
+            self.modal = Some(ModalState::error(err, self.last_repair.is_some()));
         } else {
             self.set_status("No recent error", false);
         }
@@ -727,6 +797,7 @@ impl App {
             Some(RetryAction::InstallUpdate) => self.start_install_update(),
             Some(RetryAction::InstallBackend(kind)) => self.start_install(kind),
             Some(RetryAction::ConnectRemote(idx)) => self.connect_remote(idx),
+            Some(RetryAction::ApplyRepair) => self.start_repair(),
             None => self.set_status("Nothing to retry", false),
         }
     }
@@ -1268,6 +1339,202 @@ impl App {
             started: Instant::now(),
             handle,
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Backend repair (diagnosis → fix)
+    // ------------------------------------------------------------------
+
+    /// Show the resolved repair for approval: the exact commands (incl. any
+    /// `sudo`) are previewed before anything runs — mirrors `start_install`.
+    fn start_repair(&mut self) {
+        if self.repair_busy.is_some() {
+            self.set_status("A fix is already running (Esc to cancel)", false);
+            return;
+        }
+        let Some(plan) = self.last_repair.clone() else {
+            self.set_status("No automatic fix is available for this error", false);
+            return;
+        };
+        let caveat = plan
+            .caveat
+            .clone()
+            .map(|c| format!("{c}\n\n"))
+            .unwrap_or_default();
+        let sudo_note = if plan.requires_sudo() {
+            "Includes a command that needs sudo — you'll be asked to approve your password.\n\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            "LocalCode will run:\n\n{}\n\n{caveat}{sudo_note}Esc cancels — nothing runs until you confirm.",
+            plan.display(),
+        );
+        self.modal = Some(ModalState::confirm(
+            plan.title.clone(),
+            body,
+            ConfirmAction::ApplyRepair,
+        ));
+    }
+
+    /// After the repair is confirmed: run it straight away, unless a sudo step
+    /// needs a password we can't get non-interactively — then prompt for it.
+    fn confirm_repair(&mut self) {
+        let Some(plan) = self.last_repair.clone() else {
+            return;
+        };
+        if plan.requires_sudo() && !can_elevate_noninteractively() {
+            self.set_status(
+                "Enter your sudo password to run the fix — Enter to confirm, Esc to cancel",
+                false,
+            );
+            self.pending_sudo = Some(PendingSudo {
+                plan,
+                buf: Zeroizing::new(String::new()),
+            });
+        } else {
+            self.spawn_repair(plan, None);
+        }
+    }
+
+    /// Spawn the repair. Streams output through `RepairProgress`; the password
+    /// (when present) is moved into the task, written to `sudo -S`, and zeroized
+    /// when the task ends — it never touches the `BgMsg` channel.
+    fn spawn_repair(&mut self, plan: RepairPlan, password: Option<Zeroizing<String>>) {
+        if self.repair_busy.is_some() {
+            self.set_status("A fix is already running (Esc to cancel)", false);
+            return;
+        }
+        let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
+        let fwd = self.bg_tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = prx.recv().await {
+                if fwd.send(BgMsg::RepairProgress(line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let tx = self.bg_tx.clone();
+        let repoint = plan.repoint.clone();
+        let handle = tokio::spawn(async move {
+            let pw = password.as_ref().map(|z| z.as_str());
+            let result = run_repair(&plan, pw, ptx).await;
+            let _ = tx.send(BgMsg::RepairDone { result, repoint });
+        });
+        self.repair_progress_line = "starting…".into();
+        self.repair_busy = Some(Busy {
+            kind: BusyKind::Install,
+            label: "Applying fix".into(),
+            started: Instant::now(),
+            handle,
+        });
+    }
+
+    /// Point a backend's configured binary at the repaired install and persist,
+    /// then rebuild the registry so the new path is used immediately.
+    fn apply_repoint(&mut self, rp: Repoint) {
+        match rp.kind {
+            BackendKind::Vllm => self.config.backends.vllm.bin = rp.bin,
+            BackendKind::Sglang => self.config.backends.sglang.bin = rp.bin,
+            BackendKind::LlamaCpp => self.config.backends.llamacpp.bin = rp.bin,
+            // Ollama repairs restart a service; there's no binary to repoint.
+            BackendKind::Ollama => {}
+        }
+        self.registry = Arc::new(BackendRegistry::from_config(&self.config));
+        if let Err(e) = self.config.save(&self.paths) {
+            self.set_status(
+                format!("Fix applied, but saving config failed: {}", e.message),
+                true,
+            );
+        }
+    }
+
+    /// Key handling while the masked sudo prompt is open. Modeled on the remote
+    /// field editor; Enter runs the fix, Esc cancels (buffer zeroized on drop).
+    fn handle_sudo_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(ps) = self.pending_sudo.take() {
+                    let PendingSudo { plan, buf } = ps;
+                    self.spawn_repair(plan, Some(buf));
+                }
+            }
+            KeyCode::Esc => {
+                self.pending_sudo = None;
+                self.set_status("Fix cancelled", false);
+            }
+            KeyCode::Backspace => {
+                if let Some(ps) = &mut self.pending_sudo {
+                    ps.buf.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ps) = &mut self.pending_sudo {
+                    ps.buf.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Render state for the masked sudo prompt: `(chars entered, command being
+    /// authorized)`. `None` when no prompt is open. The password itself is never
+    /// exposed — only its length, for the `•` mask.
+    pub fn sudo_prompt(&self) -> Option<(usize, String)> {
+        self.pending_sudo.as_ref().map(|ps| {
+            let cmd = ps
+                .plan
+                .steps
+                .iter()
+                .find_map(|s| match s {
+                    localcode_backends::InstallStep::Sudo { display, .. } => Some(display.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| ps.plan.title.clone());
+            (ps.buf.chars().count(), cmd)
+        })
+    }
+
+    /// Smoke-test one backend from the Backends view, storing the result.
+    fn start_smoke(&mut self, kind: BackendKind) {
+        let Some(report) = self.backend_reports.iter().find(|r| r.kind == kind).cloned() else {
+            self.set_status("Detecting first — try again in a moment", false);
+            self.start_detect();
+            return;
+        };
+        let cfg = self.config.clone();
+        let tx = self.bg_tx.clone();
+        self.set_status(format!("Smoke-testing {}…", kind.as_str()), false);
+        tokio::spawn(async move {
+            let sr = smoke_test(&report, &cfg).await;
+            let _ = tx.send(BgMsg::SmokeDone(sr));
+        });
+    }
+
+    /// Start the fix for a backend from its stored smoke diagnosis (Backends
+    /// view). Falls back to running a smoke test if we don't have one yet.
+    fn fix_backend(&mut self, kind: BackendKind) {
+        let Some(intent) = self
+            .smoke_reports
+            .iter()
+            .find(|r| r.kind == kind)
+            .and_then(|r| r.diagnosis.as_ref())
+            .and_then(|d| d.repair.clone())
+        else {
+            self.set_status(format!("Smoke-test {} first to diagnose it", kind.as_str()), false);
+            self.start_smoke(kind);
+            return;
+        };
+        match resolve_repair(&intent, kind, &self.paths) {
+            Ok(plan) => {
+                self.last_repair = Some(plan);
+                self.start_repair();
+            }
+            Err(e) => {
+                self.error_backend = Some(kind);
+                self.raise_error(e);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1830,9 +2097,50 @@ impl App {
                             self.start_detect();
                         }
                         Err(e) => {
+                            self.error_backend = Some(kind);
                             self.last_failed_action = Some(RetryAction::InstallBackend(kind));
                             self.raise_error(e);
                         }
+                    }
+                }
+                BgMsg::RepairProgress(line) => {
+                    self.repair_progress_line = line.clone();
+                    self.set_status(format!("Fixing: {line}"), false);
+                }
+                BgMsg::RepairDone { result, repoint } => {
+                    self.repair_busy = None;
+                    self.repair_progress_line.clear();
+                    match result {
+                        Ok(()) => {
+                            if let Some(rp) = repoint {
+                                self.apply_repoint(rp);
+                            }
+                            // Clear the resolved fix and re-check health.
+                            self.last_repair = None;
+                            self.set_status("Fix applied — re-checking…", false);
+                            self.start_detect();
+                        }
+                        Err(e) => {
+                            self.last_failed_action = Some(RetryAction::ApplyRepair);
+                            self.raise_error(e);
+                        }
+                    }
+                }
+                BgMsg::SmokeDone(report) => {
+                    let kind = report.kind;
+                    let ok = report.ok;
+                    let summary = report.diagnosis.as_ref().map(|d| d.summary.clone());
+                    self.smoke_reports.retain(|r| r.kind != kind);
+                    self.smoke_reports.push(report);
+                    if ok {
+                        self.set_status(format!("{} smoke test passed", kind.as_str()), false);
+                    } else {
+                        self.set_status(
+                            summary
+                                .map(|s| format!("{}: {s}", kind.as_str()))
+                                .unwrap_or_else(|| format!("{} smoke test failed", kind.as_str())),
+                            true,
+                        );
                     }
                 }
                 BgMsg::RemoteConnected { server_idx, result } => {
@@ -1897,6 +2205,8 @@ impl App {
                 AppEvent::DeployFailed { error, .. } => {
                     self.deploy_progress = 0;
                     self.last_failed_action = Some(RetryAction::Deploy);
+                    // The Fix button needs to know which backend failed.
+                    self.error_backend = Some(self.deploy_backend);
                     self.raise_error(error);
                 }
                 AppEvent::ErrorRaised { error } => {
@@ -2264,6 +2574,13 @@ to select, click deploy. Remote: click a field to edit, then connect."
             }
         }
 
+        // The masked sudo prompt captures all input while it is open (it has no
+        // modal — it renders in the omnibar), so check it before everything else.
+        if self.pending_sudo.is_some() {
+            self.handle_sudo_key(key);
+            return;
+        }
+
         // The inline banner captures all input while it is open.
         if let Some(modal) = self.modal.clone() {
             self.handle_modal_key(key, &modal);
@@ -2299,6 +2616,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
             if self.fg_busy()
                 || self.deploy_busy.is_some()
                 || self.install_busy.is_some()
+                || self.repair_busy.is_some()
                 || self.update_busy.is_some()
             {
                 self.cancel_current();
@@ -2559,6 +2877,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
         let kind = modal.kind.clone();
         self.modal = None;
         match (&kind, label) {
+            (ModalKind::Error { .. }, "Fix") => self.start_repair(),
             (ModalKind::Error { .. }, "Retry") => self.retry_last(),
             (ModalKind::Error { .. }, "Open logs") => {
                 self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false);
@@ -2595,6 +2914,13 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 },
                 "Confirm",
             ) => self.spawn_install(*kind),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::ApplyRepair,
+                    ..
+                },
+                "Confirm",
+            ) => self.confirm_repair(),
             (
                 ModalKind::Confirm {
                     action: ConfirmAction::ToolApproval,
@@ -2701,6 +3027,14 @@ to select, click deploy. Remote: click a field to edit, then connect."
             ClickTarget::BackendInstall(i) => {
                 self.backend_sel = i.min(BACKEND_ORDER.len() - 1);
                 self.start_install(BACKEND_ORDER[self.backend_sel]);
+            }
+            ClickTarget::BackendSmoke(i) => {
+                self.backend_sel = i.min(BACKEND_ORDER.len() - 1);
+                self.start_smoke(BACKEND_ORDER[self.backend_sel]);
+            }
+            ClickTarget::BackendFix(i) => {
+                self.backend_sel = i.min(BACKEND_ORDER.len() - 1);
+                self.fix_backend(BACKEND_ORDER[self.backend_sel]);
             }
             ClickTarget::BackendRedetect => {
                 self.start_detect();
@@ -3123,5 +3457,78 @@ mod tests {
             _ => panic!("expected an Info banner"),
         }
         assert!(render_to_string(&mut app, 120, 40).contains("Logs"));
+    }
+
+    #[test]
+    fn raise_error_diagnoses_vllm_registration_bug() {
+        let mut app = test_app();
+        // A caller sets the backend context right before raising.
+        app.error_backend = Some(BackendKind::Vllm);
+        let err = LocalCodeError::new(ErrorCode::BackendStartFailed, "vLLM exited: exit status: 1")
+            .with_cause(
+                "vLLM output:\nRuntimeError: Tried to register an operator \
+                 (vllm::_fused_mul_mat_gguf) with the same name ... registered multiple times.",
+            );
+        app.raise_error(err);
+        assert!(app.last_diagnosis.is_some(), "the install bug must be diagnosed");
+        assert!(app.error_backend.is_none(), "backend context is consumed once");
+    }
+
+    #[test]
+    fn generic_backend_error_offers_no_fix() {
+        let mut app = test_app();
+        app.error_backend = Some(BackendKind::Vllm);
+        app.raise_error(LocalCodeError::new(ErrorCode::Internal, "unexpected"));
+        assert!(app.last_diagnosis.is_none());
+        assert!(app.last_repair.is_none());
+        let buttons = app.modal.as_ref().unwrap().buttons();
+        assert!(!buttons.contains(&"Fix"), "no Fix button without a repair");
+    }
+
+    #[test]
+    fn fix_button_leads_when_repair_available() {
+        let mut app = test_app();
+        // Inject a resolved repair (as if a diagnosis produced one on this OS).
+        app.last_repair = Some(RepairPlan {
+            title: "Reinstall vllm in a clean environment".into(),
+            steps: vec![],
+            caveat: None,
+            repoint: None,
+        });
+        app.last_error = Some(LocalCodeError::new(ErrorCode::BackendStartFailed, "x"));
+        app.open_error_modal();
+        let buttons = app.modal.as_ref().unwrap().buttons();
+        assert_eq!(buttons.first(), Some(&"Fix"), "Fix leads as the recommended action");
+    }
+
+    #[test]
+    fn sudo_prompt_masks_input_shows_command_and_cancels() {
+        let mut app = test_app();
+        app.pending_sudo = Some(PendingSudo {
+            plan: RepairPlan {
+                title: "Start the Ollama service".into(),
+                steps: vec![localcode_backends::InstallStep::Sudo {
+                    program: "systemctl".into(),
+                    args: vec!["start".into(), "ollama".into()],
+                    display: "sudo systemctl start ollama".into(),
+                }],
+                caveat: None,
+                repoint: None,
+            },
+            buf: Zeroizing::new(String::new()),
+        });
+        // Typing accumulates; only the length is ever exposed (masked).
+        app.handle_sudo_key(key(KeyCode::Char('h')));
+        app.handle_sudo_key(key(KeyCode::Char('i')));
+        let (len, cmd) = app.sudo_prompt().expect("prompt open");
+        assert_eq!(len, 2);
+        assert!(cmd.contains("sudo systemctl start ollama"));
+        // The rendered omnibar masks the password and shows the command.
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(screen.contains("sudo password"));
+        assert!(screen.contains("••"), "password is masked, not echoed");
+        // Esc cancels and drops the (zeroized) buffer.
+        app.handle_sudo_key(key(KeyCode::Esc));
+        assert!(app.sudo_prompt().is_none());
     }
 }
