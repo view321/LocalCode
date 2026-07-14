@@ -98,8 +98,25 @@ fn discover_nvidia_smi() -> Result<GpuInventory, LocalCodeError> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_nvidia_smi_csv(&stdout, "nvidia-smi"))
+}
+
+/// The exact `nvidia-smi` argument list [`discover`] uses. Exposed so remote
+/// discovery (running nvidia-smi over SSH) produces identically-parseable CSV.
+pub const NVIDIA_SMI_QUERY_ARGS: [&str; 2] = [
+    "--query-gpu=index,name,memory.total,memory.free,driver_version",
+    "--format=csv,noheader,nounits",
+];
+
+/// Parse `nvidia-smi --format=csv,noheader,nounits` output (MiB values) into a
+/// [`GpuInventory`]. Shared by local discovery and remote (over-SSH) discovery
+/// so both interpret the CSV identically. `detection_method` labels the source.
+pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventory {
     let mut devices = Vec::new();
     for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let parts: Vec<_> = line.split(',').map(|s| s.trim()).collect();
         if parts.len() < 4 {
             continue;
@@ -119,12 +136,12 @@ fn discover_nvidia_smi() -> Result<GpuInventory, LocalCodeError> {
         });
     }
 
-    debug!(count = devices.len(), "discovered GPUs via nvidia-smi");
-    Ok(GpuInventory {
+    debug!(count = devices.len(), method = detection_method, "parsed nvidia-smi CSV");
+    GpuInventory {
         devices,
-        detection_method: "nvidia-smi".into(),
+        detection_method: detection_method.to_string(),
         warnings: vec![],
-    })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,5 +339,23 @@ mod tests {
             },
         );
         assert!(pred.fits_free);
+    }
+
+    #[test]
+    fn parses_nvidia_smi_csv() {
+        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104\n1, NVIDIA A100, 40960, 40000, 535.104\n";
+        let inv = parse_nvidia_smi_csv(csv, "nvidia-smi-remote");
+        assert_eq!(inv.detection_method, "nvidia-smi-remote");
+        assert_eq!(inv.devices.len(), 2);
+        assert_eq!(inv.devices[0].name, "NVIDIA RTX 4090");
+        assert_eq!(inv.devices[0].total_vram_bytes, 24576 * 1024 * 1024);
+        assert_eq!(inv.devices[1].free_vram_bytes, 40000 * 1024 * 1024);
+        assert_eq!(inv.devices[0].driver_version.as_deref(), Some("535.104"));
+    }
+
+    #[test]
+    fn ignores_blank_and_malformed_lines() {
+        let inv = parse_nvidia_smi_csv("\n0, GPU, 1024, 512\nbogus\n", "x");
+        assert_eq!(inv.devices.len(), 1);
     }
 }

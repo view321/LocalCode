@@ -30,6 +30,8 @@ pub struct Config {
     pub panes: PaneRatios,
     #[serde(default)]
     pub updates: UpdatesConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 /// Read an env var, treating empty values as unset.
@@ -77,6 +79,11 @@ pub struct UpdatesConfig {
     /// location; `LOCALCODE_INSTALL_DIR` env overrides at use time.
     #[serde(default)]
     pub install_dir: Option<String>,
+    /// Alternate git remote URLs for self-update, tried in order after
+    /// `repo_url` fails. Useful when github.com is unreachable from the machine
+    /// running the update (mirror the repo to an internal git host).
+    #[serde(default)]
+    pub mirrors: Vec<String>,
 }
 
 impl Default for UpdatesConfig {
@@ -86,6 +93,7 @@ impl Default for UpdatesConfig {
             repo_url: default_repo_url(),
             branch: default_repo_branch(),
             install_dir: None,
+            mirrors: Vec::new(),
         }
     }
 }
@@ -100,6 +108,12 @@ pub struct RegistryConfig {
     pub api_endpoint: String,
     #[serde(default = "default_hf_token_env")]
     pub token_env: String,
+    /// Extra HuggingFace mirror web roots (e.g. `https://hf-mirror.com`), tried
+    /// in order after `endpoint` and before the canonical `huggingface.co`
+    /// fallback. Each api base is derived as `{root}/api`. Essential when the
+    /// deploy target sits in an isolated network that can't reach HF directly.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
 }
 
 impl Default for RegistryConfig {
@@ -109,6 +123,7 @@ impl Default for RegistryConfig {
             endpoint: default_hf_endpoint(),
             api_endpoint: default_hf_api(),
             token_env: default_hf_token_env(),
+            mirrors: Vec::new(),
         }
     }
 }
@@ -359,6 +374,107 @@ pub struct PaneRatios {
     pub views: HashMap<String, Vec<f32>>,
 }
 
+/// Remote GPU servers reachable over SSH. LocalCode connects, ensures a
+/// backend (Ollama) runs there, and forwards its port back to localhost so the
+/// agent codes against the remote GPU as if it were local.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub servers: Vec<RemoteServer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteServer {
+    /// Friendly label shown in the UI and used as the runtime name.
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub username: String,
+    /// SSH password, stored in plaintext so a saved server reconnects in one
+    /// click (the AmneziaVPN desktop model). SECURITY: this file is on your
+    /// local disk in the clear. Prefer `key_path` for key-based auth, or leave
+    /// this empty and type the password per session in the TUI.
+    #[serde(default)]
+    pub password: String,
+    /// Path to a private key file (OpenSSH format). Alternative to `password`.
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Backend to run remotely. Only "ollama" is wired end-to-end today.
+    #[serde(default = "default_remote_backend")]
+    pub backend: String,
+    /// Port the remote backend listens on (Ollama = 11434).
+    #[serde(default = "default_remote_backend_port")]
+    pub remote_port: u16,
+    /// Local port the SSH tunnel binds. 0 means "same as remote_port".
+    #[serde(default)]
+    pub local_port: u16,
+    /// Attempt to connect automatically on TUI startup.
+    #[serde(default)]
+    pub auto_connect: bool,
+    /// Provisioning mirror fallbacks for the remote (used when the server can't
+    /// reach the public internet directly).
+    #[serde(default)]
+    pub mirrors: RemoteMirrors,
+}
+
+impl RemoteServer {
+    /// Local port the tunnel should bind — `local_port` or, if unset, the
+    /// remote port so the mapping is 1:1 by default.
+    pub fn effective_local_port(&self) -> u16 {
+        if self.local_port == 0 {
+            self.remote_port
+        } else {
+            self.local_port
+        }
+    }
+
+    /// The base URL the local agent uses once the tunnel is up.
+    pub fn tunnel_base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.effective_local_port())
+    }
+}
+
+impl Default for RemoteServer {
+    fn default() -> Self {
+        Self {
+            name: "gpu-server".into(),
+            host: String::new(),
+            port: default_ssh_port(),
+            username: String::new(),
+            password: String::new(),
+            key_path: None,
+            backend: default_remote_backend(),
+            remote_port: default_remote_backend_port(),
+            local_port: 0,
+            auto_connect: false,
+            mirrors: RemoteMirrors::default(),
+        }
+    }
+}
+
+/// Mirror fallbacks used while provisioning a remote server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteMirrors {
+    /// URLs hosting the Ollama install script, tried in order. Default is the
+    /// official installer; add an internal mirror for air-gapped LANs.
+    #[serde(default = "default_ollama_install_urls")]
+    pub ollama_install: Vec<String>,
+    /// HuggingFace endpoint the remote Ollama should pull GGUF weights from
+    /// (sets `HF_ENDPOINT` for the remote pull). Empty = default huggingface.co.
+    #[serde(default)]
+    pub hf_endpoint: String,
+}
+
+impl Default for RemoteMirrors {
+    fn default() -> Self {
+        Self {
+            ollama_install: default_ollama_install_urls(),
+            hf_endpoint: String::new(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -424,6 +540,18 @@ fn default_repo_branch() -> String {
 }
 fn default_spend_threshold() -> f64 {
     1.0
+}
+fn default_ssh_port() -> u16 {
+    22
+}
+fn default_remote_backend() -> String {
+    "ollama".into()
+}
+fn default_remote_backend_port() -> u16 {
+    11434
+}
+fn default_ollama_install_urls() -> Vec<String> {
+    vec!["https://ollama.com/install.sh".into()]
 }
 // NOTE: defaults must be pure — env overrides are resolved at *use* time
 // (api_base_url(), log_level(), hf endpoints), never baked into a saved config.
@@ -508,6 +636,22 @@ impl Config {
             )
         }
     }
+
+    /// Ordered, de-duplicated HuggingFace web roots to try for weight
+    /// downloads: the primary endpoint (honoring the env override) first, then
+    /// configured mirrors, then canonical `huggingface.co` as a last resort.
+    pub fn hf_mirror_hosts(&self) -> Vec<String> {
+        let (endpoint, _api) = self.hf_endpoints();
+        let mut hosts = vec![endpoint];
+        hosts.extend(self.registry.mirrors.iter().cloned());
+        hosts.push("https://huggingface.co".to_string());
+        let mut seen = std::collections::HashSet::new();
+        hosts
+            .into_iter()
+            .map(|h| h.trim_end_matches('/').to_string())
+            .filter(|h| !h.is_empty() && seen.insert(h.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -526,5 +670,44 @@ mod tests {
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.ui.theme, ThemeMode::Dark);
         assert_eq!(loaded.backends.default.kind, "ollama");
+    }
+
+    #[test]
+    fn roundtrip_remote_and_mirrors() {
+        let dir = tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut cfg = Config::default();
+        cfg.registry.endpoint = "https://hf-mirror.com".into();
+        cfg.registry.mirrors = vec!["https://hf-mirror-2.com".into()];
+        cfg.updates.mirrors = vec!["https://git.internal.lan/lc.git".into()];
+        cfg.remote.servers.push(RemoteServer {
+            name: "gpu".into(),
+            host: "10.0.0.5".into(),
+            username: "root".into(),
+            password: "pw".into(),
+            local_port: 21434,
+            mirrors: RemoteMirrors {
+                ollama_install: vec!["https://internal.lan/install.sh".into()],
+                hf_endpoint: "https://hf-mirror.com".into(),
+            },
+            ..Default::default()
+        });
+        cfg.save(&paths).unwrap();
+
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.registry.mirrors, vec!["https://hf-mirror-2.com"]);
+        assert_eq!(loaded.remote.servers.len(), 1);
+        let s = &loaded.remote.servers[0];
+        assert_eq!(s.host, "10.0.0.5");
+        assert_eq!(s.effective_local_port(), 21434);
+        assert_eq!(s.tunnel_base_url(), "http://127.0.0.1:21434");
+        assert_eq!(s.mirrors.hf_endpoint, "https://hf-mirror.com");
+
+        // Mirror host list is ordered (endpoint first) with HF appended last.
+        let hosts = loaded.hf_mirror_hosts();
+        assert_eq!(hosts[0], "https://hf-mirror.com");
+        assert_eq!(hosts[1], "https://hf-mirror-2.com");
+        assert_eq!(hosts.last().unwrap(), "https://huggingface.co");
     }
 }

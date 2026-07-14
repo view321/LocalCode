@@ -1,6 +1,8 @@
 # LocalCode
 
-**Local-first Rust TUI coding agent** for developers who prefer local LLMs — with Hugging Face model discovery, GPU VRAM fit warnings, one-click deploy (Ollama / llama.cpp / vLLM / SGLang), benchmarks, optional cloud (RunPod / Vast.ai / Akash), USDC top-up on **Base**, and an in-app assistant that helps fix LocalCode itself.
+**Local-first Rust TUI coding agent** for developers who prefer local LLMs — with Hugging Face model discovery, GPU VRAM fit warnings, one-click deploy (Ollama / llama.cpp / vLLM / SGLang), **one-click remote GPU servers over SSH**, download **mirror fallbacks** for air-gapped networks, benchmarks, optional cloud (RunPod / Vast.ai / Akash), USDC top-up on **Base**, and an in-app assistant that helps fix LocalCode itself.
+
+The interface is a single **omnibar**: type to chat with the agent, or press `/` for commands. Everything else (models, backends, remote servers, settings) opens as a popup above the bar — inspired by OpenCode and Pi.
 
 Philosophy: **one-click and no errors** — guided recovery, warnings over hard blocks, always-available Ask assistant.
 
@@ -70,19 +72,61 @@ Website (project page): open [`website/index.html`](website/index.html) or the G
 ### First deploy (happy path)
 
 1. Start Ollama (`ollama serve`) if using the default backend.
-2. Open **Models** (`2`), press `/` to search or `p` for popular coding models.
-3. Select a model, `Enter` for detail, pick a quant with `,` / `.`, press `d` to **Deploy**.
+2. Type `/models qwen coder` (or just `/models`) — the omnibar becomes the
+   HuggingFace search box and results open in a popup.
+3. Click a model (or `↑`/`↓` then `Enter`) to open its card, click a **Quant**
+   to cycle, then click **Deploy** (or type `/deploy`).
    HF GGUF repos deploy through Ollama as `hf.co/{org}/{repo}:{quant}` automatically.
 4. If VRAM fit warns, choose **Continue** — deploys are never hard-blocked on size.
-5. Open **Coding** (`4`), press `i` and type a prompt. Replies **stream
-   token-by-token** into the transcript, with live tool activity (`⚙ fs.read …`)
-   as the agent works. `Esc` cancels a running turn and keeps the partial output.
-   Streaming can be disabled with `agent.stream = false` if your runtime rejects
-   `stream: true` together with tools.
+5. Press `Esc` to close the popup and just **type a prompt** in the bar. Replies
+   **stream token-by-token** into the transcript, with live tool activity
+   (`⚙ fs.read …`) as the agent works. `Esc` cancels a running turn and keeps the
+   partial output. Streaming can be disabled with `agent.stream = false` if your
+   runtime rejects `stream: true` together with tools.
 
 Coding is **local-first**: with no runtime deployed it will not silently fall back
 to a cloud provider. Set `agent.allow_cloud_fallback = true` in config.toml to
 allow using the configured assistant provider instead.
+
+### Remote GPU over SSH
+
+Code on your laptop, run the model on a GPU box — even one on an isolated LAN
+that can't reach GitHub or HuggingFace directly.
+
+1. Type `/remote` to open the servers panel.
+2. Click **+ New server**, click each field to fill in **host, username,
+   password** (like the AmneziaVPN one-click setup), then click **Connect** —
+   or do it in one line:
+
+   ```
+   /remote add gpu-box 10.8.0.2 ubuntu mypassword
+   ```
+
+   then click **Connect** (or `/connect`).
+3. LocalCode connects over SSH, detects the remote GPU (`nvidia-smi`), installs
+   and starts **Ollama** if needed, and opens a tunnel
+   (`localhost → remote:11434`). The agent then uses the remote GPU as if it
+   were local — deploy, coding, and benchmarks all flow over the tunnel.
+
+Auth uses a stored password (kept in `config.toml`; ⚠ plaintext — prefer
+`key_path` for key-based auth). Set `auto_connect = true` to link on startup.
+
+**Mirrors for air-gapped networks.** When the deploy target can't reach the
+public internet, add fallback mirrors — tried in order after the primary:
+
+```toml
+[registry]
+endpoint = "https://hf-mirror.com"          # primary HuggingFace host
+mirrors  = ["https://my-internal-hf.lan"]    # fallbacks, then huggingface.co
+
+[updates]
+mirrors  = ["https://git.internal.lan/LocalCode.git"]  # self-update fallback
+
+# per-server, in the [[remote.servers]] table:
+#   [remote.servers.mirrors]
+#   ollama_install = ["https://internal.lan/ollama-install.sh"]
+#   hf_endpoint    = "https://hf-mirror.com"   # remote Ollama pulls via this
+```
 
 ### Headless CLI
 
@@ -106,42 +150,41 @@ Accounts are **optional**. Local browse, deploy, coding, and benchmarks work off
 
 ## TUI
 
-Top bar: identity + live chips (runtime health, GPU, API) and an update badge.
-Below it, a clickable tab strip:
+No tabs. A thin top line shows live chips (runtime health, GPU, API) and an
+update badge; the middle is the conversation transcript; the bottom is the
+**omnibar**, which is active in every mode.
 
-1 home · 2 models · 3 bench · 4 coding · 5 setup · 6 alerts · 7 settings
+- **Type** a message + `Enter` → chat with the agent.
+- Type **`/`** → the command menu opens above the bar (`↑`/`↓` pick, `Enter`
+  run, `Esc` close). `Ctrl+K` also opens it.
+- **`Esc`** → close a panel, or cancel the running task at home.
 
-| Shortcut | Action |
-|----------|--------|
-| `1`–`7`, `Tab`/`Shift+Tab` | Switch tab (or click the strip) |
-| `?` | Help overlay (per-tab keys) |
-| `Ctrl+K` | Command palette |
-| `u` | Install the available update (background build) |
-| `Esc` | Cancel the running task (search/deploy/agent turn/update) |
-| `/` `p` `t` | Models: search / popular / trending |
-| `←`/`→` | Models: focus the results list or the model card |
-| `j`/`k`, `PgUp/PgDn`, `g`/`G` | Models: move selection / scroll the card |
-| `,` `.` / `+` `-` | Models: pick quant / adjust context size |
-| `b` / `d` | Models: cycle backend / one-click deploy |
-| `[` `]` and `{` `}` | Resize panes (Models: list↔card and card↔deploy; Dashboard: columns) |
-| `i`, `Enter` | Coding: focus composer (`↑` history, `PgUp/PgDn` scroll) |
-| `Ctrl+↑`/`Ctrl+↓` (or `+`/`-`) | Coding: grow/shrink the composer |
-| `n` | Coding: new session |
-| `j`/`k`, `x` | Dashboard: select / stop runtime |
-| `a` | Ask assistant (uses last error context) |
-| `e` | Open last error details (with working Retry) |
-| `c` | Notifications: clear |
-| `Ctrl+S` | Save config |
-| `q` | Quit (confirms if managed runtimes are running) |
+| Key | Action |
+|-----|--------|
+| `Enter` | Send the prompt (or run the highlighted command) |
+| `/` or `Ctrl+K` | Open the command menu |
+| `↑`/`↓` | Command menu / panel navigation (input history at home) |
+| `Ctrl+↑`/`Ctrl+↓` | Grow/shrink the omnibar |
+| `Ctrl+S` | Save config &nbsp;·&nbsp; `Ctrl+C` quit |
+| `Esc` | Close panel / cancel task |
 
-**Model cards** render as formatted markdown (headings, lists, tables, code)
-with metadata chips — downloads, likes, license, parameter size, gating — and
-scroll independently of the results list; the focused pane has the accent
-border. **Pane sizes persist** across restarts (saved with the config).
+| Command | Opens |
+|---------|-------|
+| `/models [query]` | Search & deploy HuggingFace models |
+| `/remote` | Connect a GPU server over SSH |
+| `/backends` | Install & configure inference backends |
+| `/runtimes` | Active runtimes & system overview |
+| `/deploy` | Deploy the selected model |
+| `/bench` `/setup` `/doctor` `/settings` `/theme` `/alerts` `/new` `/assistant` `/update` `/logs` `/quit` | … |
 
-Mouse: click tabs, scroll wheel in transcript/card/setup (honors `ui.mouse`
-config; disable it to keep native text selection). Long operations run in the
-background — the status bar shows a spinner and elapsed time, and `Esc`
+Panels open as **popups** above the bar. **Model cards** render as formatted
+markdown with metadata chips and scroll independently; the focused pane has the
+accent border. **Pane sizes persist** across restarts (drag the pane borders).
+
+Mouse-first: click list rows, buttons (Deploy, Connect, Backend/Quant), and
+fields to edit; scroll wheel in transcript/card/panels (honors `ui.mouse`;
+disable it to keep native text selection). Long operations run in the
+background — the status line shows a spinner and elapsed time, and `Esc`
 cancels.
 
 ## Server (optional VPS)
@@ -172,6 +215,7 @@ crates/
   localcode-gpu/        GPU discover + VRAM fit
   localcode-hf/         HF client, mirrors, quants, cache
   localcode-backends/   Ollama, llama.cpp, vLLM, SGLang
+  localcode-remote/     SSH remote GPU servers (russh: connect, provision, tunnel)
   localcode-cloud/      RunPod, Vast, Akash adapters
   localcode-payments/   USDC balance client
   localcode-bench/      suites + runner + publish

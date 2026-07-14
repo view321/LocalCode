@@ -6,6 +6,7 @@ members = [
     "crates/localcode-gpu",
     "crates/localcode-hf",
     "crates/localcode-backends",
+    "crates/localcode-remote",
     "crates/localcode-cloud",
     "crates/localcode-payments",
     "crates/localcode-bench",
@@ -38,6 +39,7 @@ localcode-log = { path = "crates/localcode-log" }
 localcode-gpu = { path = "crates/localcode-gpu" }
 localcode-hf = { path = "crates/localcode-hf" }
 localcode-backends = { path = "crates/localcode-backends" }
+localcode-remote = { path = "crates/localcode-remote" }
 localcode-cloud = { path = "crates/localcode-cloud" }
 localcode-payments = { path = "crates/localcode-payments" }
 localcode-bench = { path = "crates/localcode-bench" }

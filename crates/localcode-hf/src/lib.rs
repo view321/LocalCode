@@ -85,10 +85,58 @@ impl HfClient {
 
         Ok(Self {
             http,
-            urls: UrlBuilder::new(&endpoint, &api_endpoint),
+            urls: UrlBuilder::with_mirrors(&endpoint, &api_endpoint, &registry.mirrors),
             token,
             cache: ModelCache::new(cache_dir),
         })
+    }
+
+    /// GET the first candidate URL that answers, falling back mirror-by-mirror
+    /// on transport errors and 5xx/429 (reachability failures). A definitive
+    /// response (2xx or a 4xx that isn't 429) is returned immediately so
+    /// callers can do their own status handling (404, auth, etc.). Warns when a
+    /// non-primary candidate is the one that answers.
+    async fn get_with_fallback(
+        &self,
+        urls: &[String],
+        cid: CorrelationId,
+    ) -> Result<reqwest::Response, LocalCodeError> {
+        let mut last_err: Option<LocalCodeError> = None;
+        let n = urls.len();
+        for (i, url) in urls.iter().enumerate() {
+            let has_more = i + 1 < n;
+            match self.auth_header(self.http.get(url)).send().await {
+                Ok(resp) => {
+                    let s = resp.status();
+                    let retryable = s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    if retryable && has_more {
+                        warn!(%cid, %url, status = %s, "HF host degraded; trying next mirror");
+                        last_err = Some(
+                            LocalCodeError::new(ErrorCode::HfUnreachable, format!("status {s}"))
+                                .with_correlation(cid),
+                        );
+                        continue;
+                    }
+                    if i > 0 {
+                        warn!(%cid, %url, "HF primary failed; served from mirror");
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if has_more {
+                        warn!(%cid, %url, error = %e, "HF host unreachable; trying next mirror");
+                        last_err = Some(map_http_err(e, cid));
+                        continue;
+                    }
+                    return Err(map_http_err(e, cid));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            LocalCodeError::new(ErrorCode::HfUnreachable, "no HF endpoint configured")
+                .with_correlation(cid)
+                .retryable(true)
+        }))
     }
 
     fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -108,17 +156,18 @@ impl HfClient {
         sort: &str,
     ) -> Result<Vec<ModelSummary>, LocalCodeError> {
         let cid = CorrelationId::new();
-        let mut url = self.urls.api(&format!(
+        let mut path = format!(
             "models?search={}&limit={}&sort={}&direction=-1",
             urlencoding_lite(query),
             limit,
             sort
-        ));
+        );
         if coding_only {
-            url = format!("{url}&filter=text-generation");
+            path = format!("{path}&filter=text-generation");
         }
+        let urls = self.urls.api_candidates(&path);
 
-        match self.fetch_search(&url, cid).await {
+        match self.fetch_search(&urls, cid).await {
             Ok(models) => {
                 let mut models = models;
                 if coding_only {
@@ -143,12 +192,11 @@ impl HfClient {
 
     async fn fetch_search(
         &self,
-        url: &str,
+        urls: &[String],
         cid: CorrelationId,
     ) -> Result<Vec<ModelSummary>, LocalCodeError> {
-        info!(%cid, %url, "HF search");
-        let req = self.auth_header(self.http.get(url));
-        let resp = req.send().await.map_err(|e| map_http_err(e, cid))?;
+        info!(%cid, url = %urls.first().map(String::as_str).unwrap_or(""), "HF search");
+        let resp = self.get_with_fallback(urls, cid).await?;
         handle_status(resp.status(), cid)?;
         let models: Vec<ModelSummary> = resp.json().await.map_err(|e| {
             LocalCodeError::new(ErrorCode::HfUnreachable, e.to_string())
@@ -192,10 +240,11 @@ impl HfClient {
     ) -> Result<ModelDetail, LocalCodeError> {
         // blobs=true is required for sibling file sizes; without it every
         // quant reports 0 bytes and VRAM fit prediction is meaningless.
-        let url = self.urls.api(&format!("models/{model_id}?blobs=true"));
+        let urls = self
+            .urls
+            .api_candidates(&format!("models/{model_id}?blobs=true"));
         info!(%cid, %model_id, "HF model info");
-        let req = self.auth_header(self.http.get(&url));
-        let resp = req.send().await.map_err(|e| map_http_err(e, cid))?;
+        let resp = self.get_with_fallback(&urls, cid).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(LocalCodeError::new(
                 ErrorCode::HfModelNotFound,
@@ -273,11 +322,9 @@ impl HfClient {
     }
 
     async fn fetch_readme(&self, model_id: &str) -> Result<String, LocalCodeError> {
-        let url = self.urls.resolve_file(model_id, "README.md");
-        let req = self.auth_header(self.http.get(&url));
-        let resp = req.send().await.map_err(|e| {
-            LocalCodeError::new(ErrorCode::HfUnreachable, e.to_string())
-        })?;
+        let cid = CorrelationId::new();
+        let urls = self.urls.resolve_file_candidates(model_id, "README.md");
+        let resp = self.get_with_fallback(&urls, cid).await?;
         if !resp.status().is_success() {
             return Err(LocalCodeError::new(
                 ErrorCode::HfUnreachable,
@@ -290,6 +337,19 @@ impl HfClient {
     /// Resolve download URL via mirror with primary fallback.
     pub fn download_url(&self, model_id: &str, filename: &str) -> String {
         self.urls.resolve_file(model_id, filename)
+    }
+
+    /// All candidate download URLs for a file (primary endpoint first, then
+    /// mirrors, then canonical HF). A downloader should try them in order.
+    pub fn download_url_candidates(&self, model_id: &str, filename: &str) -> Vec<String> {
+        self.urls.resolve_file_candidates(model_id, filename)
+    }
+
+    /// Expand a single resolved download URL into the same path on every
+    /// configured host (primary first). Used by the deploy downloader to add
+    /// mirror fallbacks to URLs that were resolved earlier.
+    pub fn mirror_candidates(&self, url: &str) -> Vec<String> {
+        self.urls.mirror_candidates(url)
     }
 
     pub fn cache(&self) -> &ModelCache {

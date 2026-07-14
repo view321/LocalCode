@@ -5,7 +5,7 @@ use localcode_core::error::LocalCodeError;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme;
@@ -266,66 +266,3 @@ pub fn draw_modal(
     hits
 }
 
-/// Returns the on-screen rect of each visible item (with its index) so the
-/// caller can register click regions.
-pub fn draw_palette(
-    f: &mut Frame,
-    area: Rect,
-    query: &str,
-    items: &[String],
-    selected: usize,
-    th: &localcode_core::Theme,
-) -> Vec<(Rect, usize)> {
-    let rect = centered_rect(60, 50, area);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" Command palette (Ctrl+K) ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::accent(th));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
-        .split(inner);
-
-    f.render_widget(
-        Paragraph::new(format!("> {query}")).style(theme::accent(th)),
-        chunks[0],
-    );
-
-    let list_items: Vec<ListItem> = items
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let style = if i == selected {
-                theme::nav_active(th)
-            } else {
-                theme::muted(th)
-            };
-            ListItem::new(s.as_str()).style(style)
-        })
-        .collect();
-    f.render_widget(List::new(list_items), chunks[1]);
-
-    // One click rect per visible row (the list has no scroll offset).
-    let mut hits: Vec<(Rect, usize)> = Vec::new();
-    for i in 0..items.len() {
-        let y = chunks[1].y.saturating_add(i as u16);
-        if y >= chunks[1].y.saturating_add(chunks[1].height) {
-            break;
-        }
-        hits.push((
-            Rect {
-                x: chunks[1].x,
-                y,
-                width: chunks[1].width,
-                height: 1,
-            },
-            i,
-        ));
-    }
-    hits
-}

@@ -1,0 +1,25 @@
+[package]
+name = "localcode-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+localcode-core = { workspace = true }
+localcode-gpu = { workspace = true }
+# Pure-Rust crypto (ring) so no C/NASM toolchain is needed to build on Windows;
+# aws-lc-rs (russh's default) requires a system C compiler.
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

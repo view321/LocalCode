@@ -1,0 +1,231 @@
+//! Probe and provision a remote host: detect the GPU and Ollama, install
+//! Ollama (mirror-aware) if missing, and make sure it is serving.
+
+use localcode_core::config::RemoteServer;
+use localcode_core::error::{ErrorCode, LocalCodeError};
+use localcode_gpu::{parse_nvidia_smi_csv, GpuInventory, NVIDIA_SMI_QUERY_ARGS};
+
+use crate::ssh::SshClient;
+
+/// What we learned about a remote host.
+#[derive(Debug, Clone)]
+pub struct RemoteProbe {
+    pub uname: String,
+    pub has_ollama: bool,
+    pub ollama_running: bool,
+    pub gpu: GpuInventory,
+    /// Model tags already present on the remote Ollama (best-effort).
+    pub models: Vec<String>,
+}
+
+/// The `nvidia-smi` command that yields the CSV `parse_nvidia_smi_csv` expects.
+pub fn nvidia_smi_command() -> String {
+    format!("nvidia-smi {}", NVIDIA_SMI_QUERY_ARGS.join(" "))
+}
+
+/// Command that installs Ollama from `url` (the official installer, or a
+/// mirror of it). Piped to `sh`, matching the documented one-liner.
+pub fn ollama_install_command(url: &str) -> String {
+    format!("curl -fsSL {} | sh", shell_single_quote(url))
+}
+
+/// Command that starts `ollama serve` detached, optionally pointing HF pulls at
+/// a mirror via `HF_ENDPOINT` so an air-gapped box can still fetch `hf.co/*`
+/// GGUF weights.
+pub fn ollama_serve_command(hf_endpoint: &str, port: u16) -> String {
+    let mut env = format!("OLLAMA_HOST=127.0.0.1:{port} ");
+    if !hf_endpoint.trim().is_empty() {
+        env.push_str(&format!("HF_ENDPOINT={} ", shell_single_quote(hf_endpoint.trim())));
+    }
+    // Detach so the serve outlives our exec channel.
+    format!("sh -lc 'nohup env {env}ollama serve >/tmp/localcode-ollama.log 2>&1 & echo started'")
+}
+
+/// Single-quote a string for POSIX `sh` (wrap in quotes, escape embedded ').
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Probe the remote host. Never fails hard — missing tools show as false/empty.
+pub async fn probe(ssh: &SshClient, remote_port: u16) -> Result<RemoteProbe, LocalCodeError> {
+    let uname = ssh
+        .exec("uname -sm")
+        .await
+        .map(|o| o.out().to_string())
+        .unwrap_or_default();
+
+    let has_ollama = ssh
+        .exec("command -v ollama >/dev/null 2>&1 && echo yes || echo no")
+        .await
+        .map(|o| o.out() == "yes")
+        .unwrap_or(false);
+
+    let gpu = match ssh.exec(&nvidia_smi_command()).await {
+        Ok(o) if o.ok() => parse_nvidia_smi_csv(&o.stdout, "nvidia-smi-remote"),
+        _ => GpuInventory {
+            devices: vec![],
+            detection_method: "none".into(),
+            warnings: vec!["No NVIDIA GPU detected on the remote host".into()],
+        },
+    };
+
+    let ollama_running = ollama_health(ssh, remote_port).await;
+
+    let models = if ollama_running {
+        ssh.exec("ollama list")
+            .await
+            .map(|o| parse_ollama_list(&o.stdout))
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    Ok(RemoteProbe {
+        uname,
+        has_ollama,
+        ollama_running,
+        gpu,
+        models,
+    })
+}
+
+/// True if the remote Ollama HTTP endpoint answers.
+async fn ollama_health(ssh: &SshClient, port: u16) -> bool {
+    let cmd = format!(
+        "curl -fsS http://127.0.0.1:{port}/api/version >/dev/null 2>&1 && echo up || echo down"
+    );
+    ssh.exec(&cmd).await.map(|o| o.out() == "up").unwrap_or(false)
+}
+
+/// Parse `ollama list` table output into model tags (skip the header row).
+fn parse_ollama_list(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Ensure Ollama is installed and serving on the remote. `log` receives
+/// human-readable progress lines. Installs from the first working mirror.
+pub async fn ensure_ollama(
+    ssh: &SshClient,
+    server: &RemoteServer,
+    mut probe_state: RemoteProbe,
+    log: &mut (dyn FnMut(String) + Send),
+) -> Result<(), LocalCodeError> {
+    if !probe_state.has_ollama {
+        log("Ollama not found — installing".into());
+        install_ollama(ssh, server, log).await?;
+        probe_state.has_ollama = true;
+    } else {
+        log("Ollama already installed".into());
+    }
+
+    if !probe_state.ollama_running {
+        log("Starting ollama serve".into());
+        let cmd = ollama_serve_command(&server.mirrors.hf_endpoint, server.remote_port);
+        // Best-effort systemd first (installer sets up a service), else nohup.
+        let _ = ssh.exec("systemctl start ollama 2>/dev/null || true").await;
+        if !wait_for_ollama(ssh, server.remote_port, 3).await {
+            ssh.exec_checked(&cmd).await?;
+        }
+        if !wait_for_ollama(ssh, server.remote_port, 30).await {
+            return Err(LocalCodeError::new(
+                ErrorCode::RemoteProvisionFailed,
+                "Ollama did not become healthy on the remote host",
+            )
+            .with_cause("`ollama serve` started but /api/version never answered")
+            .with_hint("Check /tmp/localcode-ollama.log on the server")
+            .retryable(true));
+        }
+    }
+    log("Ollama is serving".into());
+    Ok(())
+}
+
+/// Try each configured installer mirror until one succeeds.
+async fn install_ollama(
+    ssh: &SshClient,
+    server: &RemoteServer,
+    log: &mut (dyn FnMut(String) + Send),
+) -> Result<(), LocalCodeError> {
+    let urls = if server.mirrors.ollama_install.is_empty() {
+        vec!["https://ollama.com/install.sh".to_string()]
+    } else {
+        server.mirrors.ollama_install.clone()
+    };
+    let mut last_err: Option<LocalCodeError> = None;
+    let n = urls.len();
+    for (i, url) in urls.iter().enumerate() {
+        log(format!("Installing Ollama from {} ({}/{})", url, i + 1, n));
+        match ssh.exec_checked(&ollama_install_command(url)).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                log(format!("Install source failed: {}", e.message));
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| {
+            LocalCodeError::new(ErrorCode::RemoteProvisionFailed, "no Ollama installer configured")
+        })
+        .with_hint("Add a reachable installer URL to the server's mirrors.ollama_install"))
+}
+
+/// Poll the remote Ollama health up to `secs` times (1s apart).
+async fn wait_for_ollama(ssh: &SshClient, port: u16, secs: u32) -> bool {
+    for _ in 0..secs {
+        if ollama_health(ssh, port).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_command_quotes_url() {
+        assert_eq!(
+            ollama_install_command("https://ollama.com/install.sh"),
+            "curl -fsSL 'https://ollama.com/install.sh' | sh"
+        );
+    }
+
+    #[test]
+    fn serve_command_sets_host_and_optional_hf_endpoint() {
+        let no_mirror = ollama_serve_command("", 11434);
+        assert!(no_mirror.contains("OLLAMA_HOST=127.0.0.1:11434"));
+        assert!(!no_mirror.contains("HF_ENDPOINT"));
+
+        let mirror = ollama_serve_command("https://hf-mirror.com", 11500);
+        assert!(mirror.contains("OLLAMA_HOST=127.0.0.1:11500"));
+        assert!(mirror.contains("HF_ENDPOINT='https://hf-mirror.com'"));
+    }
+
+    #[test]
+    fn nvidia_smi_command_matches_query_args() {
+        let c = nvidia_smi_command();
+        assert!(c.starts_with("nvidia-smi "));
+        assert!(c.contains("--query-gpu=index,name,memory.total,memory.free,driver_version"));
+        assert!(c.contains("--format=csv,noheader,nounits"));
+    }
+
+    #[test]
+    fn parse_ollama_list_skips_header() {
+        let out = "NAME\tID\tSIZE\nqwen2.5-coder:7b\tabc\t4GB\nllama3:8b\tdef\t5GB\n";
+        assert_eq!(parse_ollama_list(out), vec!["qwen2.5-coder:7b", "llama3:8b"]);
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+}

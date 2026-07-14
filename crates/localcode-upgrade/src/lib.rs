@@ -183,6 +183,8 @@ pub struct SelfUpdater {
     pub install_dir: PathBuf,
     repo_url: String,
     branch: String,
+    /// Alternate git remotes tried in order if `repo_url` fetch fails.
+    mirrors: Vec<String>,
 }
 
 impl SelfUpdater {
@@ -193,6 +195,7 @@ impl SelfUpdater {
         config_install_dir: Option<&str>,
         repo_url: &str,
         branch: &str,
+        mirrors: &[String],
     ) -> Result<Self, LocalCodeError> {
         let dir = std::env::var("LOCALCODE_INSTALL_DIR")
             .ok()
@@ -219,6 +222,7 @@ impl SelfUpdater {
             install_dir: dir,
             repo_url: repo_url.to_string(),
             branch: branch.to_string(),
+            mirrors: mirrors.iter().filter(|m| !m.trim().is_empty()).cloned().collect(),
         })
     }
 
@@ -235,9 +239,35 @@ impl SelfUpdater {
 
         say("Fetching latest code…");
         // Fetch the configured URL directly (not the checkout's `origin`) so
-        // updates.repo_url in config is always honored.
-        self.git(&["fetch", "--depth", "1", &self.repo_url, &self.branch])
-            .await?;
+        // updates.repo_url in config is always honored. Fall back to each
+        // configured mirror remote when the primary is unreachable (e.g.
+        // github.com blocked on this network).
+        let mut remotes = vec![self.repo_url.clone()];
+        remotes.extend(self.mirrors.iter().cloned());
+        let n = remotes.len();
+        let mut last_err: Option<LocalCodeError> = None;
+        let mut fetched = false;
+        for (i, remote) in remotes.iter().enumerate() {
+            if i > 0 {
+                say(&format!("Primary failed; trying mirror {}/{}…", i + 1, n));
+            }
+            match self
+                .git(&["fetch", "--depth", "1", remote, &self.branch])
+                .await
+            {
+                Ok(()) => {
+                    fetched = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !fetched {
+            return Err(last_err.unwrap_or_else(|| {
+                LocalCodeError::new(ErrorCode::UpdateFailed, "git fetch failed")
+                    .retryable(true)
+            }));
+        }
         self.git(&["checkout", "-B", &self.branch, "FETCH_HEAD"]).await?;
 
         let manifest = tokio::fs::read_to_string(self.install_dir.join("Cargo.toml"))
@@ -489,7 +519,7 @@ mod tests {
     fn resolve_rejects_non_checkout() {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("LOCALCODE_INSTALL_DIR");
-        let err = SelfUpdater::resolve(Some(dir.path().to_str().unwrap()), "u", "main")
+        let err = SelfUpdater::resolve(Some(dir.path().to_str().unwrap()), "u", "main", &[])
             .err()
             .expect("must reject a dir without .git");
         assert_eq!(err.code, ErrorCode::UpdateFailed);

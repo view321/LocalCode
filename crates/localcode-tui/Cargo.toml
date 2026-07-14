@@ -11,6 +11,7 @@ localcode-log = { workspace = true }
 localcode-gpu = { workspace = true }
 localcode-hf = { workspace = true }
 localcode-backends = { workspace = true }
+localcode-remote = { workspace = true }
 localcode-cloud = { workspace = true }
 localcode-payments = { workspace = true }
 localcode-bench = { workspace = true }

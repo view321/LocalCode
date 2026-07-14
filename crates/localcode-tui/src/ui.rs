@@ -1,29 +1,28 @@
-//! View rendering for all tabs.
+//! View rendering.
 //!
-//! Layout: header (identity + live chips) · clickable tab strip · view ·
-//! status bar. Views with multiple panes take their split from
-//! `App::pane_ratios` so `[`/`]` (and `{`/`}`) resizing persists.
+//! Layout: a thin top status line (no app name/emoji), the home transcript
+//! filling the middle, a one-line status/spinner, and a persistent omnibar at
+//! the bottom. Panels (former tabs) open as popups over the transcript; the
+//! omnibar stays visible and functional in every mode. Slash commands and a
+//! command menu drive navigation.
 
-use crate::app::{
-    App, BusyKind, ClickRegion, ClickTarget, EntryKind, ModelsPane, ResizeBorder, Tab,
-};
+use crate::app::{App, BusyKind, ClickRegion, ClickTarget, EntryKind, ModelsPane, Panel, ResizeBorder};
 use crate::markdown;
 use crate::theme;
-use crate::widgets::{draw_modal, draw_palette};
+use crate::widgets::draw_modal;
 use localcode_core::events::Severity;
 use localcode_core::runtime::RuntimeStatus;
 use localcode_core::theme::ThemeToken;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Standard bordered pane. Focused panes get the accent border so the pane
-/// that owns j/k/PgUp/PgDn is always visible.
+/// Standard bordered pane. Focused panes get the accent border.
 fn pane(app: &App, title: String, focused: bool) -> Block<'static> {
     let border = if focused {
         theme::accent(&app.theme)
@@ -49,8 +48,7 @@ fn ratio_constraints(ratios: &[f32]) -> Vec<Constraint> {
         .collect()
 }
 
-/// The area inside a pane's border — where list rows and content actually
-/// render. Used so a click maps to the right row (row 0 sits at `area.y + 1`).
+/// The area inside a pane's border.
 fn inner_rect(a: Rect) -> Rect {
     Rect {
         x: a.x.saturating_add(1),
@@ -60,13 +58,10 @@ fn inner_rect(a: Rect) -> Rect {
     }
 }
 
-/// Record a clickable region for this frame.
 fn click(app: &mut App, rect: Rect, target: ClickTarget) {
     app.click_regions.push(ClickRegion { rect, target });
 }
 
-/// Record a draggable vertical seam between panes `idx` and `idx + 1` of
-/// `view`, spanning the full height of `area` at column `x`.
 fn border(app: &mut App, x: u16, area: Rect, view: &'static str, idx: usize) {
     app.resize_borders.push(ResizeBorder {
         x,
@@ -81,13 +76,9 @@ fn border(app: &mut App, x: u16, area: Rect, view: &'static str, idx: usize) {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    // Hit regions are rebuilt every frame. Clear before the small-terminal
-    // early return so a shrink can never leave stale zones that fire on click.
     app.click_regions.clear();
     app.resize_borders.clear();
 
-    // Paint the themed background/foreground over the whole frame so light
-    // and high-contrast modes don't depend on the terminal's own colors.
     let base = Style::default()
         .bg(theme::color(&app.theme, ThemeToken::Bg))
         .fg(theme::color(&app.theme, ThemeToken::Fg));
@@ -95,35 +86,44 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if area.width < 40 || area.height < 12 {
         f.render_widget(
-            Paragraph::new("Terminal too small. Resize to continue.")
-                .style(theme::warn(&app.theme)),
+            Paragraph::new("Terminal too small. Resize to continue.").style(theme::warn(&app.theme)),
             area,
         );
         return;
     }
 
+    let composer_rows = app.config.ui.composer_rows.clamp(1, 10);
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Length(1), // tab strip
-            Constraint::Min(5),    // view
-            Constraint::Length(3), // status
+            Constraint::Length(1),               // top status chips
+            Constraint::Min(5),                  // body (transcript / panel)
+            Constraint::Length(1),               // status / spinner line
+            Constraint::Length(composer_rows + 2), // omnibar
         ])
         .split(area);
 
-    draw_header(f, main[0], app);
-    draw_tabs(f, main[1], app);
-    draw_view(f, main[2], app);
-    draw_status(f, main[3], app);
+    draw_topbar(f, main[0], app);
+    draw_home(f, main[1], app);
+    draw_statusline(f, main[2], app);
+    draw_omnibar(f, main[3], app);
 
-    // The backends manager sits under the modal layer so an install-confirm
-    // dialog overlays it (and its regions, recorded later, win the scan).
+    // Panels open as popups filling the body area, above the omnibar.
+    if let Some(panel) = app.panel {
+        draw_panel(f, main[1], app, panel);
+    }
+
+    // The backends manager overlays everything except the modal layer.
     if app.backends_open {
         draw_backend_manager(f, area, app);
     }
 
-    // Overlays are recorded last so their click regions win the reverse scan.
+    // The slash-command menu anchors just above the omnibar.
+    if app.slash_active() {
+        draw_slash_menu(f, main[1], main[3].y, app);
+    }
+
+    // Top-most overlays.
     let modal_btns = if let Some(modal) = &app.modal {
         draw_modal(f, area, modal, &app.theme)
     } else {
@@ -132,106 +132,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     for (rect, i) in modal_btns {
         click(app, rect, ClickTarget::ModalButton(i));
     }
-
-    if app.palette_open {
-        let items = app.palette_items();
-        let hits = draw_palette(
-            f,
-            area,
-            &app.palette_query,
-            &items,
-            app.palette_selected,
-            &app.theme,
-        );
-        for (rect, i) in hits {
-            click(app, rect, ClickTarget::PaletteItem(i));
-        }
-    }
     if app.assistant_open {
         draw_assistant_dock(f, area, app);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Chrome: header, tab strip, status
+// Chrome: top status, status line, omnibar
 // ---------------------------------------------------------------------------
-
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let th = &app.theme;
-    let sep = Span::styled(" │ ", theme::border(th));
-
-    let mut left: Vec<Span> = vec![
-        Span::styled(
-            " ⚡ LocalCode ",
-            theme::accent(th).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), theme::muted(th)),
-        sep.clone(),
-    ];
-
-    // Runtime chip
-    match app.active_runtime() {
-        Some(rt) => {
-            let (glyph, style) = runtime_glyph(rt.status, th);
-            left.push(Span::styled(format!("{glyph} "), style));
-            left.push(Span::styled(
-                rt.name.clone(),
-                Style::default().fg(theme::color(th, ThemeToken::Fg)),
-            ));
-        }
-        None => left.push(Span::styled("○ no runtime", theme::muted(th))),
-    }
-    left.push(sep.clone());
-
-    // GPU chip
-    left.push(Span::styled(app.gpu.summary(), theme::muted(th)));
-    left.push(sep);
-
-    // API chip
-    let (api_txt, api_style) = match app.api_healthy {
-        None => ("api …", theme::muted(th)),
-        Some(true) => ("api ✓", theme::ok(th)),
-        Some(false) => ("api ✗ (local-first ok)", theme::muted(th)),
-    };
-    left.push(Span::styled(api_txt, api_style));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme::border(th));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(Paragraph::new(Line::from(left)), inner);
-
-    // Right-aligned update badge, painted after so it always wins.
-    let badge: Option<(String, Style)> = if let Some(v) = &app.update_installed {
-        Some((
-            format!("↻ v{v} installed — restart to apply "),
-            theme::ok(th).add_modifier(Modifier::BOLD),
-        ))
-    } else if app.update_busy.is_some() {
-        Some((" updating… (Esc cancels) ".into(), theme::accent(th)))
-    } else {
-        app.update_available.as_ref().map(|info| {
-            (
-                format!("⬆ update v{} — press u ", info.latest),
-                theme::warn(th).add_modifier(Modifier::BOLD),
-            )
-        })
-    };
-    if let Some((text, style)) = badge {
-        let w = text.width() as u16;
-        if inner.width > w + 40 {
-            let rect = Rect {
-                x: inner.x + inner.width - w,
-                y: inner.y,
-                width: w,
-                height: 1,
-            };
-            f.render_widget(Paragraph::new(Span::styled(text, style)), rect);
-        }
-    }
-}
 
 fn runtime_glyph(status: RuntimeStatus, th: &localcode_core::Theme) -> (&'static str, Style) {
     match status {
@@ -243,79 +151,80 @@ fn runtime_glyph(status: RuntimeStatus, th: &localcode_core::Theme) -> (&'static
     }
 }
 
-fn tab_label(tab: Tab) -> &'static str {
-    match tab {
-        Tab::Dashboard => "home",
-        Tab::Models => "models",
-        Tab::Benchmarks => "bench",
-        Tab::Coding => "coding",
-        Tab::Setup => "setup",
-        Tab::Notifications => "alerts",
-        Tab::Settings => "settings",
-    }
-}
-
-/// Tab strip. Also records hit ranges on `app` so mouse clicks map to tabs.
-fn draw_tabs(f: &mut Frame, area: Rect, app: &mut App) {
-    let th = app.theme;
-    app.tab_strip_row = area.y;
-    app.tab_hit.clear();
-
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    let mut x = area.x + 1;
-    for t in Tab::all() {
-        let mut label = format!(" {} ", tab_label(t));
-        if t == Tab::Notifications && !app.notifications.is_empty() {
-            label = format!(" {}({}) ", tab_label(t), app.notifications.len());
-        }
-        let w = label.width() as u16;
-        let active = app.tab == t;
-        let hovered = app.tab_hover == Some(t) && app.config.ui.right_rail_hover_brightens;
-        let style = if active {
-            Style::default()
-                .fg(theme::color(&th, ThemeToken::Bg))
-                .bg(theme::color(&th, ThemeToken::Accent))
-                .add_modifier(Modifier::BOLD)
-        } else if hovered {
-            theme::nav_hover(&th)
-        } else {
-            theme::nav_idle(&th)
-        };
-        app.tab_hit.push((x, x + w, t));
-        spans.push(Span::styled(label, style));
-        spans.push(Span::raw(" "));
-        x += w + 1;
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn tab_hint(tab: Tab) -> &'static str {
-    match tab {
-        Tab::Dashboard => "click a runtime · drag border to resize · scroll · x stop · ? help",
-        Tab::Models => {
-            "click a model to open · click card · drag borders · scroll · d deploy · ? help"
-        }
-        Tab::Coding => "click composer to type · scroll transcript · n new · ? help",
-        Tab::Benchmarks => "r run · ? help",
-        Tab::Setup => "scroll · m manage backends · d doctor · r redetect · ? help",
-        Tab::Notifications => "click or scroll to select · c clear · ? help",
-        Tab::Settings => "t theme · Ctrl+S save · ? help",
-    }
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+/// Thin top line: runtime · gpu · api chips on the left, update badge right.
+/// No app name or emoji — minimal by design.
+fn draw_topbar(f: &mut Frame, area: Rect, app: &App) {
     let th = &app.theme;
-    let (mut text, style) = if let Some(b) = &app.busy {
+    let sep = Span::styled("  ", theme::muted(th));
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+
+    match app.active_runtime() {
+        Some(rt) => {
+            let (glyph, style) = runtime_glyph(rt.status, th);
+            spans.push(Span::styled(format!("{glyph} "), style));
+            spans.push(Span::styled(
+                rt.name.clone(),
+                Style::default().fg(theme::color(th, ThemeToken::Fg)),
+            ));
+        }
+        None => spans.push(Span::styled("○ no runtime", theme::muted(th))),
+    }
+    spans.push(sep.clone());
+    spans.push(Span::styled(app.gpu.summary(), theme::muted(th)));
+    spans.push(sep);
+    let (api_txt, api_style) = match app.api_healthy {
+        None => ("api …", theme::muted(th)),
+        Some(true) => ("api ✓", theme::ok(th)),
+        Some(false) => ("api ✗ local-first", theme::muted(th)),
+    };
+    spans.push(Span::styled(api_txt, api_style));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Right-aligned update badge.
+    let badge: Option<(String, Style)> = if let Some(v) = &app.update_installed {
+        Some((
+            format!("↻ v{v} installed — restart "),
+            theme::ok(th).add_modifier(Modifier::BOLD),
+        ))
+    } else if app.update_busy.is_some() {
+        Some((" updating… ".into(), theme::accent(th)))
+    } else {
+        app.update_available.as_ref().map(|info| {
+            (
+                format!("⬆ update v{} — /update ", info.latest),
+                theme::warn(th).add_modifier(Modifier::BOLD),
+            )
+        })
+    };
+    if let Some((text, style)) = badge {
+        let w = text.width() as u16;
+        if area.width > w + 20 {
+            let rect = Rect {
+                x: area.x + area.width - w,
+                y: area.y,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(Span::styled(text, style)), rect);
+        }
+    }
+}
+
+/// One-line status/spinner above the omnibar.
+fn draw_statusline(f: &mut Frame, area: Rect, app: &App) {
+    let th = &app.theme;
+    let (text, style) = if let Some(b) = &app.busy {
         let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
-        let label = if b.kind == BusyKind::Coding {
-            format!("{} — tokens stream into the transcript", b.label)
+        let extra = if b.kind == BusyKind::Coding {
+            " — tokens streaming".to_string()
         } else {
-            b.label.clone()
+            String::new()
         };
         (
             format!(
-                "{frame} {} ({}s) — Esc cancels",
-                label,
+                " {frame} {}{extra} ({}s) — Esc cancels",
+                b.label,
                 b.started.elapsed().as_secs()
             ),
             theme::accent(th),
@@ -324,20 +233,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
         (
             format!(
-                "{frame} {} {}% ({}s) — Esc cancels",
+                " {frame} {} {}% ({}s) — Esc cancels",
                 b.label,
                 app.deploy_progress,
-                b.started.elapsed().as_secs()
-            ),
-            theme::accent(th),
-        )
-    } else if let Some(b) = &app.update_busy {
-        let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
-        (
-            format!(
-                "{frame} {}: {} ({}s) — Esc cancels",
-                b.label,
-                app.update_progress_line,
                 b.started.elapsed().as_secs()
             ),
             theme::accent(th),
@@ -345,12 +243,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else if let Some(b) = &app.install_busy {
         let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
         (
-            format!(
-                "{frame} {}: {} ({}s) — Esc cancels",
-                b.label,
-                app.install_progress_line,
-                b.started.elapsed().as_secs()
-            ),
+            format!(" {frame} {}: {}", b.label, app.install_progress_line),
+            theme::accent(th),
+        )
+    } else if let Some(b) = &app.update_busy {
+        let frame = SPINNER[(b.started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
+        (
+            format!(" {frame} {}: {}", b.label, app.update_progress_line),
             theme::accent(th),
         )
     } else {
@@ -359,53 +258,246 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         } else {
             theme::muted(th)
         };
-        (app.status_line.clone(), style)
+        (format!(" {}", app.status_line), style)
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+}
+
+/// The persistent omnibar. Typing chats with the agent; a leading '/' turns it
+/// into a command entry (menu drawn above). It doubles as the model-search box
+/// when the Models panel is open.
+fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, area, ClickTarget::Composer);
+    let th = &app.theme;
+    let slash = app.slash_active();
+    let style = if slash {
+        theme::accent(th)
+    } else {
+        theme::border(th)
     };
 
-    // Right-aligned per-tab key hints, left text truncated to fit.
-    let hint = tab_hint(app.tab);
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let hint_w = hint.width();
-    if inner_w > hint_w + 3 {
-        let max_text = inner_w - hint_w - 3;
-        if text.width() > max_text {
-            text = text
-                .chars()
-                .scan(0usize, |w, c| {
-                    *w += c.to_string().width();
-                    if *w > max_text.saturating_sub(1) {
-                        None
-                    } else {
-                        Some(c)
-                    }
-                })
-                .collect::<String>()
-                + "…";
-        }
-        let pad = inner_w.saturating_sub(text.width() + hint_w);
-        text = format!("{}{}{}", text, " ".repeat(pad), hint);
+    let placeholder = match app.panel {
+        Some(Panel::Models) => "search HuggingFace models…  (Enter searches)",
+        _ => "message the agent…  ( / for commands )",
+    };
+
+    let title = match app.panel {
+        Some(Panel::Models) => " search ".to_string(),
+        Some(p) => format!(" {} · type to chat ", p.title()),
+        None => " prompt ".to_string(),
+    };
+
+    let mut spans: Vec<Span> = vec![Span::styled("❯ ", theme::accent(th))];
+    if app.coding_input.is_empty() {
+        spans.push(Span::styled(placeholder, theme::muted(th)));
+    } else {
+        let chars: Vec<char> = app.coding_input.chars().collect();
+        let cur = app.coding_cursor.min(chars.len());
+        let before: String = chars[..cur].iter().collect();
+        let at: String = chars
+            .get(cur)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".into());
+        let after: String = if cur < chars.len() {
+            chars[cur + 1..].iter().collect()
+        } else {
+            String::new()
+        };
+        spans.push(Span::raw(before));
+        spans.push(Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)));
+        spans.push(Span::raw(after));
     }
 
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, style))).block(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(theme::border(th)),
+                .title(title)
+                .border_style(style),
         ),
         area,
     );
 }
 
-fn draw_view(f: &mut Frame, area: Rect, app: &mut App) {
-    match app.tab {
-        Tab::Dashboard => draw_dashboard(f, area, app),
-        Tab::Models => draw_models(f, area, app),
-        Tab::Benchmarks => draw_benchmarks(f, area, app),
-        Tab::Coding => draw_coding(f, area, app),
-        Tab::Setup => draw_setup(f, area, app),
-        Tab::Notifications => draw_notifications(f, area, app),
-        Tab::Settings => draw_settings(f, area, app),
+/// The slash-command menu, anchored just above the omnibar.
+fn draw_slash_menu(f: &mut Frame, body: Rect, omnibar_y: u16, app: &mut App) {
+    let items = app.palette_items();
+    let n = items.len().max(1) as u16;
+    let height = (n + 2).min(body.height.max(3));
+    let width = body.width.clamp(30, 72);
+    let x = body.x + (body.width.saturating_sub(width)) / 2;
+    let y = omnibar_y.saturating_sub(height);
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let th = &app.theme;
+    let block = Block::default()
+        .title(" commands — ↑/↓ Enter · Esc ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent(th));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let sel = app.palette_selected.min(items.len().saturating_sub(1));
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|s| ListItem::new(s.as_str()))
+        .collect();
+    let mut hits: Vec<(Rect, usize)> = Vec::new();
+    for (i, _) in items.iter().enumerate() {
+        let ry = inner.y.saturating_add(i as u16);
+        if ry >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        hits.push((
+            Rect {
+                x: inner.x,
+                y: ry,
+                width: inner.width,
+                height: 1,
+            },
+            i,
+        ));
+    }
+    let styled: Vec<ListItem> = list_items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| {
+            if i == sel {
+                it.style(theme::nav_active(th))
+            } else {
+                it.style(theme::muted(th))
+            }
+        })
+        .collect();
+    f.render_widget(List::new(styled), inner);
+    for (rect, i) in hits {
+        click(app, rect, ClickTarget::PaletteItem(i));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Home surface: the coding transcript
+// ---------------------------------------------------------------------------
+
+fn draw_home(f: &mut Frame, area: Rect, app: &mut App) {
+    click(app, area, ClickTarget::Transcript);
+    draw_transcript(f, area, app);
+}
+
+/// Transcript from structured entries, with scroll + follow.
+fn draw_transcript(f: &mut Frame, area: Rect, app: &mut App) {
+    let th = app.theme;
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2);
+    let agent_running = app
+        .busy
+        .as_ref()
+        .is_some_and(|b| b.kind == BusyKind::Coding);
+
+    let fg = Style::default().fg(theme::color(&th, ThemeToken::Fg));
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, e) in app.coding_transcript.iter().enumerate() {
+        if e.kind == EntryKind::You && idx > 0 {
+            lines.push(Line::from(""));
+        }
+        let (prefix, style) = match e.kind {
+            EntryKind::You => ("❯ ", theme::accent(&th).add_modifier(Modifier::BOLD)),
+            EntryKind::Agent => ("", fg),
+            EntryKind::Tool => ("  ", theme::muted(&th).add_modifier(Modifier::ITALIC)),
+            EntryKind::System => ("· ", theme::muted(&th)),
+            EntryKind::Error => ("✗ ", theme::error(&th)),
+        };
+        let text_style = if e.kind == EntryKind::You { style } else { fg };
+        let mut first = true;
+        let part_count = e.text.split('\n').count();
+        for (pi, part) in e.text.split('\n').enumerate() {
+            let mut spans: Vec<Span> = Vec::new();
+            if first && !prefix.is_empty() {
+                spans.push(Span::styled(prefix.to_string(), style));
+            } else if !first && !prefix.is_empty() {
+                spans.push(Span::raw(" ".repeat(prefix.width())));
+            }
+            let content_style = match e.kind {
+                EntryKind::Tool | EntryKind::System | EntryKind::Error => style,
+                _ => text_style,
+            };
+            spans.push(Span::styled(part.to_string(), content_style));
+            if e.live && agent_running && pi + 1 == part_count {
+                spans.push(Span::styled("▌", theme::accent(&th)));
+            }
+            lines.push(Line::from(spans));
+            first = false;
+        }
+    }
+
+    let total: usize = lines.iter().map(|l| (l.width().max(1)).div_ceil(inner_w)).sum();
+    app.coding_total_lines = total;
+    app.coding_view_height = inner_h;
+    let max_scroll = total.saturating_sub(inner_h as usize);
+    let offset = if app.coding_follow {
+        max_scroll
+    } else {
+        app.coding_scroll.min(max_scroll)
+    };
+
+    let title = if app.coding_follow {
+        " conversation ".to_string()
+    } else {
+        " conversation — scrolled · End to follow ".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((offset as u16, 0))
+            .block(pane(app, title, false)),
+        area,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Panel frame + dispatch
+// ---------------------------------------------------------------------------
+
+/// Draw the popup frame for a panel and its content inside.
+fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, panel: Panel) {
+    f.render_widget(Clear, area);
+    let th = app.theme;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent(&th))
+        .title(Span::styled(
+            format!(" {} ", panel.title()),
+            theme::accent(&th).add_modifier(Modifier::BOLD),
+        ))
+        .title(Span::styled(" Esc ✕ ", theme::muted(&th)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // A close hit at the top-right of the frame.
+    let close = Rect {
+        x: area.x + area.width.saturating_sub(4),
+        y: area.y,
+        width: 3,
+        height: 1,
+    };
+    click(app, close, ClickTarget::PanelClose);
+
+    match panel {
+        Panel::Models => draw_models(f, inner, app),
+        Panel::Runtimes => draw_runtimes(f, inner, app),
+        Panel::Benchmarks => draw_benchmarks(f, inner, app),
+        Panel::Setup => draw_setup(f, inner, app),
+        Panel::Notifications => draw_notifications(f, inner, app),
+        Panel::Settings => draw_settings(f, inner, app),
+        Panel::Remote => draw_remote(f, inner, app),
     }
 }
 
@@ -424,10 +516,10 @@ fn gib(bytes: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard
+// Runtimes panel (formerly Dashboard)
 // ---------------------------------------------------------------------------
 
-fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_runtimes(f: &mut Frame, area: Rect, app: &mut App) {
     let ratios = app.pane_ratios("dashboard", App::pane_defaults("dashboard"));
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -438,15 +530,16 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
     border(app, cols[1].x, area, "dashboard", 0);
 
     let th = app.theme;
-    let items: Vec<ListItem> = if app.runtimes.is_empty() {
+    let runtimes = app.all_runtimes();
+    let items: Vec<ListItem> = if runtimes.is_empty() {
         vec![
             ListItem::new("No active runtimes.").style(theme::muted(&th)),
             ListItem::new(""),
-            ListItem::new("Deploy a model from the models tab — press d there")
+            ListItem::new("Deploy one with /models, or connect a remote GPU with /remote")
                 .style(theme::muted(&th)),
         ]
     } else {
-        app.runtimes
+        runtimes
             .iter()
             .enumerate()
             .map(|(i, r)| {
@@ -457,49 +550,25 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
                 } else {
                     Style::default().fg(theme::color(&th, ThemeToken::Fg))
                 };
-                let line = Line::from(vec![
+                ListItem::new(Line::from(vec![
                     Span::styled(format!(" {glyph} "), gstyle),
                     Span::styled(r.name.clone(), name_style),
-                    Span::styled(
-                        format!("  {:?} · {}", r.status, r.base_url),
-                        theme::muted(&th),
-                    ),
-                ]);
-                ListItem::new(line)
+                    Span::styled(format!("  {:?} · {}", r.status, r.base_url), theme::muted(&th)),
+                ]))
             })
             .collect()
     };
-    app.runtime_list_state.select(if app.runtimes.is_empty() {
-        None
-    } else {
-        Some(app.runtime_selected)
-    });
-
+    let n = runtimes.len();
+    app.runtime_list_state
+        .select(if n == 0 { None } else { Some(app.runtime_selected.min(n - 1)) });
     f.render_stateful_widget(
-        List::new(items).block(pane(
-            app,
-            " Runtimes — click or scroll · x stop ".into(),
-            true,
-        )),
+        List::new(items).block(pane(app, " Runtimes — /stop to stop ".into(), true)),
         cols[0],
         &mut app.runtime_list_state,
     );
 
     let th = &app.theme;
     let mut right: Vec<Line> = Vec::new();
-    if let Some(v) = &app.update_installed {
-        right.push(Line::from(Span::styled(
-            format!("↻ v{v} installed — restart LocalCode to apply"),
-            theme::ok(th).add_modifier(Modifier::BOLD),
-        )));
-        right.push(Line::from(""));
-    } else if let Some(info) = &app.update_available {
-        right.push(Line::from(Span::styled(
-            format!("⬆ Update v{} available — press u to install", info.latest),
-            theme::warn(th).add_modifier(Modifier::BOLD),
-        )));
-        right.push(Line::from(""));
-    }
     right.push(Line::from(Span::styled(
         "GPU",
         theme::accent(th).add_modifier(Modifier::BOLD),
@@ -526,57 +595,34 @@ fn draw_dashboard(f: &mut Frame, area: Rect, app: &mut App) {
         if app.assistant_configured {
             "configured"
         } else {
-            "not configured (see the setup tab)"
+            "not configured (/settings)"
         }
     )));
-    right.push(Line::from(""));
-    right.push(Line::from(Span::styled(
-        "Quick actions",
-        theme::accent(th).add_modifier(Modifier::BOLD),
-    )));
-    right.push(Line::from(
-        "  models: deploy a model    coding: code with it",
-    ));
-    right.push(Line::from(
-        "  bench: benchmark          setup: setup & doctor",
-    ));
-    right.push(Line::from("  Ctrl+K command palette"));
-    if !app.notifications.is_empty() {
+    if !app.remote_sessions.is_empty() {
         right.push(Line::from(""));
         right.push(Line::from(Span::styled(
-            "Recent",
+            "Remote servers",
             theme::accent(th).add_modifier(Modifier::BOLD),
         )));
-        for n in app.notifications.iter().rev().take(5) {
-            let style = match n.severity {
-                Severity::Error => theme::error(th),
-                Severity::Warn => theme::warn(th),
-                Severity::Success => theme::ok(th),
-                Severity::Info => theme::muted(th),
-            };
+        for s in &app.remote_sessions {
             right.push(Line::from(vec![
-                Span::styled("  • ", style),
-                Span::styled(n.title.clone(), theme::muted(th)),
+                Span::styled("  ● ", theme::ok(th)),
+                Span::styled(s.server_name.clone(), theme::muted(th)),
+                Span::styled(format!("  {}", s.gpu.summary()), theme::muted(th)),
             ]));
         }
     }
-
     f.render_widget(
-        Paragraph::new(right).wrap(Wrap { trim: true }).block(pane(
-            app,
-            " Overview ".into(),
-            false,
-        )),
+        Paragraph::new(right).wrap(Wrap { trim: true }).block(pane(app, " Overview ".into(), false)),
         cols[1],
     );
 }
 
 // ---------------------------------------------------------------------------
-// Models
+// Models panel
 // ---------------------------------------------------------------------------
 
 fn draw_models(f: &mut Frame, area: Rect, app: &mut App) {
-    // Refresh the memoized card render if the model or theme changed.
     let stale = match (&app.model_detail, &app.card_cache) {
         (Some(d), Some(c)) => c.model_id != d.summary.id || c.mode != app.theme.mode,
         (Some(_), None) => true,
@@ -612,41 +658,13 @@ fn draw_models(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(area);
-
-    click(app, left[0], ClickTarget::ModelSearch);
-    click(app, inner_rect(left[1]), ClickTarget::ModelList);
-
-    let search_style = if app.model_search_focus {
-        theme::accent(&th)
-    } else {
-        theme::muted(&th)
-    };
-    f.render_widget(
-        Paragraph::new(format!(
-            "{}{}",
-            app.model_query,
-            if app.model_search_focus { "▌" } else { "" }
-        ))
-        .style(search_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Search — click to type · p popular · t trending ")
-                .border_style(search_style),
-        ),
-        left[0],
-    );
+    click(app, inner_rect(area), ClickTarget::ModelList);
 
     let items: Vec<ListItem> = if app.models.is_empty() {
         vec![
             ListItem::new("No results yet.").style(theme::muted(&th)),
             ListItem::new(""),
-            ListItem::new("  / search HF   p popular   t trending").style(theme::muted(&th)),
+            ListItem::new("Type a query below and press Enter").style(theme::muted(&th)),
         ]
     } else {
         app.models
@@ -675,25 +693,25 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect()
     };
-    app.model_list_state.select(if app.models.is_empty() {
-        None
-    } else {
-        Some(app.model_selected)
-    });
+    app.model_list_state
+        .select(if app.models.is_empty() {
+            None
+        } else {
+            Some(app.model_selected)
+        });
 
-    let focused = app.models_focus == ModelsPane::List && !app.model_search_focus;
+    let focused = app.models_focus == ModelsPane::List;
     f.render_stateful_widget(
         List::new(items).block(pane(
             app,
             format!(" Models ({}) — click to open ", app.models.len()),
             focused,
         )),
-        left[1],
+        area,
         &mut app.model_list_state,
     );
 }
 
-/// Metadata chips + rendered markdown card, scrollable.
 fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
     click(app, area, ClickTarget::ModelCard);
     let th = &app.theme;
@@ -703,10 +721,7 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled(
-                    "  Select a model and press Enter.",
-                    theme::muted(th),
-                )),
+                Line::from(Span::styled("  Select a model and press Enter.", theme::muted(th))),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  The full model card renders here — click it to focus, scroll to read.",
@@ -724,7 +739,6 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Length(6), Constraint::Min(3)])
         .split(area);
 
-    // --- Chips header
     let s = &d.summary;
     let mut chip_line1: Vec<Span> = vec![Span::styled(
         s.id.clone(),
@@ -765,18 +779,9 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
 
     let header = vec![
         Line::from(chip_line1),
-        Line::from(Span::styled(
-            chips2,
-            Style::default().fg(theme::color(th, ThemeToken::Fg)),
-        )),
-        Line::from(Span::styled(
-            format!("tags: {}", tags.join(", ")),
-            theme::muted(th),
-        )),
-        Line::from(Span::styled(
-            format!("updated: {updated}"),
-            theme::muted(th),
-        )),
+        Line::from(Span::styled(chips2, Style::default().fg(theme::color(th, ThemeToken::Fg)))),
+        Line::from(Span::styled(format!("tags: {}", tags.join(", ")), theme::muted(th))),
+        Line::from(Span::styled(format!("updated: {updated}"), theme::muted(th))),
     ];
     f.render_widget(
         Paragraph::new(header).block(
@@ -792,7 +797,6 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
         rows[0],
     );
 
-    // --- Markdown body (memoized in app.card_cache)
     let inner_w = rows[1].width.saturating_sub(2).max(1) as usize;
     let inner_h = rows[1].height.saturating_sub(2);
     let lines: Vec<Line> = app
@@ -800,10 +804,7 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|c| c.lines.clone())
         .unwrap_or_default();
-    let total: usize = lines
-        .iter()
-        .map(|l| (l.width().max(1)).div_ceil(inner_w))
-        .sum();
+    let total: usize = lines.iter().map(|l| (l.width().max(1)).div_ceil(inner_w)).sum();
     app.card_total_lines = total;
     app.card_view_height = inner_h;
     let max_scroll = total.saturating_sub(inner_h as usize);
@@ -825,7 +826,39 @@ fn draw_models_card(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
+    // Register all click regions up front (they need `&mut app`) before taking
+    // an immutable borrow of the theme. Later-registered regions win the
+    // reverse hit-scan: DeployButton (last row) over QuantList over the pane.
     click(app, area, ClickTarget::DeployPane);
+    let inner = inner_rect(area);
+    if inner.height > 0 {
+        click(
+            app,
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+            ClickTarget::BackendCycle,
+        );
+    }
+    if inner.height > 4 {
+        click(
+            app,
+            Rect {
+                x: inner.x,
+                y: inner.y + 3,
+                width: inner.width,
+                height: inner.height.saturating_sub(4),
+            },
+            ClickTarget::QuantList,
+        );
+    }
+    if inner.height >= 1 {
+        let by = inner.y + inner.height.saturating_sub(1);
+        click(
+            app,
+            Rect { x: inner.x, y: by, width: inner.width, height: 1 },
+            ClickTarget::DeployButton,
+        );
+    }
+
     let th = &app.theme;
     let deploying = app.deploy_busy.is_some();
     let chunks = if deploying {
@@ -846,7 +879,7 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
             app.deploy_backend.as_str().to_string(),
             theme::accent(th).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   [b] cycle", theme::muted(th)),
+        Span::styled("  ⟳ click", theme::muted(th)),
     ])];
     lines.push(Line::from(vec![
         Span::styled("Context  ", theme::muted(th)),
@@ -854,13 +887,12 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
             format!("{}", app.deploy_ctx),
             Style::default().fg(theme::color(th, ThemeToken::Fg)),
         ),
-        Span::styled("   [+/-] adjust", theme::muted(th)),
     ]));
     lines.push(Line::from(""));
 
     if let Some(d) = &app.model_detail {
         lines.push(Line::from(Span::styled(
-            format!("Quants ({})  [,/.] pick", d.quants.len()),
+            format!("Quants ({}) — click to cycle", d.quants.len()),
             theme::muted(th),
         )));
         let selected_idx = d
@@ -868,7 +900,6 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .position(|q| Some(q.label.as_str()) == app.selected_quant.as_deref())
             .unwrap_or(0);
-        // Window the list around the selection so long quant lists stay usable.
         let max_show = (area.height.saturating_sub(12) as usize).clamp(4, 10);
         let start = selected_idx
             .saturating_sub(max_show / 2)
@@ -891,15 +922,9 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
                 style,
             )));
         }
-        if d.quants.len() > start + max_show {
-            lines.push(Line::from(Span::styled(
-                format!("  … {} more", d.quants.len() - start - max_show),
-                theme::muted(th),
-            )));
-        }
     } else {
         lines.push(Line::from(Span::styled(
-            "Open a model (Enter) to pick a quant.",
+            "Open a model to pick a quant.",
             theme::muted(th),
         )));
     }
@@ -920,18 +945,12 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "[d] one-click deploy",
+        "▶ Deploy  (click, or /deploy)",
         theme::accent(th).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        "[ ] and { } resize panes",
-        theme::muted(th),
     )));
 
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(pane(app, " Deploy ".into(), false)),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(pane(app, " Deploy ".into(), false)),
         chunks[0],
     );
 
@@ -947,188 +966,184 @@ fn draw_models_deploy(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Coding
+// Remote panel
 // ---------------------------------------------------------------------------
 
-fn draw_coding(f: &mut Frame, area: Rect, app: &mut App) {
-    let composer_rows = app.config.ui.composer_rows.clamp(1, 10);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(composer_rows + 2),
-        ])
+fn draw_remote(f: &mut Frame, area: Rect, app: &mut App) {
+    use crate::app::REMOTE_FIELDS;
+    let th = app.theme;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(24)])
         .split(area);
 
-    click(app, chunks[1], ClickTarget::Transcript);
-    click(app, chunks[2], ClickTarget::Composer);
+    // Left: saved servers + a "new" affordance.
+    let list_block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(theme::border(&th));
+    let list_inner = list_block.inner(cols[0]);
+    f.render_widget(list_block, cols[0]);
+    click(app, list_inner, ClickTarget::RemoteList);
 
-    let th = &app.theme;
-    let stream_chip = if app.config.agent.stream {
-        Span::styled("streaming ✓", theme::ok(th))
-    } else {
-        Span::styled("streaming off", theme::muted(th))
-    };
-    let header = Line::from(vec![
-        Span::styled("Runtime ", theme::muted(th)),
-        Span::styled(
-            app.active_runtime_name().unwrap_or_else(|| "none".into()),
-            Style::default().fg(theme::color(th, ThemeToken::Fg)),
-        ),
-        Span::styled(" │ ", theme::border(th)),
-        stream_chip,
-        Span::styled(" │ ", theme::border(th)),
-        Span::styled(
-            format!(
-                "skills {} · mcp {}",
-                app.skill_count, app.mcp_status_summary
-            ),
-            theme::muted(th),
-        ),
-    ]);
-    f.render_widget(
-        Paragraph::new(header).block(pane(app, " Coding ".into(), false)),
-        chunks[0],
-    );
-
-    draw_transcript(f, chunks[1], app);
-
-    // Composer with a real cursor.
-    let composer_style = if app.coding_input_focus {
-        theme::accent(&app.theme)
-    } else {
-        theme::border(&app.theme)
-    };
-    let mut spans: Vec<Span> = vec![Span::styled("❯ ", theme::accent(&app.theme))];
-    if app.coding_input_focus {
-        let chars: Vec<char> = app.coding_input.chars().collect();
-        let cur = app.coding_cursor.min(chars.len());
-        let before: String = chars[..cur].iter().collect();
-        let at: String = chars
-            .get(cur)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| " ".into());
-        let after: String = if cur < chars.len() {
-            chars[cur + 1..].iter().collect()
+    let connected: Vec<String> = app.remote_sessions.iter().map(|s| s.server_name.clone()).collect();
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, s) in app.config.remote.servers.iter().enumerate() {
+        let sel = i == app.remote_selected;
+        let live = connected.contains(&s.name);
+        let connecting = app.remote_connecting == Some(i);
+        let (glyph, gstyle) = if connecting {
+            ("◐", theme::warn(&th))
+        } else if live {
+            ("●", theme::ok(&th))
         } else {
-            String::new()
+            ("○", theme::muted(&th))
         };
-        spans.push(Span::raw(before));
-        spans.push(Span::styled(
-            at,
-            Style::default().add_modifier(Modifier::REVERSED),
-        ));
-        spans.push(Span::raw(after));
-    } else {
-        spans.push(Span::raw(app.coding_input.clone()));
+        let name_style = if sel {
+            theme::nav_active(&th)
+        } else {
+            Style::default().fg(theme::color(&th, ThemeToken::Fg))
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!(" {glyph} "), gstyle),
+            Span::styled(s.name.clone(), name_style),
+        ])));
     }
+    if items.is_empty() {
+        items.push(ListItem::new(" (no servers) ").style(theme::muted(&th)));
+    }
+    f.render_widget(List::new(items), list_inner);
+    // "+ New" row at the bottom of the list column.
+    let newy = cols[0].y + cols[0].height.saturating_sub(1);
+    let newrect = Rect { x: cols[0].x, y: newy, width: cols[0].width, height: 1 };
     f.render_widget(
-        Paragraph::new(Line::from(spans))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Composer — click to type · Enter send · ↑ history ")
-                    .border_style(composer_style),
-            ),
-        chunks[2],
+        Paragraph::new(Span::styled(" + New server ", theme::accent(&th))),
+        newrect,
     );
-}
+    click(app, newrect, ClickTarget::RemoteNew);
 
-/// Transcript from structured entries, with scroll + follow. Wrapped line
-/// counts are estimated so PgUp/PgDn and auto-follow know the bounds.
-fn draw_transcript(f: &mut Frame, area: Rect, app: &mut App) {
-    let th = app.theme;
-    let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let inner_h = area.height.saturating_sub(2);
-    let agent_running = app
-        .busy
-        .as_ref()
-        .is_some_and(|b| b.kind == BusyKind::Coding);
+    // Right: the editable form for the selected server + actions.
+    let right = Rect {
+        x: cols[1].x + 1,
+        y: cols[1].y,
+        width: cols[1].width.saturating_sub(2),
+        height: cols[1].height,
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(REMOTE_FIELDS.len() as u16 + 1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
+        .split(right);
 
-    let fg = Style::default().fg(theme::color(&th, ThemeToken::Fg));
-    let mut lines: Vec<Line> = Vec::new();
-    for (idx, e) in app.coding_transcript.iter().enumerate() {
-        // Breathing room before each user turn.
-        if e.kind == EntryKind::You && idx > 0 {
-            lines.push(Line::from(""));
-        }
-        let (prefix, style) = match e.kind {
-            EntryKind::You => ("❯ ", theme::accent(&th).add_modifier(Modifier::BOLD)),
-            EntryKind::Agent => ("", fg),
-            EntryKind::Tool => ("  ", theme::muted(&th).add_modifier(Modifier::ITALIC)),
-            EntryKind::System => ("· ", theme::muted(&th)),
-            EntryKind::Error => ("✗ ", theme::error(&th)),
-        };
-        let text_style = if e.kind == EntryKind::You { style } else { fg };
-        let mut first = true;
-        let part_count = e.text.split('\n').count();
-        for (pi, part) in e.text.split('\n').enumerate() {
-            let mut spans: Vec<Span> = Vec::new();
-            if first && !prefix.is_empty() {
-                spans.push(Span::styled(prefix.to_string(), style));
-            } else if !first && !prefix.is_empty() {
-                spans.push(Span::raw(" ".repeat(prefix.width())));
-            }
-            let content_style = match e.kind {
-                EntryKind::Tool | EntryKind::System => style,
-                EntryKind::Error => style,
-                _ => text_style,
+    let has_server = !app.config.remote.servers.is_empty();
+    let mut field_lines: Vec<Line> = vec![Line::from(Span::styled(
+        "Server — click a field to edit",
+        theme::muted(&th),
+    ))];
+    if has_server {
+        for (i, label) in REMOTE_FIELDS.iter().enumerate() {
+            let selected = i == app.remote_field;
+            let editing = selected && app.remote_editing;
+            let raw = if editing {
+                app.remote_field_edit.clone()
+            } else {
+                app.remote_field_value(i)
             };
-            spans.push(Span::styled(part.to_string(), content_style));
-            // Live streaming cursor on the entry's last line.
-            if e.live && agent_running && pi + 1 == part_count {
-                spans.push(Span::styled("▌", theme::accent(&th)));
-            }
-            lines.push(Line::from(spans));
-            first = false;
+            // Mask the password field when not editing.
+            let shown = if *label == "password" && !editing {
+                "•".repeat(raw.chars().count().min(12))
+            } else if editing {
+                format!("{raw}▌")
+            } else {
+                raw
+            };
+            let mark = if selected { "▶" } else { " " };
+            let label_style = if selected {
+                theme::accent(&th).add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted(&th)
+            };
+            let val_style = if editing {
+                theme::accent(&th)
+            } else {
+                Style::default().fg(theme::color(&th, ThemeToken::Fg))
+            };
+            field_lines.push(Line::from(vec![
+                Span::styled(format!("{mark} {label:<10} "), label_style),
+                Span::styled(shown, val_style),
+            ]));
         }
+    } else {
+        field_lines.push(Line::from(Span::styled(
+            "No server selected. Click '+ New server' to add one.",
+            theme::muted(&th),
+        )));
     }
-
-    let total: usize = lines
-        .iter()
-        .map(|l| (l.width().max(1)).div_ceil(inner_w))
-        .sum();
-    app.coding_total_lines = total;
-    app.coding_view_height = inner_h;
-    let max_scroll = total.saturating_sub(inner_h as usize);
-    let offset = if app.coding_follow {
-        max_scroll
-    } else {
-        app.coding_scroll.min(max_scroll)
+    // Field rows are clickable (row 0 is the header, fields start at row 1).
+    let field_rect = Rect {
+        x: rows[0].x,
+        y: rows[0].y + 1,
+        width: rows[0].width,
+        height: rows[0].height.saturating_sub(1),
     };
+    click(app, field_rect, ClickTarget::RemoteField);
+    f.render_widget(Paragraph::new(field_lines), rows[0]);
 
-    let title = if app.coding_follow {
-        " Transcript ".to_string()
-    } else {
-        " Transcript — scrolled · End to follow ".to_string()
-    };
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset as u16, 0))
-            .block(pane(app, title, false)),
-        area,
-    );
+    // Action buttons row.
+    let buttons = [
+        ("[ Connect ]", ClickTarget::RemoteConnect),
+        ("[ Save ]", ClickTarget::RemoteSave),
+        ("[ Disconnect ]", ClickTarget::RemoteDisconnect),
+        ("[ Delete ]", ClickTarget::RemoteDelete),
+    ];
+    let mut x = rows[1].x;
+    let mut spans: Vec<Span> = Vec::new();
+    for (label, target) in buttons {
+        let w = label.width() as u16;
+        if x + w <= rows[1].x + rows[1].width {
+            click(app, Rect { x, y: rows[1].y, width: w, height: 1 }, target);
+        }
+        spans.push(Span::styled(label.to_string(), theme::accent(&th).add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(w + 1);
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+
+    // Help / password warning.
+    let help = vec![
+        Line::from(Span::styled(
+            "Connect installs & starts Ollama on the server (mirror-aware), then",
+            theme::muted(&th),
+        )),
+        Line::from(Span::styled(
+            "tunnels its port here so the agent uses the remote GPU.",
+            theme::muted(&th),
+        )),
+        Line::from(Span::styled(
+            "⚠ passwords are stored in plaintext in config.toml — prefer key_path.",
+            theme::warn(&th),
+        )),
+        Line::from(Span::styled(
+            "Quick add: /remote add <name> <host> <user> <password>",
+            theme::muted(&th),
+        )),
+    ];
+    f.render_widget(Paragraph::new(help).wrap(Wrap { trim: true }), rows[2]);
 }
 
 // ---------------------------------------------------------------------------
-// Benchmarks / Setup / Notifications / Settings
+// Benchmarks / Setup / Notifications / Settings (reused, minus tab hints)
 // ---------------------------------------------------------------------------
 
 fn draw_benchmarks(f: &mut Frame, area: Rect, app: &App) {
     let th = &app.theme;
     let mut lines = vec![
-        Line::from(Span::styled(
-            "Benchmarks",
-            theme::accent(th).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled("Benchmarks", theme::accent(th).add_modifier(Modifier::BOLD))),
         Line::from("Suite: localcode-sample-coding v1.0.0"),
         Line::from(""),
-        Line::from("[r] Run sample suite on the selected runtime"),
-        Line::from("[p] Publish last result (requires sign-in)"),
+        Line::from("Enter runs the sample suite on the active runtime."),
         Line::from(""),
     ];
     match &app.last_bench_result {
@@ -1138,35 +1153,20 @@ fn draw_benchmarks(f: &mut Frame, area: Rect, app: &App) {
                 theme::accent(th).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(format!("  score      {:.2}", r.metrics.score)));
-            lines.push(Line::from(format!(
-                "  pass rate  {:.0}%",
-                r.metrics.pass_rate * 100.0
-            )));
-            lines.push(Line::from(format!(
-                "  latency    p50 {} ms",
-                r.metrics.latency_p50_ms
-            )));
+            lines.push(Line::from(format!("  pass rate  {:.0}%", r.metrics.pass_rate * 100.0)));
+            lines.push(Line::from(format!("  latency    p50 {} ms", r.metrics.latency_p50_ms)));
         }
-        None => lines.push(Line::from(Span::styled(
-            app.last_bench_summary.clone(),
-            theme::muted(th),
-        ))),
+        None => lines.push(Line::from(Span::styled(app.last_bench_summary.clone(), theme::muted(th)))),
     }
-    f.render_widget(
-        Paragraph::new(lines).block(pane(app, " Benchmarks ".into(), false)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(pane(app, " Benchmarks ".into(), false)), area);
 }
 
 fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
     click(app, area, ClickTarget::SetupBody);
     let th = &app.theme;
     let mut lines = vec![
-        Line::from(Span::styled(
-            "Setup",
-            theme::accent(th).add_modifier(Modifier::BOLD),
-        )),
-        Line::from("1. GPUs detected — see Dashboard"),
+        Line::from(Span::styled("Setup", theme::accent(th).add_modifier(Modifier::BOLD))),
+        Line::from("1. GPUs detected — see /runtimes"),
         Line::from(format!(
             "2. Backends: {}",
             if app.detecting { "(detecting…)" } else { "" }
@@ -1190,33 +1190,25 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let manage_line_idx = lines.len();
     lines.push(Line::from(Span::styled(
-        "   [m] Manage & install backends — configure URL/bin/port · one-click install",
+        "   ▶ Manage & install backends (/backends)",
         theme::accent(th).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from("3. HF token: set HF_TOKEN env for gated models"));
+    lines.push(Line::from(format!("   endpoint: {}", app.config.registry.endpoint)));
+    if !app.config.registry.mirrors.is_empty() {
+        lines.push(Line::from(format!(
+            "   mirrors: {}",
+            app.config.registry.mirrors.join(", ")
+        )));
+    }
+    lines.push(Line::from("4. Assistant: OPENROUTER_API_KEY, or an OpenAI-compatible base_url"));
+    lines.push(Line::from("5. Remote GPU: /remote to connect a server over SSH"));
     lines.push(Line::from(format!(
-        "   endpoint: {}",
-        app.config.registry.endpoint
+        "6. Updates: checked on startup ({}) — /update when available",
+        if app.config.updates.check_on_startup { "on" } else { "off" }
     )));
-    lines.push(Line::from(
-        "4. Assistant: OPENROUTER_API_KEY, or an OpenAI-compatible base_url",
-    ));
-    lines.push(Line::from(
-        "5. Cloud providers (RunPod/Vast/Akash): not implemented yet",
-    ));
-    lines.push(Line::from(format!(
-        "6. Updates: checked on startup ({}) — press u when one is available,",
-        if app.config.updates.check_on_startup {
-            "on"
-        } else {
-            "off"
-        }
-    )));
-    lines.push(Line::from("   or run `localcode update` in a terminal"));
     lines.push(Line::from(""));
-    lines.push(Line::from(
-        "[m] Manage backends   [d] Run doctor   [r] Refresh detection   PgUp/PgDn scroll",
-    ));
+    lines.push(Line::from("Enter/scroll — /doctor runs diagnostics · /backends manages backends"));
     if let Some(doc) = &app.doctor_summary {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Doctor report", theme::muted(th))));
@@ -1225,29 +1217,19 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Make the "Manage backends" line clickable (recorded after SetupBody so it
-    // wins the reverse-scan for that row). Skipped when scrolled out of view.
     let inner = inner_rect(area);
     if (manage_line_idx as u16) >= app.setup_scroll {
         let ry = inner.y + (manage_line_idx as u16 - app.setup_scroll);
         if ry < inner.y.saturating_add(inner.height) {
             click(
                 app,
-                Rect {
-                    x: inner.x,
-                    y: ry,
-                    width: inner.width,
-                    height: 1,
-                },
+                Rect { x: inner.x, y: ry, width: inner.width, height: 1 },
                 ClickTarget::SetupManageBackends,
             );
         }
     }
-
     f.render_widget(
-        Paragraph::new(lines)
-            .scroll((app.setup_scroll, 0))
-            .block(pane(app, " Setup ".into(), false)),
+        Paragraph::new(lines).scroll((app.setup_scroll, 0)).block(pane(app, " Setup & Doctor ".into(), false)),
         area,
     );
 }
@@ -1285,18 +1267,13 @@ fn draw_notifications(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect()
     };
-    app.notif_list_state
-        .select(if app.notifications.is_empty() {
-            None
-        } else {
-            Some(app.notif_selected.min(app.notifications.len() - 1))
-        });
+    app.notif_list_state.select(if app.notifications.is_empty() {
+        None
+    } else {
+        Some(app.notif_selected.min(app.notifications.len() - 1))
+    });
     f.render_stateful_widget(
-        List::new(items).block(pane(
-            app,
-            format!(" Notifications ({}) — c clear ", app.notifications.len()),
-            true,
-        )),
+        List::new(items).block(pane(app, format!(" Notifications ({}) ", app.notifications.len()), true)),
         area,
         &mut app.notif_list_state,
     );
@@ -1304,34 +1281,20 @@ fn draw_notifications(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let th = &app.theme;
-    let head = |t: &str| {
-        Line::from(Span::styled(
-            t.to_string(),
-            theme::accent(th).add_modifier(Modifier::BOLD),
-        ))
-    };
+    let head = |t: &str| Line::from(Span::styled(t.to_string(), theme::accent(th).add_modifier(Modifier::BOLD)));
     let lines = vec![
         head("Appearance"),
-        Line::from(format!("  Theme: {:?}   [t] cycle", app.config.ui.theme)),
+        Line::from(format!("  Theme: {:?}   (/theme cycles)", app.config.ui.theme)),
         Line::from(format!("  Mouse capture: {}", app.config.ui.mouse)),
-        Line::from(format!(
-            "  Composer rows: {}   (Ctrl+↑/↓ on Coding)",
-            app.config.ui.composer_rows
-        )),
+        Line::from(format!("  Omnibar rows: {}   (Ctrl+↑/↓)", app.config.ui.composer_rows)),
         Line::from(""),
         head("Agent"),
-        Line::from(format!(
-            "  Token streaming: {}   (agent.stream)",
-            app.config.agent.stream
-        )),
+        Line::from(format!("  Token streaming: {}   (agent.stream)", app.config.agent.stream)),
         Line::from(format!(
             "  Confirm destructive shell commands: {}",
             app.config.agent.confirm_destructive_tools
         )),
-        Line::from(format!(
-            "  Allow cloud fallback for Coding: {}",
-            app.config.agent.allow_cloud_fallback
-        )),
+        Line::from(format!("  Allow cloud fallback: {}", app.config.agent.allow_cloud_fallback)),
         Line::from(""),
         head("Updates"),
         Line::from(format!(
@@ -1339,59 +1302,40 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             app.config.updates.check_on_startup,
             env!("CARGO_PKG_VERSION")
         )),
-        Line::from(format!(
-            "  Source: {} ({})",
-            app.config.updates.repo_url, app.config.updates.branch
-        )),
+        Line::from(format!("  Source: {} ({})", app.config.updates.repo_url, app.config.updates.branch)),
         Line::from(""),
         head("Services"),
-        Line::from(format!(
-            "  Default backend: {}",
-            app.config.backends.default.kind
-        )),
-        Line::from(format!("  Log level: {}", app.config.log_level())),
-        Line::from(format!(
-            "  Redact secrets in logs: {}",
-            app.config.logging.redact_secrets
-        )),
-        Line::from(format!("  API: {}", app.config.api_base_url())),
+        Line::from(format!("  Default backend: {}", app.config.backends.default.kind)),
         Line::from(format!("  Registry: {}", app.config.registry.api_endpoint)),
+        Line::from(format!("  HF mirrors: {}", if app.config.registry.mirrors.is_empty() { "none".into() } else { app.config.registry.mirrors.join(", ") })),
+        Line::from(format!("  Remote servers: {}", app.config.remote.servers.len())),
         Line::from(""),
         head("Config file"),
         Line::from(format!("  {}", app.paths.config_file().display())),
         Line::from(""),
         Line::from(Span::styled(
-            "Edit the file for options without a keybinding, then Ctrl+S here",
+            "Edit the file for options without a command, then Ctrl+S. Env overrides:",
             theme::muted(th),
         )),
         Line::from(Span::styled(
-            "or restart. Env overrides: LOCALCODE_API_URL, LOCALCODE_HF_ENDPOINT,",
-            theme::muted(th),
-        )),
-        Line::from(Span::styled(
-            "LOCALCODE_LOG_LEVEL, LOCALCODE_INSTALL_DIR, HF_TOKEN, OPENROUTER_API_KEY.",
+            "LOCALCODE_API_URL, LOCALCODE_HF_ENDPOINT, LOCALCODE_LOG_LEVEL, HF_TOKEN, OPENROUTER_API_KEY.",
             theme::muted(th),
         )),
     ];
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(pane(
-            app,
-            " Settings ".into(),
-            false,
-        )),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(pane(app, " Settings ".into(), false)),
         area,
     );
 }
 
 fn draw_assistant_dock(f: &mut Frame, area: Rect, app: &App) {
     use crate::widgets::centered_rect;
-    use ratatui::widgets::Clear;
     let rect = centered_rect(80, 70, area);
     f.render_widget(Clear, rect);
     let body = app
         .assistant_reply
         .clone()
-        .unwrap_or_else(|| "Ask assistant about the last error, or press a anywhere.".into());
+        .unwrap_or_else(|| "Ask the assistant about the last error (/assistant).".into());
     f.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: true })
@@ -1407,14 +1351,10 @@ fn draw_assistant_dock(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The backends manager: install (with prerequisites) and configure each
-/// backend. Left column lists the four backends with live status; the right
-/// column shows detection detail, editable config fields, the resolved install
-/// plan, and Install / Save / Re-detect actions.
+/// The backends manager overlay (install + configure each backend).
 fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     use crate::app::BACKEND_ORDER;
     use crate::widgets::centered_rect;
-    use ratatui::widgets::Clear;
 
     let th = app.theme;
     let rect = centered_rect(85, 82, area);
@@ -1432,7 +1372,6 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Length(18), Constraint::Min(24)])
         .split(inner);
 
-    // --- Left column: the four backends with a status glyph.
     let list_block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(theme::border(&th));
@@ -1468,7 +1407,6 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(List::new(items), list_inner);
 
-    // --- Right column: detail for the selected backend.
     let kind = app.backend_sel_kind();
     let labels = App::backend_field_labels(kind);
     let nfields = labels.len() as u16;
@@ -1481,15 +1419,14 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),           // detection
-            Constraint::Length(nfields.max(1)), // config fields
-            Constraint::Length(4),           // install plan
-            Constraint::Length(1),           // action buttons
-            Constraint::Min(1),              // progress / hint
+            Constraint::Length(7),
+            Constraint::Length(nfields.max(1)),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
         .split(right);
 
-    // Detection detail (owned clone so no borrow lingers across click()).
     let report = app.backend_reports.iter().find(|r| r.kind == kind).cloned();
     let status = match &report {
         Some(r) if r.ready => "ready",
@@ -1498,43 +1435,27 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
         None => "detecting…",
     };
     let mut info: Vec<Line> = vec![Line::from(vec![
-        Span::styled(
-            kind.as_str().to_string(),
-            theme::accent(&th).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(kind.as_str().to_string(), theme::accent(&th).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  — {status}"), theme::muted(&th)),
     ])];
     if let Some(r) = &report {
         if let Some(v) = &r.version {
-            info.push(Line::from(Span::styled(
-                format!("version: {v}"),
-                theme::muted(&th),
-            )));
+            info.push(Line::from(Span::styled(format!("version: {v}"), theme::muted(&th))));
         }
         if let Some(p) = &r.binary_path {
-            info.push(Line::from(Span::styled(
-                format!("path: {p}"),
-                theme::muted(&th),
-            )));
+            info.push(Line::from(Span::styled(format!("path: {p}"), theme::muted(&th))));
         }
         if let Some(u) = &r.base_url {
-            info.push(Line::from(Span::styled(
-                format!("url:  {u}"),
-                theme::muted(&th),
-            )));
+            info.push(Line::from(Span::styled(format!("url:  {u}"), theme::muted(&th))));
         }
         if let Some(n) = r.notes.first() {
             info.push(Line::from(Span::styled(n.clone(), theme::muted(&th))));
         }
     } else {
-        info.push(Line::from(Span::styled(
-            "press [r] to re-detect",
-            theme::muted(&th),
-        )));
+        info.push(Line::from(Span::styled("press [r] to re-detect", theme::muted(&th))));
     }
     f.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), rows[0]);
 
-    // Editable config fields — one clickable region over exactly the field rows.
     click(app, rows[1], ClickTarget::BackendMgrField);
     let mut field_lines: Vec<Line> = Vec::new();
     for (i, label) in labels.iter().enumerate() {
@@ -1563,7 +1484,6 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(Paragraph::new(field_lines), rows[1]);
 
-    // Resolved install plan preview.
     let preview = if app.backend_plan_preview.is_empty() {
         "—".to_string()
     } else {
@@ -1572,16 +1492,12 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled("Install plan", theme::muted(&th))),
-            Line::from(Span::styled(
-                preview,
-                Style::default().fg(theme::color(&th, ThemeToken::Fg)),
-            )),
+            Line::from(Span::styled(preview, Style::default().fg(theme::color(&th, ThemeToken::Fg)))),
         ])
         .wrap(Wrap { trim: true }),
         rows[2],
     );
 
-    // Action buttons.
     let buttons = [
         ("[i] Install", ClickTarget::BackendMgrInstall),
         ("[s] Save", ClickTarget::BackendMgrSave),
@@ -1592,27 +1508,14 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     for (label, target) in buttons {
         let w = label.width() as u16;
         if x + w <= rows[3].x + rows[3].width {
-            click(
-                app,
-                Rect {
-                    x,
-                    y: rows[3].y,
-                    width: w,
-                    height: 1,
-                },
-                target,
-            );
+            click(app, Rect { x, y: rows[3].y, width: w, height: 1 }, target);
         }
-        spans.push(Span::styled(
-            label.to_string(),
-            theme::accent(&th).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(label.to_string(), theme::accent(&th).add_modifier(Modifier::BOLD)));
         spans.push(Span::raw("  "));
         x = x.saturating_add(w + 2);
     }
     f.render_widget(Paragraph::new(Line::from(spans)), rows[3]);
 
-    // Progress / hint line.
     let hint = if let Some(b) = &app.install_busy {
         format!("{}: {}", b.label, app.install_progress_line)
     } else if app.backend_editing {
@@ -1625,8 +1528,5 @@ fn draw_backend_manager(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         theme::muted(&th)
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(hint, hint_style)).wrap(Wrap { trim: true }),
-        rows[4],
-    );
+    f.render_widget(Paragraph::new(Span::styled(hint, hint_style)).wrap(Wrap { trim: true }), rows[4]);
 }

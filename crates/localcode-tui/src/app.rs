@@ -33,6 +33,7 @@ use localcode_core::paths::AppPaths;
 use localcode_core::runtime::ActiveRuntime;
 use localcode_core::theme::{Theme, ThemeMode};
 use localcode_gpu::{discover, predict_fit, FitPrediction, FitRequest, GpuInventory};
+use localcode_remote::{setup_server, RemoteSession};
 use localcode_hf::{HfClient, ModelDetail, ModelSummary};
 use localcode_upgrade::{SelfUpdater, UpdateChecker, UpdateInfo, UpdateReport};
 use ratatui::backend::CrosstermBackend;
@@ -50,48 +51,31 @@ use tracing::info;
 const MAX_NOTIFICATIONS: usize = 200;
 const MAX_INPUT_HISTORY: usize = 100;
 
+/// A popup panel raised over the home transcript. `None` (no panel) is the
+/// home surface: the coding transcript plus the omnibar. Panels replace the
+/// old tabs — they are opened with slash commands and dismissed with Esc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Dashboard,
+pub enum Panel {
     Models,
+    Runtimes,
     Benchmarks,
-    Coding,
     Setup,
     Notifications,
     Settings,
+    Remote,
 }
 
-impl Tab {
-    pub fn all() -> [Tab; 7] {
-        [
-            Tab::Dashboard,
-            Tab::Models,
-            Tab::Benchmarks,
-            Tab::Coding,
-            Tab::Setup,
-            Tab::Notifications,
-            Tab::Settings,
-        ]
-    }
-
-    pub fn as_str(self) -> &'static str {
+impl Panel {
+    pub fn title(self) -> &'static str {
         match self {
-            Tab::Dashboard => "dashboard",
-            Tab::Models => "models",
-            Tab::Benchmarks => "benchmarks",
-            Tab::Coding => "coding",
-            Tab::Setup => "setup",
-            Tab::Notifications => "notifications",
-            Tab::Settings => "settings",
+            Panel::Models => "Models",
+            Panel::Runtimes => "Runtimes",
+            Panel::Benchmarks => "Benchmarks",
+            Panel::Setup => "Setup & Doctor",
+            Panel::Notifications => "Notifications",
+            Panel::Settings => "Settings",
+            Panel::Remote => "Remote GPU servers",
         }
-    }
-
-    pub fn from_index(i: usize) -> Tab {
-        *Self::all().get(i).unwrap_or(&Tab::Dashboard)
-    }
-
-    pub fn index(self) -> usize {
-        Self::all().iter().position(|t| *t == self).unwrap_or(0)
     }
 }
 
@@ -151,10 +135,12 @@ pub struct ClickRegion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickTarget {
     RuntimeList,
-    ModelSearch,
     ModelList,
     ModelCard,
     DeployPane,
+    DeployButton,
+    QuantList,
+    BackendCycle,
     Transcript,
     Composer,
     NotificationList,
@@ -168,6 +154,16 @@ pub enum ClickTarget {
     BackendMgrInstall,
     BackendMgrSave,
     BackendMgrRedetect,
+    // Remote panel
+    RemoteList,
+    RemoteField,
+    RemoteConnect,
+    RemoteSave,
+    RemoteDisconnect,
+    RemoteDelete,
+    RemoteNew,
+    // Panel close (the ✕ on a popup)
+    PanelClose,
 }
 
 /// A draggable vertical seam between two horizontal panes, recorded during
@@ -210,6 +206,7 @@ pub enum BusyKind {
     Doctor,
     Update,
     Install,
+    Remote,
 }
 
 pub struct Busy {
@@ -231,6 +228,7 @@ pub enum RetryAction {
     CheckUpdate,
     InstallUpdate,
     InstallBackend(BackendKind),
+    ConnectRemote(usize),
 }
 
 pub enum DeployOutcome {
@@ -271,6 +269,11 @@ pub enum BgMsg {
         kind: BackendKind,
         result: Result<(), LocalCodeError>,
     },
+    /// A remote SSH GPU server connection finished (setup + tunnel).
+    RemoteConnected {
+        server_idx: usize,
+        result: Result<Box<RemoteSession>, LocalCodeError>,
+    },
 }
 
 /// Bridges the agent's destructive-command approval to a TUI modal.
@@ -300,12 +303,8 @@ pub struct App {
     pub paths: AppPaths,
     pub config: Config,
     pub theme: Theme,
-    pub tab: Tab,
-    /// Tab-strip hit ranges `(x_start, x_end_exclusive, tab)` and row, filled
-    /// during draw so mouse handling matches what is actually on screen.
-    pub tab_hit: Vec<(u16, u16, Tab)>,
-    pub tab_strip_row: u16,
-    pub tab_hover: Option<Tab>,
+    /// The popup panel raised over the home transcript, or `None` for home.
+    pub panel: Option<Panel>,
     /// Clickable regions and draggable pane borders for the current frame,
     /// refilled every draw so the mouse handler never recomputes layout.
     pub click_regions: Vec<ClickRegion>,
@@ -317,8 +316,8 @@ pub struct App {
     pub last_failed_action: Option<RetryAction>,
     pub modal: Option<ModalState>,
     pending_tool_confirm: Option<oneshot::Sender<bool>>,
-    pub palette_open: bool,
-    pub palette_query: String,
+    /// Highlighted index in the slash-command menu (shown when the omnibar
+    /// text starts with '/').
     pub palette_selected: usize,
     pub assistant_open: bool,
     pub assistant_reply: Option<String>,
@@ -349,9 +348,18 @@ pub struct App {
     pub install_busy: Option<Busy>,
     pub install_progress_line: String,
     pub installing_kind: Option<BackendKind>,
+    // Remote SSH GPU servers
+    pub remote_sessions: Vec<RemoteSession>,
+    pub remote_selected: usize,
+    pub remote_field: usize,
+    pub remote_field_edit: String,
+    pub remote_editing: bool,
+    pub remote_connecting: Option<usize>,
+    /// Ollama base_url saved before it was repointed at a remote tunnel, so it
+    /// can be restored on disconnect.
+    pub pre_remote_ollama_url: Option<String>,
     // Models
     pub model_query: String,
-    pub model_search_focus: bool,
     pub models: Vec<ModelSummary>,
     pub model_selected: usize,
     pub model_list_state: ListState,
@@ -370,10 +378,9 @@ pub struct App {
     pub deploy_progress: u8,
     pub last_fit: Option<FitPrediction>,
     pub pending_oversize_deploy: Option<DeployRequest>,
-    // Coding
+    // Omnibar (prompt / search / command bar) — always focused.
     pub coding_input: String,
     pub coding_cursor: usize, // char index into coding_input
-    pub coding_input_focus: bool,
     pub coding_history: Vec<String>,
     coding_hist_idx: Option<usize>,
     pub coding_transcript: Vec<TranscriptEntry>,
@@ -446,21 +453,16 @@ impl App {
         let mut app = Self {
             theme: Theme::new(config.ui.theme),
             paths,
-            tab: Tab::Dashboard,
-            tab_hit: vec![],
-            tab_strip_row: 0,
+            panel: None,
             click_regions: vec![],
             resize_borders: vec![],
             dragging: None,
-            tab_hover: None,
-            status_line: "Ready — one-click local models, no account required".into(),
+            status_line: "Type to chat with the agent · press / for commands".into(),
             status_is_error: false,
             last_error: None,
             last_failed_action: None,
             modal: None,
             pending_tool_confirm: None,
-            palette_open: false,
-            palette_query: String::new(),
             palette_selected: 0,
             assistant_open: false,
             assistant_reply: None,
@@ -487,8 +489,14 @@ impl App {
             install_busy: None,
             install_progress_line: String::new(),
             installing_kind: None,
+            remote_sessions: vec![],
+            remote_selected: 0,
+            remote_field: 0,
+            remote_field_edit: String::new(),
+            remote_editing: false,
+            remote_connecting: None,
+            pre_remote_ollama_url: None,
             model_query: String::new(),
-            model_search_focus: false,
             models: vec![],
             model_selected: 0,
             model_list_state: ListState::default(),
@@ -508,12 +516,11 @@ impl App {
             pending_oversize_deploy: None,
             coding_input: String::new(),
             coding_cursor: 0,
-            coding_input_focus: false,
             coding_history: vec![],
             coding_hist_idx: None,
             coding_transcript: vec![TranscriptEntry::new(
                 EntryKind::System,
-                "Welcome to LocalCode Coding. Deploy a runtime (Models tab), then type a message.",
+                "Welcome to LocalCode. Type a message to chat with the agent, or press / for commands (/models, /remote, /backends, /help). Deploy a model with /models, or connect a remote GPU with /remote.",
             )],
             coding_scroll: 0,
             coding_follow: true,
@@ -549,10 +556,20 @@ impl App {
         app
     }
 
-    pub fn active_runtime(&self) -> Option<&ActiveRuntime> {
+    /// All runtimes the agent can use: locally-managed (from the registry) plus
+    /// remote runtimes tunneled over SSH.
+    pub fn all_runtimes(&self) -> Vec<&ActiveRuntime> {
         self.runtimes
-            .get(self.runtime_selected)
-            .or_else(|| self.runtimes.first())
+            .iter()
+            .chain(self.remote_sessions.iter().map(|s| &s.runtime))
+            .collect()
+    }
+
+    pub fn active_runtime(&self) -> Option<ActiveRuntime> {
+        let all = self.all_runtimes();
+        all.get(self.runtime_selected)
+            .or_else(|| all.first())
+            .map(|r| (*r).clone())
     }
 
     pub fn active_runtime_name(&self) -> Option<String> {
@@ -633,6 +650,13 @@ impl App {
                 self.coding_transcript
                     .push(TranscriptEntry::new(EntryKind::System, "turn cancelled"));
                 self.coding_follow = true;
+            }
+            if b.kind == BusyKind::Remote {
+                self.remote_connecting = None;
+                // Undo the speculative Ollama repoint.
+                if let Some(url) = self.pre_remote_ollama_url.take() {
+                    self.config.backends.ollama.base_url = url;
+                }
             }
             self.set_status(format!("Cancelled: {}", b.label), false);
         } else if let Some(b) = self.deploy_busy.take() {
@@ -781,6 +805,7 @@ impl App {
             Some(RetryAction::CheckUpdate) => self.start_update_check(true),
             Some(RetryAction::InstallUpdate) => self.start_install_update(),
             Some(RetryAction::InstallBackend(kind)) => self.start_install(kind),
+            Some(RetryAction::ConnectRemote(idx)) => self.connect_remote(idx),
             None => self.set_status("Nothing to retry", false),
         }
     }
@@ -975,6 +1000,7 @@ impl App {
             self.gpu.clone(),
             self.paths.models_cache.clone(),
             self.config.hf_token(),
+            self.config.hf_mirror_hosts(),
         );
         let tx = self.bg_tx.clone();
         let label = format!("Deploying {}", req.model_id);
@@ -1004,7 +1030,7 @@ impl App {
             self.set_status("Busy — Esc to cancel first", false);
             return;
         }
-        let Some(runtime) = self.active_runtime().cloned() else {
+        let Some(runtime) = self.active_runtime() else {
             self.set_status("Deploy a runtime first", true);
             return;
         };
@@ -1119,7 +1145,7 @@ impl App {
             return;
         }
 
-        let runtime = match self.active_runtime().cloned() {
+        let runtime = match self.active_runtime() {
             Some(r) => r,
             None => {
                 // Local-first: never silently route the workspace to a cloud
@@ -1220,6 +1246,21 @@ impl App {
     }
 
     fn start_stop_runtime(&mut self) {
+        // Selection indexes registry runtimes first, then remote sessions.
+        let reg_len = self.runtimes.len();
+        if self.runtime_selected >= reg_len {
+            let remote_idx = self.runtime_selected - reg_len;
+            if let Some(name) = self.remote_sessions.get(remote_idx).map(|s| s.server_name.clone()) {
+                match self.config.remote.servers.iter().position(|s| s.name == name) {
+                    Some(cfg_idx) => self.disconnect_remote(cfg_idx),
+                    None => {
+                        self.remote_sessions.remove(remote_idx);
+                        self.set_status(format!("Disconnected from {name}"), false);
+                    }
+                }
+            }
+            return;
+        }
         let Some(rt) = self.runtimes.get(self.runtime_selected) else {
             self.set_status("No runtime selected", false);
             return;
@@ -1501,6 +1542,246 @@ impl App {
     }
 
     // ------------------------------------------------------------------
+    // Remote SSH GPU servers
+    // ------------------------------------------------------------------
+
+    /// Connect the first server marked `auto_connect` on startup.
+    pub fn autoconnect_remotes(&mut self) {
+        if let Some(idx) = self
+            .config
+            .remote
+            .servers
+            .iter()
+            .position(|s| s.auto_connect)
+        {
+            self.set_status(
+                format!("Auto-connecting to {}…", self.config.remote.servers[idx].name),
+                false,
+            );
+            self.connect_remote(idx);
+        }
+    }
+
+    fn open_remote_panel(&mut self) {
+        self.set_panel(Some(Panel::Remote));
+        self.assistant_open = false;
+        if self.remote_selected >= self.config.remote.servers.len() {
+            self.remote_selected = 0;
+        }
+        self.remote_field = 0;
+        self.remote_editing = false;
+        self.set_status(
+            "Remote: click a field to edit · Connect to link · or /remote add <name> <host> <user> <password>",
+            false,
+        );
+    }
+
+    /// Append a fresh server template and select it for editing.
+    fn new_remote_server(&mut self) {
+        let s = localcode_core::config::RemoteServer {
+            name: format!("server-{}", self.config.remote.servers.len() + 1),
+            ..Default::default()
+        };
+        self.config.remote.servers.push(s);
+        self.remote_selected = self.config.remote.servers.len() - 1;
+        self.remote_field = 0;
+        self.remote_editing = false;
+        self.set_status("New server — fill in host/username/password, then Save & Connect", false);
+    }
+
+    fn delete_remote(&mut self, idx: usize) {
+        if idx < self.config.remote.servers.len() {
+            let name = self.config.remote.servers[idx].name.clone();
+            self.disconnect_remote(idx);
+            self.config.remote.servers.remove(idx);
+            self.remote_selected = self.remote_selected.min(
+                self.config.remote.servers.len().saturating_sub(1),
+            );
+            let _ = self.config.save(&self.paths);
+            self.set_status(format!("Removed server '{name}'"), false);
+        }
+    }
+
+    fn save_remote_config(&mut self) {
+        self.commit_remote_field();
+        match self.config.save(&self.paths) {
+            Ok(()) => self.set_status("Remote servers saved", false),
+            Err(e) => self.raise_error(e),
+        }
+    }
+
+    /// `/remote add <name> <host> <user> <password> [port] [local_port]`
+    fn remote_quick_add(&mut self, args: &[String]) {
+        if args.len() < 4 {
+            self.set_status(
+                "Usage: /remote add <name> <host> <username> <password> [port] [local_port]",
+                true,
+            );
+            self.open_remote_panel();
+            return;
+        }
+        let mut s = localcode_core::config::RemoteServer {
+            name: args[0].clone(),
+            host: args[1].clone(),
+            username: args[2].clone(),
+            password: args[3].clone(),
+            ..Default::default()
+        };
+        if let Some(p) = args.get(4).and_then(|v| v.parse().ok()) {
+            s.port = p;
+        }
+        if let Some(lp) = args.get(5).and_then(|v| v.parse().ok()) {
+            s.local_port = lp;
+        }
+        self.config.remote.servers.push(s);
+        self.remote_selected = self.config.remote.servers.len() - 1;
+        let _ = self.config.save(&self.paths);
+        self.open_remote_panel();
+        self.set_status(
+            format!("Added '{}' — press Connect (or /connect)", args[0]),
+            false,
+        );
+    }
+
+    pub(crate) fn remote_field_value(&self, idx: usize) -> String {
+        let Some(s) = self.config.remote.servers.get(self.remote_selected) else {
+            return String::new();
+        };
+        match idx {
+            0 => s.name.clone(),
+            1 => s.host.clone(),
+            2 => s.port.to_string(),
+            3 => s.username.clone(),
+            4 => s.password.clone(),
+            5 => {
+                if s.local_port == 0 {
+                    String::new()
+                } else {
+                    s.local_port.to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn set_remote_field_value(&mut self, idx: usize, val: &str) {
+        let v = val.trim().to_string();
+        let Some(s) = self.config.remote.servers.get_mut(self.remote_selected) else {
+            return;
+        };
+        match idx {
+            0 => s.name = v,
+            1 => s.host = v,
+            2 => {
+                if let Ok(p) = v.parse() {
+                    s.port = p;
+                }
+            }
+            3 => s.username = v,
+            4 => s.password = v,
+            5 => s.local_port = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+
+    fn load_remote_field_edit(&mut self) {
+        self.remote_field_edit = self.remote_field_value(self.remote_field);
+    }
+
+    fn commit_remote_field(&mut self) {
+        if self.remote_editing {
+            let v = self.remote_field_edit.clone();
+            self.set_remote_field_value(self.remote_field, &v);
+        }
+    }
+
+    fn handle_remote_field_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.commit_remote_field();
+                self.remote_editing = false;
+            }
+            KeyCode::Backspace => {
+                self.remote_field_edit.pop();
+            }
+            KeyCode::Char(c) => self.remote_field_edit.push(c),
+            _ => {}
+        }
+    }
+
+    fn connect_remote(&mut self, idx: usize) {
+        if self.remote_connecting.is_some() || self.fg_busy() {
+            self.set_status("Busy — Esc to cancel first", false);
+            return;
+        }
+        self.commit_remote_field();
+        let Some(server) = self.config.remote.servers.get(idx).cloned() else {
+            self.set_status("No server selected — add one first", true);
+            return;
+        };
+        if server.host.trim().is_empty() || server.username.trim().is_empty() {
+            self.set_status("Set host and username first", true);
+            return;
+        }
+        // Point the Ollama backend at the tunnel so /deploy pulls on the remote,
+        // remembering the old URL to restore on disconnect.
+        if self.pre_remote_ollama_url.is_none() {
+            self.pre_remote_ollama_url = Some(self.config.backends.ollama.base_url.clone());
+        }
+        self.config.backends.ollama.base_url = server.tunnel_base_url();
+
+        let events = self.events.clone();
+        let tx = self.bg_tx.clone();
+        let server_for_task = server.clone();
+        self.remote_connecting = Some(idx);
+        self.last_failed_action = Some(RetryAction::ConnectRemote(idx));
+        let handle = tokio::spawn(async move {
+            let result = setup_server(&server_for_task, &events)
+                .await
+                .map(Box::new);
+            let _ = tx.send(BgMsg::RemoteConnected {
+                server_idx: idx,
+                result,
+            });
+        });
+        self.begin_busy(
+            BusyKind::Remote,
+            format!("Connecting to {} ({})", server.name, server.host),
+            handle,
+        );
+    }
+
+    fn disconnect_remote(&mut self, idx: usize) {
+        let Some(name) = self
+            .config
+            .remote
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        let before = self.remote_sessions.len();
+        self.remote_sessions.retain(|s| s.server_name != name);
+        if self.remote_sessions.len() == before {
+            return; // wasn't connected
+        }
+        // Restore the local Ollama URL if no remote sessions remain.
+        if self.remote_sessions.is_empty() {
+            if let Some(url) = self.pre_remote_ollama_url.take() {
+                self.config.backends.ollama.base_url = url;
+            }
+            self.gpu = discover().unwrap_or_else(|_| GpuInventory {
+                devices: vec![],
+                detection_method: "none".into(),
+                warnings: vec![],
+            });
+        }
+        self.runtime_selected = 0;
+        self.set_status(format!("Disconnected from {name}"), false);
+    }
+
+    // ------------------------------------------------------------------
     // Updates
     // ------------------------------------------------------------------
 
@@ -1565,6 +1846,7 @@ impl App {
             self.config.updates.install_dir.as_deref(),
             &self.config.updates.repo_url,
             &self.config.updates.branch,
+            &self.config.updates.mirrors,
         ) {
             Ok(u) => u,
             Err(e) => {
@@ -1845,6 +2127,40 @@ impl App {
                         }
                     }
                 }
+                BgMsg::RemoteConnected { server_idx, result } => {
+                    self.finish_busy();
+                    self.remote_connecting = None;
+                    match result {
+                        Ok(session) => {
+                            let session = *session;
+                            let name = session.server_name.clone();
+                            // Show the remote GPU in the top bar.
+                            self.gpu = session.gpu.clone();
+                            // Apply the repointed Ollama URL (set in connect_remote)
+                            // when it's safe — no locally-managed runtimes to kill.
+                            if self.runtimes.is_empty() {
+                                self.registry = Arc::new(BackendRegistry::from_config(&self.config));
+                            }
+                            // Replace any prior session for the same server.
+                            self.remote_sessions.retain(|s| s.server_name != name);
+                            self.remote_sessions.push(session);
+                            self.runtime_selected = self.all_runtimes().len().saturating_sub(1);
+                            self.set_status(
+                                format!("{name} connected — coding uses the remote GPU"),
+                                false,
+                            );
+                        }
+                        Err(e) => {
+                            // Roll back the speculative Ollama repoint on failure.
+                            if let Some(url) = self.pre_remote_ollama_url.take() {
+                                self.config.backends.ollama.base_url = url;
+                            }
+                            let _ = server_idx;
+                            self.last_failed_action = Some(RetryAction::ConnectRemote(server_idx));
+                            self.raise_error(e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1899,81 +2215,210 @@ impl App {
                 }
             }
         }
-        // Refresh runtimes from registry
+        // Refresh runtimes from registry (remote runtimes live in
+        // `remote_sessions`; selection indexes the combined list).
         self.runtimes = self.registry.list_runtimes().await;
-        if self.runtime_selected >= self.runtimes.len() {
-            self.runtime_selected = self.runtimes.len().saturating_sub(1);
+        let total = self.all_runtimes().len();
+        if self.runtime_selected >= total {
+            self.runtime_selected = total.saturating_sub(1);
         }
     }
 
     // ------------------------------------------------------------------
-    // Palette
+    // Slash command menu (the popup above the omnibar when input starts "/")
     // ------------------------------------------------------------------
 
+    /// The command catalog: `(name, args-hint, description)`. `name` includes
+    /// the leading slash. Order is the display order in the menu.
+    pub fn slash_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
+        &[
+            ("/models", "[query]", "Search & deploy HuggingFace models"),
+            ("/remote", "", "Connect a GPU server over SSH"),
+            ("/backends", "", "Install & configure inference backends"),
+            ("/runtimes", "", "Active runtimes & system overview"),
+            ("/deploy", "", "Deploy the selected model"),
+            ("/bench", "", "Benchmark the active runtime"),
+            ("/setup", "", "Setup checklist & doctor"),
+            ("/doctor", "", "Run environment diagnostics"),
+            ("/settings", "", "Settings"),
+            ("/theme", "", "Cycle the color theme"),
+            ("/alerts", "", "Notifications"),
+            ("/new", "", "Start a new coding session"),
+            ("/assistant", "", "Ask the in-app assistant"),
+            ("/update", "", "Install the available update"),
+            ("/logs", "", "Show the log directory path"),
+            ("/help", "", "Keyboard & mouse help"),
+            ("/quit", "", "Quit LocalCode"),
+        ]
+    }
+
+    /// Menu items filtered by whatever follows the leading slash in the omnibar.
     pub fn palette_items(&self) -> Vec<String> {
-        let mut all = vec![
-            "Go: dashboard".to_string(),
-            "Go: models".into(),
-            "Go: benchmarks".into(),
-            "Go: coding".into(),
-            "Go: setup".into(),
-            "Go: notifications".into(),
-            "Go: settings".into(),
-            "Deploy selected model".into(),
-            "New coding session".into(),
-            "Run doctor".into(),
-            "Manage backends".into(),
-            "Refresh backend detection".into(),
-            "Check for updates".into(),
-            "Clear notifications".into(),
-            "Open logs".into(),
-            "Ask assistant".into(),
-            "Help".into(),
-            "Quit".into(),
-        ];
-        if self.update_available.is_some() && self.update_busy.is_none() {
-            all.insert(0, "Install update".into());
-        }
-        if self.palette_query.is_empty() {
-            return all;
-        }
-        let q = self.palette_query.to_lowercase();
-        all.into_iter()
-            .filter(|i| i.to_lowercase().contains(&q))
+        let q = self
+            .coding_input
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        Self::slash_catalog()
+            .iter()
+            .filter(|(name, _, desc)| {
+                q.is_empty()
+                    || name[1..].to_lowercase().contains(&q)
+                    || desc.to_lowercase().contains(&q)
+            })
+            .map(|(name, args, desc)| {
+                if args.is_empty() {
+                    format!("{name}  —  {desc}")
+                } else {
+                    format!("{name} {args}  —  {desc}")
+                }
+            })
             .collect()
     }
 
-    fn run_palette_action(&mut self, item: &str) {
-        match item {
-            "Go: dashboard" => self.set_tab(Tab::Dashboard),
-            "Go: models" => self.set_tab(Tab::Models),
-            "Go: benchmarks" => self.set_tab(Tab::Benchmarks),
-            "Go: coding" => self.set_tab(Tab::Coding),
-            "Go: setup" => self.set_tab(Tab::Setup),
-            "Go: notifications" => self.set_tab(Tab::Notifications),
-            "Go: settings" => self.set_tab(Tab::Settings),
-            "Deploy selected model" => self.start_deploy(false),
-            "New coding session" => self.new_coding_session(),
-            "Run doctor" => {
+    /// Is the omnibar currently a slash-command entry?
+    pub fn slash_active(&self) -> bool {
+        self.coding_input.starts_with('/')
+    }
+
+    /// Run the currently-highlighted menu command, keeping any args the user
+    /// typed after the command word.
+    fn run_selected_slash(&mut self) {
+        let items = self.palette_items();
+        let Some(item) = items.get(self.palette_selected).cloned() else {
+            // No match — treat the raw text as a command line anyway.
+            let raw = self.coding_input.clone();
+            self.clear_input();
+            self.dispatch_slash(&raw);
+            return;
+        };
+        // Extract "/name" from the display string.
+        let name = item.split_whitespace().next().unwrap_or("").to_string();
+        // Preserve any args the user typed: "/models qwen" -> keep "qwen".
+        let typed = self.coding_input.clone();
+        let args = typed
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = if args.is_empty() {
+            name
+        } else {
+            format!("{name} {args}")
+        };
+        self.clear_input();
+        self.dispatch_slash(&line);
+    }
+
+    /// Parse and run a slash command line (leading '/'), with space-separated
+    /// arguments.
+    fn dispatch_slash(&mut self, line: &str) {
+        let line = line.trim();
+        let mut parts = line.trim_start_matches('/').split_whitespace();
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        let rest = args.join(" ");
+        match cmd.as_str() {
+            "models" | "search" => {
+                self.set_panel(Some(Panel::Models));
+                if !rest.is_empty() {
+                    self.model_query = rest;
+                    self.start_search();
+                } else if self.models.is_empty() {
+                    self.start_search();
+                }
+            }
+            "popular" => {
+                self.set_panel(Some(Panel::Models));
+                self.model_query = "code".into();
+                self.start_search();
+            }
+            "trending" => {
+                self.set_panel(Some(Panel::Models));
+                self.start_trending();
+            }
+            "remote" => {
+                if args.first().map(|s| s.as_str()) == Some("add") {
+                    self.remote_quick_add(&args[1..]);
+                } else {
+                    self.open_remote_panel();
+                }
+            }
+            "connect" => {
+                self.open_remote_panel();
+                self.connect_remote(self.remote_selected);
+            }
+            "disconnect" => self.disconnect_remote(self.remote_selected),
+            "backends" => self.open_backend_manager(),
+            "runtimes" | "dashboard" | "home" => self.set_panel(Some(Panel::Runtimes)),
+            "deploy" => self.start_deploy(false),
+            "bench" | "benchmark" => self.set_panel(Some(Panel::Benchmarks)),
+            "setup" => self.set_panel(Some(Panel::Setup)),
+            "doctor" => {
+                self.set_panel(Some(Panel::Setup));
                 self.start_doctor();
-                self.set_tab(Tab::Setup);
             }
-            "Manage backends" => self.open_backend_manager(),
-            "Refresh backend detection" => self.start_detect(),
-            "Check for updates" => self.start_update_check(true),
-            "Install update" => self.open_update_modal(),
-            "Clear notifications" => {
-                self.notifications.clear();
-                self.notif_selected = 0;
+            "settings" => self.set_panel(Some(Panel::Settings)),
+            "theme" => self.cycle_theme(),
+            "alerts" | "notifications" => self.set_panel(Some(Panel::Notifications)),
+            "new" => self.new_coding_session(),
+            "assistant" | "ask" => self.start_assistant(),
+            "update" => self.open_update_modal(),
+            "redetect" | "detect" => {
+                self.start_detect();
+                self.set_status("Re-detecting backends…", false);
             }
-            "Open logs" => {
-                self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false);
+            "stop" => self.start_stop_runtime(),
+            "error" => self.open_error_modal(),
+            "context" | "ctx" => match args.first().map(|s| s.as_str()) {
+                Some("down") => self.adjust_ctx(false),
+                Some("up") | None => self.adjust_ctx(true),
+                Some(n) => {
+                    if let Ok(v) = n.parse::<u32>() {
+                        self.deploy_ctx = v.clamp(512, 131_072);
+                        self.refresh_fit();
+                    } else {
+                        self.set_status("Usage: /context <number|up|down>", true);
+                    }
+                }
+            },
+            "quant" => {
+                if args.first().map(|s| s.as_str()) == Some("prev") {
+                    self.cycle_quant(-1);
+                } else {
+                    self.cycle_quant(1);
+                }
             }
-            "Ask assistant" => self.start_assistant(),
-            "Help" => self.open_help(),
-            "Quit" => self.request_quit(),
-            _ => {}
+            "backend" => {
+                if let Some(name) = args.first() {
+                    if let Some(k) = BackendKind::parse(name) {
+                        self.deploy_backend = k;
+                        self.refresh_fit();
+                    } else {
+                        self.set_status(format!("Unknown backend: {name}"), true);
+                    }
+                } else {
+                    self.cycle_deploy_backend();
+                }
+            }
+            "logs" => self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false),
+            "help" => self.open_help(),
+            "quit" | "exit" | "q" => self.request_quit(),
+            "" => {}
+            other => self.set_status(format!("Unknown command: /{other} — press / to list"), true),
         }
+    }
+
+    fn cycle_theme(&mut self) {
+        self.config.ui.theme = match self.config.ui.theme {
+            ThemeMode::Dark => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::HighContrast,
+            ThemeMode::HighContrast => ThemeMode::Dark,
+        };
+        self.theme = Theme::new(self.config.ui.theme);
+        self.set_status(format!("Theme: {:?}", self.config.ui.theme), false);
     }
 
     // ------------------------------------------------------------------
@@ -1981,23 +2426,29 @@ impl App {
     // ------------------------------------------------------------------
 
     fn open_help(&mut self) {
-        let tab_help = match self.tab {
-            Tab::Models => {
-                "Models:\n  Click a model to open it · click the card to focus\n  Drag the pane borders to resize · scroll to move/read\n  / search   p popular   t trending\n  ,/. quant   +/- context   b backend   d deploy"
-            }
-            Tab::Coding => {
-                "Coding:\n  Click the composer to type · click the transcript to scroll\n  Enter send   ↑/↓ input history   Esc unfocus\n  Ctrl+↑/↓ (or +/-) composer height   n new session"
-            }
-            Tab::Benchmarks => "Benchmarks:\n  r run sample suite   p publish (sign-in)",
-            Tab::Dashboard => "Dashboard:\n  Click or scroll to select a runtime · x stop\n  Drag the pane border to resize",
-            Tab::Setup => "Setup:\n  Scroll to read · m manage & install backends · d run doctor · r refresh detection",
-            Tab::Notifications => "Notifications:\n  Click or scroll to select   c clear all",
-            Tab::Settings => "Settings:\n  t cycle theme   Ctrl+S save config",
-        };
-        let body = format!(
-            "Global:\n  Click a tab (or Tab/Shift+Tab) to switch\n  Mouse: click to focus/select · drag borders to resize · wheel to scroll\n  Ctrl+K palette   ? this help\n  a ask assistant   u install update   e last error details\n  l show log path   Esc cancel running task\n  q quit   Ctrl+C force quit   Ctrl+S save config\n\n{tab_help}"
-        );
-        self.modal = Some(ModalState::info("Controls", body));
+        let body = "\
+The bottom bar is always active — just type.\n\
+  • Type a message + Enter  → chat with the agent\n\
+  • Type /  → open the command menu (↑/↓ pick, Enter run, Esc close)\n\
+  • Ctrl+K  → open the command menu\n\
+  • Esc  → close a panel, or cancel the running task at home\n\
+  • Ctrl+↑/↓  → grow/shrink the bar    Ctrl+S save    Ctrl+C quit\n\
+\n\
+Commands (type / to see them all):\n\
+  /models [q]   search & deploy HuggingFace models\n\
+  /remote       connect a GPU server over SSH (one-click)\n\
+  /backends     install & configure inference backends\n\
+  /runtimes     active runtimes & system overview\n\
+  /deploy       deploy the selected model\n\
+  /bench /setup /doctor /settings /theme /alerts /new /assistant /update /logs /quit\n\
+\n\
+Panels open as popups above the bar. Inside a panel: ↑/↓ navigate,\n\
+Enter acts, click rows/buttons with the mouse, Esc closes.\n\
+Models: click a model to open it, click the card to focus, scroll to read,\n\
+click Backend/Quant/Deploy in the right pane.\n\
+Remote: click a field to edit, then Connect — or /remote add <name> <host> <user> <password>."
+            .to_string();
+        self.modal = Some(ModalState::info("Help", body));
     }
 
     fn request_quit(&mut self) {
@@ -2032,8 +2483,11 @@ impl App {
                     return;
                 }
                 KeyCode::Char('k') => {
-                    self.palette_open = !self.palette_open;
-                    self.palette_query.clear();
+                    // Open the slash-command menu by seeding a leading '/'.
+                    if !self.coding_input.starts_with('/') {
+                        self.coding_input.insert(0, '/');
+                        self.coding_cursor = self.coding_input.chars().count();
+                    }
                     self.palette_selected = 0;
                     return;
                 }
@@ -2049,12 +2503,12 @@ impl App {
                     }
                     return;
                 }
-                // Composer height (works while typing too).
-                KeyCode::Up if self.tab == Tab::Coding => {
+                // Omnibar height.
+                KeyCode::Up => {
                     self.adjust_composer_rows(1);
                     return;
                 }
-                KeyCode::Down if self.tab == Tab::Coding => {
+                KeyCode::Down => {
                     self.adjust_composer_rows(-1);
                     return;
                 }
@@ -2062,19 +2516,14 @@ impl App {
             }
         }
 
-        if self.palette_open {
-            self.handle_palette_key(key);
-            return;
-        }
-
+        // Overlays that fully capture input, in stacking order.
         if let Some(modal) = self.modal.clone() {
             self.handle_modal_key(key, &modal);
             return;
         }
-
         if self.assistant_open {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.assistant_open = false,
+                KeyCode::Esc => self.assistant_open = false,
                 KeyCode::Up => self.assistant_scroll = self.assistant_scroll.saturating_sub(1),
                 KeyCode::Down => self.assistant_scroll = self.assistant_scroll.saturating_add(1),
                 KeyCode::PageUp => self.assistant_scroll = self.assistant_scroll.saturating_sub(10),
@@ -2085,54 +2534,59 @@ impl App {
             }
             return;
         }
-
         if self.backends_open {
             self.handle_backends_key(key);
             return;
         }
 
-        // Search focus on models
-        if self.model_search_focus && self.tab == Tab::Models {
+        // The slash-command menu (omnibar text starts with '/') owns navigation
+        // and Enter; other keys still edit the text.
+        if self.slash_active() {
             match key.code {
-                KeyCode::Esc => self.model_search_focus = false,
-                KeyCode::Enter => {
-                    self.model_search_focus = false;
-                    self.start_search();
+                KeyCode::Esc => self.clear_input(),
+                KeyCode::Up => self.palette_selected = self.palette_selected.saturating_sub(1),
+                KeyCode::Down => {
+                    let n = self.palette_items().len();
+                    if n > 0 {
+                        self.palette_selected = (self.palette_selected + 1).min(n - 1);
+                    }
                 }
-                KeyCode::Backspace => {
-                    self.model_query.pop();
-                }
-                KeyCode::Char(c) => self.model_query.push(c),
-                _ => {}
+                KeyCode::Enter | KeyCode::Tab => self.run_selected_slash(),
+                _ => self.omnibar_edit(key),
             }
             return;
         }
 
-        if self.coding_input_focus && self.tab == Tab::Coding {
-            self.handle_composer_key(key);
+        // A panel owns navigation keys; typing still flows to the omnibar so the
+        // prompt bar works in every mode.
+        if let Some(panel) = self.panel {
+            if self.remote_editing && panel == Panel::Remote {
+                self.handle_remote_field_key(key);
+                return;
+            }
+            match key.code {
+                KeyCode::Esc => self.set_panel(None),
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Tab
+                | KeyCode::BackTab => self.panel_nav(panel, key.code),
+                KeyCode::Enter => self.panel_enter(panel),
+                _ => self.omnibar_edit(key),
+            }
             return;
         }
 
-        // Tab switching & global keys
+        // Home: the omnibar.
         match key.code {
-            KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('?') => self.open_help(),
-            KeyCode::Char('e') => self.open_error_modal(),
-            KeyCode::Tab => {
-                let idx = (self.tab.index() + 1) % 7;
-                self.set_tab(Tab::from_index(idx));
-            }
-            KeyCode::BackTab => {
-                let idx = (self.tab.index() + 6) % 7;
-                self.set_tab(Tab::from_index(idx));
-            }
-            KeyCode::Char('a') => self.start_assistant(),
-            KeyCode::Char('u') => self.open_update_modal(),
-            KeyCode::Char('l') => {
-                self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false);
-            }
             KeyCode::Esc => self.cancel_current(),
-            other => self.handle_tab_key(other),
+            KeyCode::Enter => self.start_coding_turn(),
+            KeyCode::Up => self.history_prev(),
+            KeyCode::Down => self.history_next(),
+            _ => self.omnibar_edit(key),
         }
     }
 
@@ -2148,10 +2602,14 @@ impl App {
         );
     }
 
-    fn handle_composer_key(&mut self, key: crossterm::event::KeyEvent) {
+    // ------------------------------------------------------------------
+    // Omnibar (the persistent prompt/search/command bar)
+    // ------------------------------------------------------------------
+
+    /// Text-editing keys for the omnibar (no Enter/Up/Down — those are
+    /// context-dependent and handled by the caller).
+    fn omnibar_edit(&mut self, key: crossterm::event::KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.coding_input_focus = false,
-            KeyCode::Enter => self.start_coding_turn(),
             KeyCode::Left => self.coding_cursor = self.coding_cursor.saturating_sub(1),
             KeyCode::Right => {
                 self.coding_cursor =
@@ -2165,6 +2623,7 @@ impl App {
                     self.coding_input.remove(idx);
                     self.coding_cursor -= 1;
                 }
+                self.palette_selected = 0;
             }
             KeyCode::Delete => {
                 if self.coding_cursor < self.coding_input.chars().count() {
@@ -2172,66 +2631,70 @@ impl App {
                     self.coding_input.remove(idx);
                 }
             }
-            KeyCode::Up => {
-                if self.coding_history.is_empty() {
-                    return;
-                }
-                let idx = match self.coding_hist_idx {
-                    None => self.coding_history.len() - 1,
-                    Some(0) => 0,
-                    Some(i) => i - 1,
-                };
-                self.coding_hist_idx = Some(idx);
-                self.coding_input = self.coding_history[idx].clone();
-                self.coding_cursor = self.coding_input.chars().count();
-            }
-            KeyCode::Down => match self.coding_hist_idx {
-                Some(i) if i + 1 < self.coding_history.len() => {
-                    self.coding_hist_idx = Some(i + 1);
-                    self.coding_input = self.coding_history[i + 1].clone();
-                    self.coding_cursor = self.coding_input.chars().count();
-                }
-                Some(_) => {
-                    self.coding_hist_idx = None;
-                    self.coding_input.clear();
-                    self.coding_cursor = 0;
-                }
-                None => {}
-            },
             KeyCode::Char(c) => {
                 let idx = char_to_byte(&self.coding_input, self.coding_cursor);
                 self.coding_input.insert(idx, c);
                 self.coding_cursor += 1;
                 self.coding_hist_idx = None;
+                self.palette_selected = 0;
             }
             _ => {}
         }
     }
 
-    fn set_tab(&mut self, tab: Tab) {
-        self.tab = tab;
+    fn history_prev(&mut self) {
+        if self.coding_history.is_empty() {
+            return;
+        }
+        let idx = match self.coding_hist_idx {
+            None => self.coding_history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.coding_hist_idx = Some(idx);
+        self.coding_input = self.coding_history[idx].clone();
+        self.coding_cursor = self.coding_input.chars().count();
     }
 
-    fn handle_tab_key(&mut self, code: KeyCode) {
-        match self.tab {
-            Tab::Models => match code {
-                KeyCode::Char('/') => {
-                    self.model_search_focus = true;
-                }
-                KeyCode::Char('p') => {
-                    self.model_query = "code".into();
-                    self.start_search();
-                }
-                KeyCode::Char('t') => self.start_trending(),
+    fn history_next(&mut self) {
+        match self.coding_hist_idx {
+            Some(i) if i + 1 < self.coding_history.len() => {
+                self.coding_hist_idx = Some(i + 1);
+                self.coding_input = self.coding_history[i + 1].clone();
+                self.coding_cursor = self.coding_input.chars().count();
+            }
+            Some(_) => {
+                self.coding_hist_idx = None;
+                self.coding_input.clear();
+                self.coding_cursor = 0;
+            }
+            None => {}
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.coding_input.clear();
+        self.coding_cursor = 0;
+        self.coding_hist_idx = None;
+        self.palette_selected = 0;
+    }
+
+    fn set_panel(&mut self, panel: Option<Panel>) {
+        self.panel = panel;
+        self.remote_editing = false;
+    }
+
+    /// Navigation keys within the active panel (arrows, page keys, Tab).
+    fn panel_nav(&mut self, panel: Panel, code: KeyCode) {
+        match panel {
+            Panel::Models => match code {
                 KeyCode::Left => self.models_focus = ModelsPane::List,
                 KeyCode::Right => {
                     if self.model_detail.is_some() {
                         self.models_focus = ModelsPane::Card;
-                    } else {
-                        self.set_status("Open a model first (Enter) to focus the card", false);
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => match self.models_focus {
+                KeyCode::Down => match self.models_focus {
                     ModelsPane::List => {
                         if !self.models.is_empty() {
                             self.model_selected =
@@ -2240,130 +2703,82 @@ impl App {
                     }
                     ModelsPane::Card => self.scroll_card(1),
                 },
-                KeyCode::Up | KeyCode::Char('k') => match self.models_focus {
+                KeyCode::Up => match self.models_focus {
                     ModelsPane::List => self.model_selected = self.model_selected.saturating_sub(1),
                     ModelsPane::Card => self.scroll_card(-1),
                 },
                 KeyCode::PageDown => self.scroll_card(self.card_view_height.max(1) as i64),
                 KeyCode::PageUp => self.scroll_card(-(self.card_view_height.max(1) as i64)),
-                KeyCode::Char('g') => self.card_scroll = 0,
-                KeyCode::Char('G') => self.scroll_card(i64::MAX / 2),
-                KeyCode::Enter => {
-                    if self.models_focus == ModelsPane::List {
-                        self.start_load_detail();
+                _ => {}
+            },
+            Panel::Runtimes => match code {
+                KeyCode::Down => {
+                    let n = self.all_runtimes().len();
+                    if n > 0 {
+                        self.runtime_selected = (self.runtime_selected + 1).min(n - 1);
                     }
                 }
-                KeyCode::Char('d') => self.start_deploy(false),
-                KeyCode::Char('b') => {
-                    self.deploy_backend = match self.deploy_backend {
-                        BackendKind::Ollama => BackendKind::LlamaCpp,
-                        BackendKind::LlamaCpp => BackendKind::Vllm,
-                        BackendKind::Vllm => BackendKind::Sglang,
-                        BackendKind::Sglang => BackendKind::Ollama,
-                    };
-                    self.refresh_fit();
-                }
-                KeyCode::Char(',') => self.cycle_quant(-1),
-                KeyCode::Char('.') => self.cycle_quant(1),
-                KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_ctx(true),
-                KeyCode::Char('-') => self.adjust_ctx(false),
-                KeyCode::Char('[') => self.adjust_pane("models", 0, -0.03),
-                KeyCode::Char(']') => self.adjust_pane("models", 0, 0.03),
-                KeyCode::Char('{') => self.adjust_pane("models", 1, -0.03),
-                KeyCode::Char('}') => self.adjust_pane("models", 1, 0.03),
+                KeyCode::Up => self.runtime_selected = self.runtime_selected.saturating_sub(1),
                 _ => {}
             },
-            Tab::Coding => match code {
-                KeyCode::Char('i') | KeyCode::Enter => {
-                    self.coding_input_focus = true;
-                }
-                KeyCode::Char('n') => self.new_coding_session(),
-                KeyCode::Char('+') | KeyCode::Char('=') => self.adjust_composer_rows(1),
-                KeyCode::Char('-') => self.adjust_composer_rows(-1),
-                KeyCode::PageUp => {
-                    let max = self
-                        .coding_total_lines
-                        .saturating_sub(self.coding_view_height as usize);
-                    let cur = if self.coding_follow {
-                        max
-                    } else {
-                        self.coding_scroll
-                    };
-                    self.coding_scroll =
-                        cur.saturating_sub(self.coding_view_height.max(1) as usize);
-                    self.coding_follow = false;
-                }
-                KeyCode::PageDown => {
-                    let max = self
-                        .coding_total_lines
-                        .saturating_sub(self.coding_view_height as usize);
-                    self.coding_scroll =
-                        (self.coding_scroll + self.coding_view_height.max(1) as usize).min(max);
-                    if self.coding_scroll >= max {
-                        self.coding_follow = true;
-                    }
-                }
-                KeyCode::End => self.coding_follow = true,
-                _ => {}
-            },
-            Tab::Benchmarks => match code {
-                KeyCode::Char('r') => self.start_bench(),
-                KeyCode::Char('p') => {
-                    self.set_status("Publish requires sign-in (Setup → Account)", true);
-                }
-                _ => {}
-            },
-            Tab::Dashboard => match code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if !self.runtimes.is_empty() {
-                        self.runtime_selected =
-                            (self.runtime_selected + 1).min(self.runtimes.len() - 1);
-                    }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.runtime_selected = self.runtime_selected.saturating_sub(1);
-                }
-                KeyCode::Char('x') => self.start_stop_runtime(),
-                KeyCode::Char('[') => self.adjust_pane("dashboard", 0, -0.03),
-                KeyCode::Char(']') => self.adjust_pane("dashboard", 0, 0.03),
-                _ => {}
-            },
-            Tab::Setup => match code {
-                KeyCode::Char('d') => self.start_doctor(),
-                KeyCode::Char('m') => self.open_backend_manager(),
-                KeyCode::Char('r') => {
-                    self.start_detect();
-                    self.set_status("Re-detecting backends…", false);
-                }
-                KeyCode::PageUp => self.setup_scroll = self.setup_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.setup_scroll = self.setup_scroll.saturating_add(10),
-                _ => {}
-            },
-            Tab::Notifications => match code {
-                KeyCode::Down | KeyCode::Char('j') => {
+            Panel::Notifications => match code {
+                KeyCode::Down => {
                     if !self.notifications.is_empty() {
                         self.notif_selected =
                             (self.notif_selected + 1).min(self.notifications.len() - 1);
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.notif_selected = self.notif_selected.saturating_sub(1);
+                KeyCode::Up => self.notif_selected = self.notif_selected.saturating_sub(1),
+                _ => {}
+            },
+            Panel::Setup => match code {
+                KeyCode::PageUp => self.setup_scroll = self.setup_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.setup_scroll = self.setup_scroll.saturating_add(10),
+                _ => {}
+            },
+            Panel::Remote => match code {
+                KeyCode::Down => {
+                    let n = self.config.remote.servers.len();
+                    if n > 0 {
+                        self.remote_selected = (self.remote_selected + 1).min(n - 1);
+                        self.remote_field = 0;
+                    }
                 }
-                KeyCode::Char('c') => {
-                    self.notifications.clear();
-                    self.notif_selected = 0;
-                    self.set_status("Notifications cleared", false);
+                KeyCode::Up => {
+                    self.remote_selected = self.remote_selected.saturating_sub(1);
+                    self.remote_field = 0;
+                }
+                KeyCode::Tab => {
+                    let n = REMOTE_FIELDS.len();
+                    self.remote_field = (self.remote_field + 1) % n;
+                    self.load_remote_field_edit();
+                    self.remote_editing = true;
                 }
                 _ => {}
             },
-            Tab::Settings => {
-                if code == KeyCode::Char('t') {
-                    self.config.ui.theme = match self.config.ui.theme {
-                        ThemeMode::Dark => ThemeMode::Light,
-                        ThemeMode::Light => ThemeMode::HighContrast,
-                        ThemeMode::HighContrast => ThemeMode::Dark,
-                    };
-                    self.theme = Theme::new(self.config.ui.theme);
+            Panel::Benchmarks | Panel::Settings => {}
+        }
+    }
+
+    /// Enter within the active panel (the primary action).
+    fn panel_enter(&mut self, panel: Panel) {
+        match panel {
+            Panel::Models => {
+                let q = self.coding_input.trim().to_string();
+                if !q.is_empty() {
+                    self.model_query = q;
+                    self.clear_input();
+                    self.start_search();
+                } else {
+                    self.start_load_detail();
+                }
+            }
+            Panel::Remote => self.connect_remote(self.remote_selected),
+            // Other panels: Enter sends any typed text to the agent so the bar
+            // still prompts from anywhere.
+            _ => {
+                if !self.coding_input.trim().is_empty() {
+                    self.start_coding_turn();
                 }
             }
         }
@@ -2371,28 +2786,6 @@ impl App {
 
     /// Shift the boundary between panes `idx` and `idx+1` of a view by
     /// `delta`. Ratios are persisted with the config (saved on quit/Ctrl+S).
-    fn adjust_pane(&mut self, view: &str, idx: usize, delta: f32) {
-        let defaults = Self::pane_defaults(view);
-        let mut ratios = self.pane_ratios(view, defaults);
-        if idx + 1 >= ratios.len() {
-            return;
-        }
-        let moved = delta
-            .min(ratios[idx + 1] - 0.15) // don't shrink the neighbor below min
-            .max(0.15 - ratios[idx]); // nor this pane
-        ratios[idx] += moved;
-        ratios[idx + 1] -= moved;
-        let sum: f32 = ratios.iter().sum();
-        for r in &mut ratios {
-            *r /= sum;
-        }
-        self.config.panes.views.insert(view.into(), ratios);
-        self.set_status(
-            format!("Pane resized ({view}) — [/] and {{/}} adjust, saved on quit"),
-            false,
-        );
-    }
-
     /// Default split per view; ui.rs uses the same values when drawing.
     pub fn pane_defaults(view: &str) -> &'static [f32] {
         match view {
@@ -2499,71 +2892,23 @@ impl App {
         }
     }
 
-    fn handle_palette_key(&mut self, key: crossterm::event::KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.palette_open = false;
-            }
-            KeyCode::Up => {
-                self.palette_selected = self.palette_selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                let n = self.palette_items().len();
-                if n > 0 {
-                    self.palette_selected = (self.palette_selected + 1).min(n - 1);
-                }
-            }
-            KeyCode::Backspace => {
-                self.palette_query.pop();
-            }
-            KeyCode::Enter => self.run_selected_palette_item(),
-            KeyCode::Char(c) => {
-                self.palette_query.push(c);
-                self.palette_selected = 0;
-            }
-            _ => {}
-        }
-    }
-
-    /// Run the currently-selected palette item. Shared by Enter and by clicking
-    /// an item (which sets `palette_selected` first).
-    fn run_selected_palette_item(&mut self) {
-        let items = self.palette_items();
-        if let Some(item) = items.get(self.palette_selected).cloned() {
-            self.palette_open = false;
-            self.run_palette_action(&item);
-        }
-    }
-
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use event::MouseButton::Left;
         let (col, row) = (mouse.column, mouse.row);
 
-        // Tab strip hit ranges are recorded during draw, so clicks/hover always
-        // match what is actually on screen.
-        self.tab_hover = if row == self.tab_strip_row {
-            self.tab_hit
-                .iter()
-                .find(|(x0, x1, _)| col >= *x0 && col < *x1)
-                .map(|(_, _, t)| *t)
-        } else {
-            None
-        };
-
         // While an overlay owns the screen, the view underneath is inert —
-        // tab clicks and border drags are suppressed (matches the key path,
-        // which routes to the overlay and returns).
-        let overlay =
-            self.modal.is_some() || self.palette_open || self.assistant_open || self.backends_open;
+        // border drags are suppressed (matches the key path, which routes to
+        // the overlay and returns).
+        let overlay = self.modal.is_some()
+            || self.slash_active()
+            || self.assistant_open
+            || self.backends_open
+            || self.panel.is_some();
 
         match mouse.kind {
             MouseEventKind::Down(Left) => {
                 if !overlay {
-                    // Tabs first, then a draggable pane seam, then a normal click.
-                    if let Some(t) = self.tab_hover {
-                        self.set_tab(t);
-                        return;
-                    }
+                    // A draggable pane seam, then a normal click.
                     if let Some(b) = self.hit_resize_border(col, row) {
                         self.dragging = Some(DragState {
                             view: b.view,
@@ -2657,10 +3002,10 @@ impl App {
             }
             return;
         }
-        if self.palette_open {
+        if self.slash_active() {
             if let ClickTarget::PaletteItem(i) = region.target {
                 self.palette_selected = i;
-                self.run_selected_palette_item();
+                self.run_selected_slash();
             }
             return;
         }
@@ -2698,21 +3043,50 @@ impl App {
             }
             return;
         }
+        if self.panel == Some(Panel::Remote) {
+            let rel_row = row.saturating_sub(region.rect.y) as usize;
+            match region.target {
+                ClickTarget::RemoteList => {
+                    if rel_row < self.config.remote.servers.len() {
+                        self.commit_remote_field();
+                        self.remote_selected = rel_row;
+                        self.remote_field = 0;
+                        self.remote_editing = false;
+                    }
+                }
+                ClickTarget::RemoteField => {
+                    if rel_row < REMOTE_FIELDS.len() {
+                        self.commit_remote_field();
+                        self.remote_field = rel_row;
+                        self.load_remote_field_edit();
+                        self.remote_editing = true;
+                    }
+                }
+                ClickTarget::RemoteConnect => self.connect_remote(self.remote_selected),
+                ClickTarget::RemoteSave => self.save_remote_config(),
+                ClickTarget::RemoteDisconnect => self.disconnect_remote(self.remote_selected),
+                ClickTarget::RemoteDelete => self.delete_remote(self.remote_selected),
+                ClickTarget::RemoteNew => self.new_remote_server(),
+                ClickTarget::PanelClose => self.set_panel(None),
+                _ => {}
+            }
+            return;
+        }
 
         // Row index within a list = first visible row + click offset.
         let rel_row = row.saturating_sub(region.rect.y) as usize;
         match region.target {
+            ClickTarget::PanelClose => self.set_panel(None),
             ClickTarget::RuntimeList => {
-                if !self.runtimes.is_empty() {
+                let n = self.all_runtimes().len();
+                if n > 0 {
                     let idx = self.runtime_list_state.offset() + rel_row;
-                    if idx < self.runtimes.len() {
+                    if idx < n {
                         self.runtime_selected = idx;
                     }
                 }
             }
-            ClickTarget::ModelSearch => self.model_search_focus = true,
             ClickTarget::ModelList => {
-                self.model_search_focus = false;
                 self.models_focus = ModelsPane::List;
                 if !self.models.is_empty() {
                     let idx = self.model_list_state.offset() + rel_row;
@@ -2727,9 +3101,10 @@ impl App {
                     self.models_focus = ModelsPane::Card;
                 }
             }
+            ClickTarget::DeployButton => self.start_deploy(false),
+            ClickTarget::QuantList => self.cycle_quant(1),
+            ClickTarget::BackendCycle => self.cycle_deploy_backend(),
             ClickTarget::SetupManageBackends => self.open_backend_manager(),
-            ClickTarget::Composer => self.coding_input_focus = true,
-            ClickTarget::Transcript => self.coding_input_focus = false,
             ClickTarget::NotificationList => {
                 if !self.notifications.is_empty() {
                     let idx = self.notif_list_state.offset() + rel_row;
@@ -2738,16 +3113,35 @@ impl App {
                     }
                 }
             }
-            // Panels with no per-click action (their keys still work).
-            ClickTarget::DeployPane | ClickTarget::SetupBody => {}
+            // Panels/regions with no per-click action (their keys still work).
+            ClickTarget::DeployPane
+            | ClickTarget::SetupBody
+            | ClickTarget::Transcript
+            | ClickTarget::Composer => {}
             ClickTarget::ModalButton(_) | ClickTarget::PaletteItem(_) => {}
-            // Handled above in the `backends_open` branch.
             ClickTarget::BackendMgrItem
             | ClickTarget::BackendMgrField
             | ClickTarget::BackendMgrInstall
             | ClickTarget::BackendMgrSave
             | ClickTarget::BackendMgrRedetect => {}
+            ClickTarget::RemoteList
+            | ClickTarget::RemoteField
+            | ClickTarget::RemoteConnect
+            | ClickTarget::RemoteSave
+            | ClickTarget::RemoteDisconnect
+            | ClickTarget::RemoteDelete
+            | ClickTarget::RemoteNew => {}
         }
+    }
+
+    fn cycle_deploy_backend(&mut self) {
+        self.deploy_backend = match self.deploy_backend {
+            BackendKind::Ollama => BackendKind::LlamaCpp,
+            BackendKind::LlamaCpp => BackendKind::Vllm,
+            BackendKind::Vllm => BackendKind::Sglang,
+            BackendKind::Sglang => BackendKind::Ollama,
+        };
+        self.refresh_fit();
     }
 
     /// Route the wheel to whatever scrollable is under the cursor, falling back
@@ -2766,15 +3160,15 @@ impl App {
         }
     }
 
-    /// Fallback wheel routing by active tab (cursor not over a known region).
+    /// Fallback wheel routing by active panel (cursor not over a known region).
     fn wheel_scroll(&mut self, delta: i64) {
-        match self.tab {
-            Tab::Coding => self.scroll_transcript(delta),
-            Tab::Models => self.scroll_card(delta),
-            Tab::Setup => {
+        match self.panel {
+            None => self.scroll_transcript(delta),
+            Some(Panel::Models) => self.scroll_card(delta),
+            Some(Panel::Setup) => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
             }
-            Tab::Notifications => self.scroll_notifs(delta),
+            Some(Panel::Notifications) => self.scroll_notifs(delta),
             _ => {}
         }
     }
@@ -2809,10 +3203,11 @@ impl App {
     }
 
     fn scroll_runtimes(&mut self, delta: i64) {
-        if self.runtimes.is_empty() {
+        let n = self.all_runtimes().len();
+        if n == 0 {
             return;
         }
-        let max = self.runtimes.len() as i64 - 1;
+        let max = n as i64 - 1;
         self.runtime_selected =
             (self.runtime_selected as i64 + delta.signum()).clamp(0, max) as usize;
     }
@@ -2825,6 +3220,10 @@ pub(crate) const BACKEND_ORDER: [BackendKind; 4] = [
     BackendKind::Vllm,
     BackendKind::Sglang,
 ];
+
+/// Editable fields of a remote server, in display order.
+pub(crate) const REMOTE_FIELDS: [&str; 6] =
+    ["name", "host", "port", "username", "password", "local_port"];
 
 /// Extra context shown above the install confirm command, per backend.
 fn install_caveat(kind: BackendKind) -> String {
@@ -2871,6 +3270,7 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
     if app.config.updates.check_on_startup {
         app.start_update_check(false);
     }
+    app.autoconnect_remotes();
     let result = run_loop(&mut terminal, &mut app).await;
 
     disable_raw_mode().ok();
@@ -2969,5 +3369,125 @@ mod tests {
     fn llamacpp_has_three_editable_fields() {
         assert_eq!(App::backend_field_labels(BackendKind::LlamaCpp).len(), 3);
         assert_eq!(App::backend_field_labels(BackendKind::Ollama), &["base_url"]);
+    }
+
+    fn typ(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn typing_slash_opens_command_menu_and_filters() {
+        let mut app = test_app();
+        assert!(!app.slash_active());
+        typ(&mut app, "/rem");
+        assert!(app.slash_active());
+        let items = app.palette_items();
+        assert!(items.iter().any(|i| i.starts_with("/remote")));
+        assert!(!items.iter().any(|i| i.starts_with("/models")));
+    }
+
+    #[test]
+    fn slash_command_opens_panel_then_esc_closes() {
+        let mut app = test_app();
+        typ(&mut app, "/settings");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.panel, Some(Panel::Settings));
+        assert!(app.coding_input.is_empty(), "omnibar cleared after running command");
+        // Esc closes the panel and returns home.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.panel, None);
+    }
+
+    #[test]
+    fn theme_command_cycles_theme() {
+        let mut app = test_app();
+        let before = app.config.ui.theme;
+        typ(&mut app, "/theme");
+        app.handle_key(key(KeyCode::Enter));
+        assert_ne!(app.config.ui.theme, before);
+    }
+
+    #[test]
+    fn plain_text_is_not_a_command() {
+        let mut app = test_app();
+        typ(&mut app, "hello world");
+        assert!(!app.slash_active());
+        assert_eq!(app.coding_input, "hello world");
+    }
+
+    #[test]
+    fn remote_quick_add_appends_server_and_opens_panel() {
+        let mut app = test_app();
+        typ(&mut app, "/remote add gpu 10.0.0.9 root secret");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.panel, Some(Panel::Remote));
+        assert_eq!(app.config.remote.servers.len(), 1);
+        let s = &app.config.remote.servers[0];
+        assert_eq!(s.name, "gpu");
+        assert_eq!(s.host, "10.0.0.9");
+        assert_eq!(s.username, "root");
+        assert_eq!(s.password, "secret");
+    }
+
+    #[test]
+    fn remote_field_edit_writes_config() {
+        let mut app = test_app();
+        app.new_remote_server();
+        app.open_remote_panel();
+        // Click-to-edit the host field (index 1), type, commit.
+        app.remote_field = 1;
+        app.load_remote_field_edit();
+        app.remote_editing = true;
+        app.remote_field_edit = "192.168.1.50".into();
+        app.handle_remote_field_key(key(KeyCode::Enter));
+        assert!(!app.remote_editing);
+        assert_eq!(app.config.remote.servers[0].host, "192.168.1.50");
+    }
+
+    /// Render every surface once to a headless backend — catches layout panics
+    /// (out-of-bounds rects, bad splits) across the redesign.
+    #[test]
+    fn all_surfaces_render_without_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app();
+        app.detecting = false;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        // Home (transcript + omnibar).
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // Each panel.
+        for panel in [
+            Panel::Models,
+            Panel::Runtimes,
+            Panel::Benchmarks,
+            Panel::Setup,
+            Panel::Notifications,
+            Panel::Settings,
+            Panel::Remote,
+        ] {
+            app.panel = Some(panel);
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        }
+        app.panel = None;
+
+        // Slash menu open.
+        typ(&mut app, "/mod");
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.clear_input();
+
+        // Backends overlay + a remote server present.
+        app.backends_open = true;
+        app.new_remote_server();
+        app.panel = Some(Panel::Remote);
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // A tiny terminal must not panic either.
+        let mut tiny = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        tiny.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     }
 }

@@ -221,6 +221,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
                 gpu,
                 paths.models_cache.clone(),
                 config.hf_token(),
+                config.hf_mirror_hosts(),
             );
 
             // Enrich HF ids with quant metadata so fit prediction has real
@@ -379,6 +380,7 @@ async fn run_update(config: &Config, check_only: bool) -> Result<(), LocalCodeEr
         config.updates.install_dir.as_deref(),
         &config.updates.repo_url,
         &config.updates.branch,
+        &config.updates.mirrors,
     )?;
     println!("Updating from checkout at {}", updater.install_dir.display());
 
