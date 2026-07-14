@@ -19,6 +19,8 @@ which = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 zip = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

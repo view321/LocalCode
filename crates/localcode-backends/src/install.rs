@@ -43,8 +43,9 @@ pub enum InstallStep {
     },
     /// Download a prebuilt llama.cpp release for this OS and extract it into
     /// `dest_dir`, then repoint the backend at the extracted `llama-server`
-    /// binary. Runs entirely in-process (HTTP + unzip) so llama.cpp installs
-    /// from the TUI on platforms without a package manager (e.g. Windows).
+    /// binary. Runs entirely in-process (HTTP + unarchive — `.zip` on Windows,
+    /// `.tar.gz` on Linux/macOS) so llama.cpp installs from the TUI on platforms
+    /// without a package manager.
     FetchLlamaCpp { dest_dir: PathBuf, display: String },
 }
 
@@ -78,16 +79,6 @@ impl InstallStep {
             program: program.to_string(),
             args,
             display,
-        }
-    }
-
-    /// A `sh -c "<script>"` step whose preview is the script itself, so a piped
-    /// command reads honestly (`curl … | sh`) instead of `sh -c curl … | sh`.
-    fn shell(script: &str) -> Self {
-        InstallStep::Command {
-            program: "sh".into(),
-            args: vec!["-c".into(), script.into()],
-            display: script.into(),
         }
     }
 
@@ -127,6 +118,17 @@ impl InstallPlan {
             .collect::<Vec<_>>()
             .join("\n");
         InstallPlan::Automated { steps, display }
+    }
+
+    /// True if any step needs elevation — the single source of truth for whether
+    /// the UI must collect a sudo password before running the install. Mirrors
+    /// [`RepairPlan::requires_sudo`].
+    pub fn requires_sudo(&self) -> bool {
+        matches!(
+            self,
+            InstallPlan::Automated { steps, .. }
+                if steps.iter().any(|s| matches!(s, InstallStep::Sudo { .. }))
+        )
     }
 }
 
@@ -173,9 +175,33 @@ fn python_prereq(os: &str, has: &dyn Fn(&str) -> bool) -> Option<InstallStep> {
 
 fn ollama_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
     match os {
-        "linux" => InstallPlan::automated(vec![InstallStep::shell(
-            "curl -fsSL https://ollama.com/install.sh | sh",
-        )]),
+        // The official installer writes to /usr/local and registers a systemd
+        // service, so it always needs root. We run the whole `curl … | sh` under
+        // our own `sudo` so the script sees uid 0 and skips its *internal* sudo,
+        // which would otherwise block on a tty the stdin-null child doesn't have.
+        // Emitting a `Sudo` step (rather than forcing manual copy-paste) lets the
+        // install run from the TUI: the runner uses `sudo -n` when elevation is
+        // passwordless and `sudo -S` otherwise, with the password collected by
+        // the masked prompt and fed to stdin — it never appears in `display`.
+        "linux" if has("sudo") => {
+            let script = "curl -fsSL https://ollama.com/install.sh | sh";
+            InstallPlan::automated(vec![InstallStep::Sudo {
+                program: "sh".into(),
+                args: vec!["-c".into(), script.into()],
+                display: format!("sudo sh -c '{script}'"),
+            }])
+        }
+        // No `sudo` to elevate with (and we can't assume root): fall back to
+        // honest copy-paste steps rather than a command that can't work here.
+        "linux" => InstallPlan::Manual {
+            summary: "Installing Ollama needs root, and `sudo` isn't available here.".into(),
+            steps: vec![
+                "Run this in a terminal with root privileges:".into(),
+                "curl -fsSL https://ollama.com/install.sh | sh".into(),
+                "Ollama starts a local service automatically — then re-detect.".into(),
+            ],
+            url: "https://ollama.com/download/linux".into(),
+        },
         "macos" if has("brew") => {
             InstallPlan::automated(vec![InstallStep::command("brew", &["install", "ollama"])])
         }
@@ -278,34 +304,17 @@ pub fn llamacpp_managed_dir(paths: &AppPaths) -> PathBuf {
 pub fn resolve_install_plan(kind: BackendKind, paths: &AppPaths) -> InstallPlan {
     let has = |b: &str| which::which(b).is_ok();
     let llamacpp_dir = llamacpp_managed_dir(paths);
-    let plan = install_plan(
+    // The Ollama-on-Linux plan now emits an elevated (`Sudo`) step instead of
+    // being downgraded to manual copy-paste here: the runner elevates with
+    // `sudo -n` when that works and `sudo -S` (password from the masked prompt)
+    // otherwise, so the install runs from the TUI. See `ollama_plan`.
+    install_plan(
         kind,
         std::env::consts::OS,
         &has,
         discover_python().is_some(),
         &llamacpp_dir,
-    );
-    // The official Ollama Linux installer runs `sudo` internally. Our install
-    // steps spawn with stdin null, so if we can't elevate without a password
-    // that `sudo` just fails ("a password is required") — a confusing failure.
-    // Per the module's honesty rule, offer manual steps instead unless we can
-    // elevate non-interactively (already root, or passwordless sudo).
-    if kind == BackendKind::Ollama
-        && std::env::consts::OS == "linux"
-        && !can_elevate_noninteractively()
-    {
-        return InstallPlan::Manual {
-            summary: "The Ollama installer needs root (it runs `sudo`), which can't be entered here."
-                .into(),
-            steps: vec![
-                "Run this in a terminal where sudo can prompt for your password:".into(),
-                "curl -fsSL https://ollama.com/install.sh | sh".into(),
-                "Ollama starts a local service automatically — then re-detect.".into(),
-            ],
-            url: "https://ollama.com/download/linux".into(),
-        };
-    }
-    plan
+    )
 }
 
 /// Whether this process can gain root without an interactive password prompt:
@@ -373,10 +382,14 @@ pub fn discover_python() -> Option<PathBuf> {
 
 /// Run an automated install plan, forwarding each output line through
 /// `progress`. `Manual` plans are handled by the caller (the UI shows steps),
-/// so passing one here is an error. Returns an optional [`Repoint`] when a step
-/// installed a managed binary (llama.cpp fetch) the backend must be pointed at.
+/// so passing one here is an error. Elevated (`Sudo`) steps — e.g. the Ollama
+/// Linux installer — run via `sudo -n` when elevation is passwordless, else
+/// `sudo -S` with `sudo_password` fed to stdin (never forwarded to `progress`
+/// or logged). Returns an optional [`Repoint`] when a step installed a managed
+/// binary (llama.cpp fetch) the backend must be pointed at.
 pub async fn run_install(
     plan: &InstallPlan,
+    sudo_password: Option<&str>,
     progress: UnboundedSender<String>,
 ) -> Result<Option<Repoint>, LocalCodeError> {
     let InstallPlan::Automated { steps, .. } = plan else {
@@ -389,14 +402,22 @@ pub async fn run_install(
     let cid = localcode_core::CorrelationId::new();
     let mut repoint = None;
     for step in steps {
-        if let InstallStep::FetchLlamaCpp { dest_dir, .. } = step {
-            let bin = fetch_llamacpp(dest_dir, &progress, cid).await?;
-            repoint = Some(Repoint {
-                kind: BackendKind::LlamaCpp,
-                bin,
-            });
-        } else {
-            run_step(step, &progress, cid).await?;
+        match step {
+            InstallStep::FetchLlamaCpp { dest_dir, .. } => {
+                let bin = fetch_llamacpp(dest_dir, &progress, cid).await?;
+                repoint = Some(Repoint {
+                    kind: BackendKind::LlamaCpp,
+                    bin,
+                });
+            }
+            InstallStep::Sudo {
+                program,
+                args,
+                display,
+            } => {
+                run_sudo_step(program, args, display, sudo_password, &progress, cid).await?;
+            }
+            other => run_step(other, &progress, cid).await?,
         }
     }
     Ok(repoint)
@@ -573,7 +594,8 @@ async fn fetch_llamacpp(
 
     let _ = progress.send(format!("$ extracting {} ({} MiB)", asset_name, bytes.len() / 1_048_576));
     let dest = dest_dir.to_path_buf();
-    let bin = tokio::task::spawn_blocking(move || extract_llamacpp_zip(&bytes, &dest))
+    let name = asset_name.clone();
+    let bin = tokio::task::spawn_blocking(move || extract_llamacpp_archive(&bytes, &dest, &name))
         .await
         .map_err(|e| fail(e.to_string()))?
         .map_err(fail)?;
@@ -584,19 +606,30 @@ async fn fetch_llamacpp(
 
 /// Pick the CPU release asset matching this OS/arch, preferring the most
 /// specific name. Pure so the matching rules are unit-tested. Returns
-/// `(name, download_url)`. GPU builds (CUDA/HIP/Vulkan/…) are excluded — the CPU
-/// build runs everywhere; GPU users can use Ollama/vLLM instead.
+/// `(name, download_url)`. GPU/accelerator builds (CUDA/HIP/Vulkan/OpenVINO/…)
+/// are excluded — the CPU build runs everywhere; GPU users can use Ollama/vLLM
+/// instead.
+///
+/// Archive format is OS-specific: llama.cpp ships Windows builds as `.zip` and
+/// Linux/macOS builds as `.tar.gz`. Matching on the wrong extension is why the
+/// in-app fetch silently found nothing on Linux — so the accepted extensions
+/// are chosen per-OS here and honored by [`extract_llamacpp_archive`].
 fn pick_llamacpp_asset(
     assets: &[(String, String)],
     os: &str,
     arch: &str,
 ) -> Option<(String, String)> {
-    const GPU_MARKERS: [&str; 9] = [
-        "cuda", "cu11", "cu12", "hip", "rocm", "vulkan", "sycl", "musa", "kompute",
+    const GPU_MARKERS: [&str; 10] = [
+        "cuda", "cu11", "cu12", "hip", "rocm", "vulkan", "sycl", "musa", "kompute", "openvino",
     ];
-    let cpu_zip = |n: &str| {
+    let exts: &[&str] = if os == "windows" {
+        &[".zip"]
+    } else {
+        &[".tar.gz", ".tgz"]
+    };
+    let cpu_archive = |n: &str| {
         let l = n.to_lowercase();
-        l.ends_with(".zip") && !GPU_MARKERS.iter().any(|m| l.contains(m))
+        exts.iter().any(|e| l.ends_with(e)) && !GPU_MARKERS.iter().any(|m| l.contains(m))
     };
     let all = |n: &str, pats: &[&str]| {
         let l = n.to_lowercase();
@@ -614,12 +647,58 @@ fn pick_llamacpp_asset(
     for pats in &prefs {
         if let Some((n, u)) = assets
             .iter()
-            .find(|(n, _)| cpu_zip(n) && all(n, pats))
+            .find(|(n, _)| cpu_archive(n) && all(n, pats))
         {
             return Some((n.clone(), u.clone()));
         }
     }
     None
+}
+
+/// Extract a downloaded llama.cpp release into `dest_dir`, dispatching on the
+/// asset's archive format (Windows ships `.zip`, Linux/macOS ship `.tar.gz`),
+/// and return the path to the extracted `llama-server` binary. Sync — run on a
+/// blocking task.
+fn extract_llamacpp_archive(
+    bytes: &[u8],
+    dest_dir: &Path,
+    asset_name: &str,
+) -> Result<PathBuf, String> {
+    let lower = asset_name.to_lowercase();
+    if lower.ends_with(".zip") {
+        extract_llamacpp_zip(bytes, dest_dir)
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        extract_llamacpp_targz(bytes, dest_dir)
+    } else {
+        Err(format!("unsupported archive format: {asset_name}"))
+    }
+}
+
+/// Extract a llama.cpp `.tar.gz` release into `dest_dir` and return the path to
+/// the `llama-server` binary within it. `unpack_in` refuses entries that escape
+/// `dest_dir` (absolute paths or `..`), and preserving permissions keeps the
+/// binary and its co-located shared libraries executable. Sync — run on a
+/// blocking task. `.tar.gz` is the Linux/macOS asset format, so the binary is
+/// always the unix `llama-server` (no `.exe`).
+fn extract_llamacpp_targz(bytes: &[u8], dest_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_permissions(true);
+    for entry in archive.entries().map_err(|e| format!("open archive: {e}"))? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        // unpack_in sanitizes the path and skips anything that would traverse
+        // outside dest_dir, returning Ok(false) for a skipped entry.
+        entry.unpack_in(dest_dir).map_err(|e| e.to_string())?;
+    }
+    let found = find_file(dest_dir, "llama-server")
+        .ok_or_else(|| "llama-server was not found inside the downloaded archive".to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&found, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(found)
 }
 
 /// Extract a llama.cpp release zip into `dest_dir` (zip-slip safe) and return the
@@ -1040,10 +1119,27 @@ mod tests {
     }
 
     #[test]
-    fn ollama_linux_uses_official_script() {
-        let steps = automated(ip(BackendKind::Ollama, "linux", &no, false));
+    fn ollama_linux_with_sudo_is_elevated_official_script() {
+        // Ollama on Linux always needs root; with sudo present the plan runs the
+        // official installer under an elevated step so it installs from the TUI.
+        let has = |b: &str| b == "sudo";
+        let plan = ip(BackendKind::Ollama, "linux", &has, false);
+        assert!(plan.requires_sudo(), "an elevated step must be emitted");
+        let steps = automated(plan);
         assert_eq!(steps.len(), 1);
-        assert!(steps[0].display().contains("ollama.com/install.sh"));
+        assert!(matches!(&steps[0], InstallStep::Sudo { .. }));
+        let d = steps[0].display();
+        assert!(d.starts_with("sudo "));
+        assert!(d.contains("ollama.com/install.sh"));
+    }
+
+    #[test]
+    fn ollama_linux_without_sudo_is_manual() {
+        // No sudo to elevate with: honest copy-paste steps rather than a command
+        // that can't run non-interactively here.
+        let plan = ip(BackendKind::Ollama, "linux", &no, false);
+        assert!(matches!(plan, InstallPlan::Manual { .. }));
+        assert!(!plan.requires_sudo());
     }
 
     #[test]
@@ -1145,7 +1241,7 @@ mod tests {
     #[test]
     fn picks_ubuntu_for_linux_and_nothing_for_unknown_os() {
         let assets = vec![
-            ("llama-b100-bin-ubuntu-x64.zip".to_string(), "linux-url".to_string()),
+            ("llama-b100-bin-ubuntu-x64.tar.gz".to_string(), "linux-url".to_string()),
             ("llama-b100-bin-win-cpu-x64.zip".to_string(), "win-url".to_string()),
         ];
         assert_eq!(
@@ -1153,6 +1249,98 @@ mod tests {
             "linux-url"
         );
         assert!(pick_llamacpp_asset(&assets, "freebsd", "x86_64").is_none());
+    }
+
+    #[test]
+    fn linux_requires_targz_not_zip() {
+        // Regression: llama.cpp ships Linux builds as .tar.gz, not .zip. A .zip
+        // ubuntu asset must NOT be picked (that mismatch is why the in-app fetch
+        // silently found nothing on Linux), while the .tar.gz is.
+        let zip_only = vec![(
+            "llama-b100-bin-ubuntu-x64.zip".to_string(),
+            "zip".to_string(),
+        )];
+        assert!(pick_llamacpp_asset(&zip_only, "linux", "x86_64").is_none());
+
+        let both = vec![
+            ("llama-b100-bin-ubuntu-x64.zip".to_string(), "zip".to_string()),
+            ("llama-b100-bin-ubuntu-x64.tar.gz".to_string(), "targz".to_string()),
+        ];
+        assert_eq!(
+            pick_llamacpp_asset(&both, "linux", "x86_64").unwrap().1,
+            "targz"
+        );
+    }
+
+    #[test]
+    fn excludes_openvino_and_gpu_builds_on_linux() {
+        // The real release lists accelerator builds (openvino, vulkan, rocm,
+        // sycl) *before* the plain CPU tarball; the plain ubuntu-x64 build must
+        // still win. openvino in particular is not a GPU marker by name, so it
+        // was added explicitly.
+        let assets = vec![
+            ("llama-b100-bin-ubuntu-openvino-2026.2.1-x64.tar.gz".into(), "openvino".into()),
+            ("llama-b100-bin-ubuntu-vulkan-x64.tar.gz".to_string(), "vulkan".into()),
+            ("llama-b100-bin-ubuntu-rocm-7.2-x64.tar.gz".to_string(), "rocm".into()),
+            ("llama-b100-bin-ubuntu-x64.tar.gz".to_string(), "cpu".to_string()),
+        ];
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "linux", "x86_64").unwrap().1,
+            "cpu"
+        );
+    }
+
+    #[test]
+    fn picks_macos_targz() {
+        let assets = vec![
+            ("llama-b100-bin-macos-arm64.tar.gz".to_string(), "arm".to_string()),
+            ("llama-b100-bin-macos-x64.tar.gz".to_string(), "x64".to_string()),
+        ];
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "macos", "aarch64").unwrap().1,
+            "arm"
+        );
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "macos", "x86_64").unwrap().1,
+            "x64"
+        );
+    }
+
+    #[test]
+    fn extract_targz_finds_nested_server_binary() {
+        use std::io::Write;
+        // A real llama.cpp tarball nests the binary under build/bin; the DFS in
+        // find_file must locate it. (Traversal safety is delegated to tar's
+        // `unpack_in`, which refuses entries that escape the destination — and
+        // the Builder here won't even let us forge a `..` entry to test it.)
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let data = b"binary";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_mtime(0);
+            b.append_data(&mut header, "build/bin/llama-server", &data[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&tar_bytes).unwrap();
+            enc.finish().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = extract_llamacpp_targz(&gz, dir.path()).unwrap();
+        assert!(bin.exists());
+        assert_eq!(bin.file_name().unwrap().to_string_lossy(), "llama-server");
+    }
+
+    #[test]
+    fn archive_dispatch_rejects_unknown_format() {
+        assert!(extract_llamacpp_archive(b"x", std::path::Path::new("/tmp/x"), "foo.rar").is_err());
     }
 
     #[test]

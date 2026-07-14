@@ -286,11 +286,45 @@ pub enum RetryAction {
     ApplyRepair,
 }
 
-/// A diagnosed repair blocked on a sudo password. The password lives ONLY here
+/// What a collected sudo password authorizes — an elevated backend install
+/// (Ollama on Linux) or a diagnosed repair. Both carry `InstallStep`s, so the
+/// same masked prompt and `sudo -S` runner serve both.
+enum SudoJob {
+    Install { kind: BackendKind, plan: InstallPlan },
+    Repair(RepairPlan),
+}
+
+impl SudoJob {
+    /// The `sudo …` command being authorized, shown next to the masked prompt so
+    /// the user sees exactly what their password runs. Falls back to a human
+    /// label if the plan somehow carries no elevated step.
+    fn sudo_display(&self) -> String {
+        let steps: &[localcode_backends::InstallStep] = match self {
+            SudoJob::Install {
+                plan: InstallPlan::Automated { steps, .. },
+                ..
+            } => steps,
+            SudoJob::Repair(plan) => &plan.steps,
+            SudoJob::Install { .. } => &[],
+        };
+        steps
+            .iter()
+            .find_map(|s| match s {
+                localcode_backends::InstallStep::Sudo { display, .. } => Some(display.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| match self {
+                SudoJob::Install { kind, .. } => format!("install {}", kind.as_str()),
+                SudoJob::Repair(plan) => plan.title.clone(),
+            })
+    }
+}
+
+/// An elevated action blocked on a sudo password. The password lives ONLY here
 /// (a `Zeroizing<String>`, wiped on drop) until the user submits it; it is never
 /// stored on `App` afterward, never crosses the `BgMsg` channel, never logged.
 struct PendingSudo {
-    plan: RepairPlan,
+    job: SudoJob,
     buf: Zeroizing<String>,
 }
 
@@ -1377,10 +1411,16 @@ impl App {
             self.set_status("An install is already running (Esc to cancel)", false);
             return;
         }
-        match resolve_install_plan(kind, &self.paths) {
+        let plan = resolve_install_plan(kind, &self.paths);
+        match &plan {
             InstallPlan::Automated { display, .. } => {
+                let sudo_note = if plan.requires_sudo() {
+                    "Includes a command that needs sudo — you'll be asked to approve your password.\n\n"
+                } else {
+                    ""
+                };
                 let body = format!(
-                    "LocalCode will run:\n\n{display}\n\n{}Esc cancels — nothing runs until you confirm.",
+                    "LocalCode will run:\n\n{display}\n\n{}{sudo_note}Esc cancels — nothing runs until you confirm.",
                     install_caveat(kind),
                 );
                 self.modal = Some(ModalState::confirm(
@@ -1395,7 +1435,7 @@ impl App {
                 url,
             } => {
                 let mut body = format!("{summary}\n\n");
-                for s in &steps {
+                for s in steps {
                     body.push_str(&format!("• {s}\n"));
                 }
                 body.push_str(&format!("\n{url}"));
@@ -1407,9 +1447,35 @@ impl App {
         }
     }
 
-    /// Spawn the install (called after the confirm dialog). Streams output lines
-    /// through `InstallProgress`; Esc aborts (kill_on_drop stops the child).
-    fn spawn_install(&mut self, kind: BackendKind) {
+    /// After the install is confirmed: run it straight away, unless an elevated
+    /// step needs a password we can't get non-interactively — then collect it
+    /// with the masked prompt first. Mirrors [`Self::confirm_repair`].
+    fn confirm_install(&mut self, kind: BackendKind) {
+        let plan = resolve_install_plan(kind, &self.paths);
+        if plan.requires_sudo() && !can_elevate_noninteractively() {
+            self.set_status(
+                "Enter your sudo password to install — Enter to confirm, Esc to cancel",
+                false,
+            );
+            self.pending_sudo = Some(PendingSudo {
+                job: SudoJob::Install { kind, plan },
+                buf: Zeroizing::new(String::new()),
+            });
+        } else {
+            self.spawn_install(kind, plan, None);
+        }
+    }
+
+    /// Spawn the resolved install plan. Streams output lines through
+    /// `InstallProgress`; Esc aborts (kill_on_drop stops the child). The sudo
+    /// password (when present) is moved into the task, written to `sudo -S`, and
+    /// zeroized when the task ends — it never touches the `BgMsg` channel.
+    fn spawn_install(
+        &mut self,
+        kind: BackendKind,
+        plan: InstallPlan,
+        password: Option<Zeroizing<String>>,
+    ) {
         if self.install_busy.is_some() {
             self.set_status("An install is already running (Esc to cancel)", false);
             return;
@@ -1423,10 +1489,10 @@ impl App {
                 }
             }
         });
-        let plan = resolve_install_plan(kind, &self.paths);
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
-            let result = run_install(&plan, ptx).await;
+            let pw = password.as_ref().map(|z| z.as_str());
+            let result = run_install(&plan, pw, ptx).await;
             let _ = tx.send(BgMsg::InstallDone { kind, result });
         });
         self.installing_kind = Some(kind);
@@ -1487,7 +1553,7 @@ impl App {
                 false,
             );
             self.pending_sudo = Some(PendingSudo {
-                plan,
+                job: SudoJob::Repair(plan),
                 buf: Zeroizing::new(String::new()),
             });
         } else {
@@ -1553,13 +1619,18 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 if let Some(ps) = self.pending_sudo.take() {
-                    let PendingSudo { plan, buf } = ps;
-                    self.spawn_repair(plan, Some(buf));
+                    let PendingSudo { job, buf } = ps;
+                    match job {
+                        SudoJob::Install { kind, plan } => {
+                            self.spawn_install(kind, plan, Some(buf))
+                        }
+                        SudoJob::Repair(plan) => self.spawn_repair(plan, Some(buf)),
+                    }
                 }
             }
             KeyCode::Esc => {
                 self.pending_sudo = None;
-                self.set_status("Fix cancelled", false);
+                self.set_status("Cancelled", false);
             }
             KeyCode::Backspace => {
                 if let Some(ps) = &mut self.pending_sudo {
@@ -1579,18 +1650,9 @@ impl App {
     /// authorized)`. `None` when no prompt is open. The password itself is never
     /// exposed — only its length, for the `•` mask.
     pub fn sudo_prompt(&self) -> Option<(usize, String)> {
-        self.pending_sudo.as_ref().map(|ps| {
-            let cmd = ps
-                .plan
-                .steps
-                .iter()
-                .find_map(|s| match s {
-                    localcode_backends::InstallStep::Sudo { display, .. } => Some(display.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| ps.plan.title.clone());
-            (ps.buf.chars().count(), cmd)
-        })
+        self.pending_sudo
+            .as_ref()
+            .map(|ps| (ps.buf.chars().count(), ps.job.sudo_display()))
     }
 
     /// Smoke-test one backend from the Backends view, storing the result.
@@ -3489,7 +3551,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
                     ..
                 },
                 "Confirm",
-            ) => self.spawn_install(*kind),
+            ) => self.confirm_install(*kind),
             (
                 ModalKind::Confirm {
                     action: ConfirmAction::ApplyRepair,
@@ -4159,7 +4221,7 @@ mod tests {
     fn sudo_prompt_masks_input_shows_command_and_cancels() {
         let mut app = test_app();
         app.pending_sudo = Some(PendingSudo {
-            plan: RepairPlan {
+            job: SudoJob::Repair(RepairPlan {
                 title: "Start the Ollama service".into(),
                 steps: vec![localcode_backends::InstallStep::Sudo {
                     program: "systemctl".into(),
@@ -4168,7 +4230,7 @@ mod tests {
                 }],
                 caveat: None,
                 repoint: None,
-            },
+            }),
             buf: Zeroizing::new(String::new()),
         });
         // Typing accumulates; only the length is ever exposed (masked).
@@ -4184,6 +4246,36 @@ mod tests {
         // Esc cancels and drops the (zeroized) buffer.
         app.handle_sudo_key(key(KeyCode::Esc));
         assert!(app.sudo_prompt().is_none());
+    }
+
+    #[test]
+    fn sudo_prompt_covers_elevated_install() {
+        // The masked prompt is shared with installs: an Ollama-on-Linux install
+        // carries a Sudo step, and the prompt must show that exact command so the
+        // user knows what their password authorizes.
+        let mut app = test_app();
+        let script = "curl -fsSL https://ollama.com/install.sh | sh";
+        let plan = InstallPlan::Automated {
+            steps: vec![localcode_backends::InstallStep::Sudo {
+                program: "sh".into(),
+                args: vec!["-c".into(), script.into()],
+                display: format!("sudo sh -c '{script}'"),
+            }],
+            display: format!("sudo sh -c '{script}'"),
+        };
+        app.pending_sudo = Some(PendingSudo {
+            job: SudoJob::Install {
+                kind: BackendKind::Ollama,
+                plan,
+            },
+            buf: Zeroizing::new(String::new()),
+        });
+        let (len, cmd) = app.sudo_prompt().expect("prompt open");
+        assert_eq!(len, 0);
+        assert!(cmd.starts_with("sudo "));
+        assert!(cmd.contains("ollama.com/install.sh"));
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(screen.contains("sudo password"));
     }
 
     #[test]
