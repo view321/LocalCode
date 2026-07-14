@@ -20,35 +20,43 @@ impl Theme {
         Self { mode }
     }
 
-    /// RGB for a named token. Every token is mode-aware so light mode is
-    /// readable on a light background and high-contrast stays high-contrast.
+    /// RGB for a named token.
+    ///
+    /// `Dark` and `Light` are the shipped themes and are **grayscale**: emphasis
+    /// is carried by brightness, never hue. The semantic tokens (`Ok`/`Warn`/
+    /// `Error`) desaturate to grays too — state is conveyed with words and
+    /// weight, not red/green/yellow (see the TUI redesign spec). `HighContrast`
+    /// keeps its saturated palette (out of scope for the redesign).
     pub fn token_rgb(&self, token: ThemeToken) -> (u8, u8, u8) {
         match self.mode {
+            // Dark (dark + gray).
             ThemeMode::Dark => match token {
-                ThemeToken::NavIdle => (100, 100, 100),
-                ThemeToken::NavHover => (240, 240, 240),
-                ThemeToken::NavActive => (255, 255, 255),
-                ThemeToken::Warn => (230, 180, 40),
-                ThemeToken::Error => (220, 70, 70),
-                ThemeToken::Ok => (80, 200, 120),
-                ThemeToken::Muted => (140, 140, 150),
-                ThemeToken::Accent => (90, 160, 255),
-                ThemeToken::Bg => (18, 18, 22),
-                ThemeToken::Fg => (230, 230, 235),
-                ThemeToken::Border => (60, 60, 70),
+                ThemeToken::Bg => (13, 13, 15),
+                ThemeToken::Fg => (215, 215, 218),
+                ThemeToken::Muted | ThemeToken::NavIdle => (108, 108, 114),
+                ThemeToken::Border => (34, 34, 38),
+                // Emphasis: selected row, active theme, user prompt.
+                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (243, 243, 245),
+                ThemeToken::Faint => (60, 60, 66),
+                ThemeToken::Work => (207, 207, 212),
+                // Grayscale semantics: good/active = emphasis, idle = muted,
+                // error = primary text (bold at the call site).
+                ThemeToken::Ok => (243, 243, 245),
+                ThemeToken::Warn => (108, 108, 114),
+                ThemeToken::Error => (215, 215, 218),
             },
+            // Light (white + gray).
             ThemeMode::Light => match token {
-                ThemeToken::NavIdle => (120, 120, 128),
-                ThemeToken::NavHover => (40, 40, 50),
-                ThemeToken::NavActive => (0, 0, 0),
-                ThemeToken::Warn => (146, 100, 0),
-                ThemeToken::Error => (176, 30, 30),
-                ThemeToken::Ok => (18, 120, 60),
-                ThemeToken::Muted => (95, 95, 108),
-                ThemeToken::Accent => (26, 84, 200),
-                ThemeToken::Bg => (245, 245, 248),
-                ThemeToken::Fg => (25, 25, 30),
-                ThemeToken::Border => (176, 176, 188),
+                ThemeToken::Bg => (244, 244, 243),
+                ThemeToken::Fg => (43, 43, 45),
+                ThemeToken::Muted | ThemeToken::NavIdle => (134, 134, 138),
+                ThemeToken::Border => (224, 224, 221),
+                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (15, 15, 17),
+                ThemeToken::Faint => (188, 188, 188),
+                ThemeToken::Work => (58, 58, 62),
+                ThemeToken::Ok => (15, 15, 17),
+                ThemeToken::Warn => (134, 134, 138),
+                ThemeToken::Error => (43, 43, 45),
             },
             ThemeMode::HighContrast => match token {
                 ThemeToken::NavIdle => (170, 170, 170),
@@ -62,6 +70,8 @@ impl Theme {
                 ThemeToken::Bg => (0, 0, 0),
                 ThemeToken::Fg => (255, 255, 255),
                 ThemeToken::Border => (255, 255, 255),
+                ThemeToken::Faint => (120, 120, 120),
+                ThemeToken::Work => (255, 255, 255),
             },
         }
     }
@@ -80,6 +90,10 @@ pub enum ThemeToken {
     Bg,
     Fg,
     Border,
+    /// Bar tracks, disabled text, `·` separators — dimmer than `Muted`.
+    Faint,
+    /// The animated braille glyph shown only while the agent is working.
+    Work,
 }
 
 #[cfg(test)]

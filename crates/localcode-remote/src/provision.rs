@@ -24,9 +24,25 @@ pub fn nvidia_smi_command() -> String {
 }
 
 /// Command that installs Ollama from `url` (the official installer, or a
-/// mirror of it). Piped to `sh`, matching the documented one-liner.
+/// mirror of it). Piped to `sh`, matching the documented one-liner. Used when
+/// the remote session is already root (or has passwordless sudo).
 pub fn ollama_install_command(url: &str) -> String {
     format!("curl -fsSL {} | sh", shell_single_quote(url))
+}
+
+/// Like [`ollama_install_command`] but runs the installer under `sudo`, feeding
+/// `password` on stdin (`-S`). The official installer calls `sudo` internally
+/// for `/usr/local/bin` + systemd; over a non-interactive SSH exec channel that
+/// inner `sudo` can't prompt, so a non-root remote otherwise fails asking for a
+/// password. Fetching the script and running it as root (`sudo sh script`) makes
+/// its internal `sudo` a no-op (`id -u == 0`), so nothing prompts.
+pub fn ollama_install_command_sudo(url: &str, password: &str) -> String {
+    format!(
+        "curl -fsSL {} -o /tmp/lc-ollama-install.sh && printf '%s\\n' {} | \
+         sudo -S -p '' sh /tmp/lc-ollama-install.sh; rm -f /tmp/lc-ollama-install.sh",
+        shell_single_quote(url),
+        shell_single_quote(password),
+    )
 }
 
 /// Command that starts `ollama serve` detached, optionally pointing HF pulls at
@@ -157,11 +173,25 @@ async fn install_ollama(
     } else {
         server.mirrors.ollama_install.clone()
     };
+    // A root session (common for cloud GPU boxes) needs no sudo; a non-root one
+    // with a stored password runs the installer under sudo so it never prompts.
+    let is_root = ssh
+        .exec("id -u")
+        .await
+        .map(|o| o.out().trim() == "0")
+        .unwrap_or(false);
+    let use_sudo = !is_root && !server.password.is_empty();
+
     let mut last_err: Option<LocalCodeError> = None;
     let n = urls.len();
     for (i, url) in urls.iter().enumerate() {
         log(format!("Installing Ollama from {} ({}/{})", url, i + 1, n));
-        match ssh.exec_checked(&ollama_install_command(url)).await {
+        let cmd = if use_sudo {
+            ollama_install_command_sudo(url, &server.password)
+        } else {
+            ollama_install_command(url)
+        };
+        match ssh.exec_checked(&cmd).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 log(format!("Install source failed: {}", e.message));
@@ -197,6 +227,16 @@ mod tests {
             ollama_install_command("https://ollama.com/install.sh"),
             "curl -fsSL 'https://ollama.com/install.sh' | sh"
         );
+    }
+
+    #[test]
+    fn install_command_sudo_runs_script_as_root() {
+        let c = ollama_install_command_sudo("https://ollama.com/install.sh", "pw");
+        // Feeds the password to sudo on stdin and runs the fetched script as root.
+        assert!(c.contains("sudo -S -p ''"));
+        assert!(c.contains("sh /tmp/lc-ollama-install.sh"));
+        assert!(c.contains("'https://ollama.com/install.sh'"));
+        assert!(c.contains("'pw'"));
     }
 
     #[test]

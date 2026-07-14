@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    html,body{margin:0;background:#050505;}
+    *{box-sizing:border-box;}
+    .lc-in{background:transparent;border:0;outline:0;font:inherit;color:inherit;width:100%;padding:0;}
+    .lc-in::placeholder{color:var(--dim);opacity:1;}
+    .lc-scroll::-webkit-scrollbar{width:8px;height:8px;} .lc-scroll::-webkit-scrollbar-thumb{background:var(--line);}
+    ::selection{background:var(--sel);}
+  </style>
+</helmet>
+<div style="--bg:{{ c.bg }};--fg:{{ c.fg }};--dim:{{ c.dim }};--faint:{{ c.faint }};--line:{{ c.line }};--em:{{ c.em }};--work:{{ c.work }};--sel:{{ c.sel }};width:1000px;height:660px;background:var(--bg);color:var(--fg);font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:14px;display:flex;flex-direction:column;border:1px solid var(--line);">
+
+  <!-- STATUS BAR -->
+  <div style="flex:0 0 32px;display:flex;align-items:center;padding:0 14px;border-bottom:1px solid var(--line);font-size:12.5px;white-space:nowrap;overflow:hidden;">
+    <span style="color:var(--work);width:11px;display:inline-block;">{{ activity }}</span>
+    <span style="color:var(--fg);margin-left:7px;">qwen2.5-coder:7b</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">vram </span><span style="color:var(--fg);">14.2/24G</span>
+    <span style="display:inline-block;width:44px;height:5px;background:var(--faint);margin:0 0 0 8px;position:relative;"><span style="position:absolute;left:0;top:0;bottom:0;width:59%;background:var(--fg);"></span></span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">tok/s </span><span style="color:var(--fg);">48</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">ctx </span><span style="color:var(--fg);">12k/32k</span>
+    <span style="display:inline-block;width:44px;height:5px;background:var(--faint);margin:0 0 0 8px;position:relative;"><span style="position:absolute;left:0;top:0;bottom:0;width:38%;background:var(--fg);"></span></span>
+    <span style="flex:1;"></span>
+    <span style="color:var(--dim);">v0.4.1</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span onClick="{{ setDark }}" style="color:{{ darkCol }};cursor:pointer;">dark</span>
+    <span style="color:var(--faint);margin:0 6px;">/</span>
+    <span onClick="{{ setLight }}" style="color:{{ lightCol }};cursor:pointer;">light</span>
+  </div>
+
+  <!-- WORKING SPACE -->
+  <div class="lc-scroll" style="flex:1;min-height:0;overflow:auto;padding:16px 20px;">
+
+    <!-- COMMAND LIST (in place, no popup) -->
+    <sc-if value="{{ isCommanding }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">commands&nbsp;&nbsp;<span style="color:var(--faint);">↵ runs the first match</span></div>
+      <sc-for list="{{ commands }}" as="cmd" hint-placeholder-count="6">
+        <div onClick="{{ cmd.run }}" style="display:flex;gap:12px;padding:5px 0;cursor:pointer;border-bottom:1px solid var(--line);">
+          <span style="color:var(--faint);width:12px;">{{ cmd.mark }}</span>
+          <span style="color:{{ cmd.col }};min-width:120px;">{{ cmd.name }}</span>
+          <span style="color:var(--dim);">{{ cmd.desc }}</span>
+        </div>
+      </sc-for>
+    </sc-if>
+
+    <!-- CHAT -->
+    <sc-if value="{{ isChat }}" hint-placeholder-val="{{ true }}">
+      <div style="max-width:760px;">
+        <div style="margin-bottom:14px;"><span style="color:var(--dim);">❯ </span><span style="color:var(--em);">refactor crates/auth to use async sqlx and remove the blocking pool</span></div>
+        <div style="color:var(--fg);margin-bottom:12px;line-height:1.65;">Reading the auth module and its manifest, then migrating the pool from r2d2 to an async sqlx PgPool.</div>
+        <div style="color:var(--dim);margin:3px 0;">read&nbsp;&nbsp;&nbsp;crates/auth/src/lib.rs&nbsp;&nbsp;&nbsp;<span style="color:var(--faint);">142 lines</span></div>
+        <div style="color:var(--dim);margin:3px 0;">read&nbsp;&nbsp;&nbsp;crates/auth/Cargo.toml&nbsp;&nbsp;&nbsp;<span style="color:var(--faint);">28 lines</span></div>
+        <div style="color:var(--fg);margin:12px 0;line-height:1.65;">Switched the pool to sqlx::PgPool, made the query functions async, and updated the two call sites in the router.</div>
+        <div style="color:var(--dim);margin:3px 0;">write&nbsp;&nbsp;crates/auth/src/lib.rs&nbsp;&nbsp;&nbsp;<span style="color:var(--faint);">+38 −21</span></div>
+        <div style="color:var(--dim);margin:3px 0;">shell&nbsp;&nbsp;cargo check -p auth&nbsp;&nbsp;&nbsp;<span style="color:var(--faint);">ok · 3.1s</span></div>
+        <div style="margin-top:14px;color:var(--fg);"><span style="color:var(--work);">{{ activity }}</span>&nbsp;&nbsp;running the test suite…</div>
+      </div>
+    </sc-if>
+
+    <!-- MODELS -->
+    <sc-if value="{{ isModels }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">models&nbsp;&nbsp;<span style="color:var(--faint);">{{ query }} · {{ resultCount }} results</span></div>
+      <sc-for list="{{ models }}" as="m" hint-placeholder-count="5">
+        <div>
+          <div onClick="{{ m.pick }}" style="display:flex;gap:12px;padding:5px 0;cursor:pointer;border-bottom:1px solid var(--line);">
+            <span style="color:var(--faint);width:12px;">{{ m.mark }}</span>
+            <span style="color:{{ m.col }};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ m.id }}</span>
+            <span style="color:var(--dim);">{{ m.meta }}</span>
+          </div>
+          <sc-if value="{{ m.open }}" hint-placeholder-val="{{ false }}">
+            <div style="padding:10px 24px 14px;color:var(--dim);line-height:1.7;">
+              <div style="color:var(--fg);">{{ m.desc }}</div>
+              <div style="margin-top:6px;">license apache-2.0 · params 7.6B · context 32k → 128k · files 14</div>
+              <div style="margin-top:10px;display:flex;align-items:center;gap:18px;white-space:nowrap;">
+                <span>backend <span onClick="{{ cycleBackend }}" style="color:var(--em);cursor:pointer;">{{ backend }}</span></span>
+                <span>quant <span style="color:var(--em);">Q5_K_M</span></span>
+                <span>fit <span style="color:var(--fg);">5.9 / 24G</span></span>
+                <span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:2px 14px;cursor:pointer;">deploy</span>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+      </sc-for>
+    </sc-if>
+
+    <!-- RUNTIMES -->
+    <sc-if value="{{ isRuntimes }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">runtimes</div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--em);flex:1;">qwen2.5-coder:7b</span><span style="color:var(--fg);">healthy</span><span style="color:var(--dim);margin-left:18px;">127.0.0.1:11434</span></div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--dim);flex:1;">llama3.1:8b</span><span style="color:var(--dim);">stopped</span><span style="color:var(--faint);margin-left:18px;">—</span></div>
+      <div style="margin-top:16px;color:var(--dim);line-height:1.8;">gpu&nbsp;&nbsp;RTX 4090 · 14.2 / 24.0 GiB · 62°C<br>api&nbsp;&nbsp;offline (local-first)<br>remote&nbsp;&nbsp;gpu-box connected · tunnel :11434</div>
+    </sc-if>
+
+    <!-- REMOTE -->
+    <sc-if value="{{ isRemote }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">remote</div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--em);flex:1;">gpu-box</span><span style="color:var(--fg);">connected</span></div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--dim);flex:1;">workstation</span><span style="color:var(--dim);">offline</span></div>
+      <div style="margin-top:16px;color:var(--dim);line-height:1.9;">host&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;10.8.0.2<br>user&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ubuntu<br>auth&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;password (prefer key_path)</div>
+      <div style="margin-top:12px;color:var(--faint);">connect installs ollama on the box and tunnels its port here.</div>
+    </sc-if>
+
+    <!-- SETTINGS -->
+    <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">settings</div>
+      <div style="color:var(--dim);line-height:2;">theme&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--em);">{{ themeName }}</span> <span style="color:var(--faint);">(/theme)</span><br>stream&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">on</span><br>confirm&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">destructive shell commands</span><br>cloud&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">fallback off — local-first</span><br>config&nbsp;&nbsp;&nbsp;~/.config/localcode/config.toml</div>
+    </sc-if>
+
+    <!-- BACKENDS -->
+    <sc-if value="{{ isBackends }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">backends</div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--em);flex:1;">ollama</span><span style="color:var(--fg);">ready</span><span style="color:var(--dim);margin-left:18px;">default</span></div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--em);flex:1;">llama.cpp</span><span style="color:var(--fg);">ready</span><span style="color:var(--faint);margin-left:18px;">—</span></div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--dim);flex:1;">vLLM</span><span style="color:var(--dim);">not installed</span><span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:1px 12px;margin-left:18px;cursor:pointer;">install</span></div>
+      <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);"><span style="color:var(--dim);flex:1;">SGLang</span><span style="color:var(--dim);">not installed</span><span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:1px 12px;margin-left:18px;cursor:pointer;">install</span></div>
+    </sc-if>
+
+    <!-- BENCH -->
+    <sc-if value="{{ isBench }}" hint-placeholder-val="{{ false }}">
+      <div style="color:var(--dim);margin-bottom:12px;">benchmarks</div>
+      <div style="color:var(--dim);line-height:2;">suite&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">localcode-sample-coding v1.0.0</span><br>last run&nbsp;<span style="color:var(--fg);">score 0.82 · pass 90% · p50 240 ms</span></div>
+      <div style="margin-top:12px;"><span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:3px 16px;cursor:pointer;">run on active runtime</span></div>
+    </sc-if>
+
+  </div>
+
+  <!-- OMNIBAR -->
+  <div style="flex:0 0 auto;border-top:1px solid var(--line);padding:9px 14px;display:flex;align-items:center;gap:10px;">
+    <sc-if value="{{ showModeTag }}" hint-placeholder-val="{{ false }}">
+      <span style="border:1px solid var(--line);color:var(--dim);padding:1px 8px;">{{ mode }}</span>
+    </sc-if>
+    <span style="color:var(--dim);">❯</span>
+    <label style="flex:1;cursor:text;display:block;">
+      <input class="lc-in" type="text" value="{{ input }}" placeholder="{{ placeholder }}" onInput="{{ onInput }}" onKeyDown="{{ onKey }}" />
+    </label>
+    <span style="color:var(--faint);font-size:12px;">{{ hint }}</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1000,&quot;height&quot;:660}}">
+const FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+const THEMES = {
+  dark:  { bg:"#0d0d0f", fg:"#d7d7da", dim:"#6c6c72", faint:"#3c3c42", line:"#222226", em:"#f3f3f5", work:"#cfcfd4", sel:"rgba(255,255,255,.14)" },
+  light: { bg:"#f4f4f3", fg:"#2b2b2d", dim:"#86868a", faint:"#bcbcbc", line:"#e0e0dd", em:"#0f0f11", work:"#3a3a3e", sel:"rgba(0,0,0,.10)" },
+};
+const COMMANDS = [
+  {name:"/models",   desc:"search & deploy HuggingFace models"},
+  {name:"/runtimes", desc:"active runtimes & system overview"},
+  {name:"/remote",   desc:"connect a GPU server over SSH"},
+  {name:"/backends", desc:"install & configure inference backends"},
+  {name:"/bench",    desc:"run the sample benchmark suite"},
+  {name:"/setup",    desc:"first-run setup & doctor"},
+  {name:"/settings", desc:"preferences & config file"},
+  {name:"/theme",    desc:"toggle dark / light"},
+  {name:"/chat",     desc:"back to the conversation"},
+  {name:"/new",      desc:"start a new conversation"},
+];
+const CMD_NAMES = COMMANDS.map(c=>c.name.slice(1));
+class Component extends DCLogic {
+  state = { theme:"dark", mode:"chat", input:"", frame:0, query:"", backendIdx:0, sel:0 };
+  componentDidMount(){ this.t = setInterval(()=> this.setState(s=>({frame:(s.frame+1)%FRAMES.length})), 90); }
+  componentWillUnmount(){ clearInterval(this.t); }
+
+  run(v){
+    const s = v.trim();
+    if(s.startsWith("/")){
+      const word = s.slice(1).split(/\s+/)[0].toLowerCase();
+      const arg = s.slice(1+word.length).trim();
+      const cmd = CMD_NAMES.includes(word) ? word : CMD_NAMES.find(n=>n.startsWith(word));
+      if(!cmd){ this.setState({input:""}); return; }
+      if(cmd==="theme"){ this.setState(st=>({theme: st.theme==="dark"?"light":"dark", input:""})); return; }
+      if(cmd==="chat"||cmd==="new"){ this.setState({mode:"chat", input:"", query:""}); return; }
+      this.setState({mode:cmd, input:"", query: cmd==="models"?arg:"", sel:0}); return;
+    }
+    if(this.state.mode==="models"){ this.setState({query:s, input:"", sel:0}); return; }
+    this.setState({input:""});
+  }
+
+  renderVals(){
+    const c = THEMES[this.state.theme];
+    const mode = this.state.mode;
+    const q = this.state.query.toLowerCase();
+    const all = [
+      {id:"Qwen/Qwen2.5-Coder-7B-Instruct", meta:"1.2M ↓  3.4k", desc:"Code-specialized causal LM tuned for fill-in-the-middle and instruction following across 40+ languages."},
+      {id:"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", meta:"890k ↓  2.1k", desc:"Prebuilt GGUF quants of Qwen2.5-Coder-7B — deploys through Ollama in one step."},
+      {id:"deepseek-ai/deepseek-coder-6.7b-instruct", meta:"640k ↓  1.8k", desc:"DeepSeek's 6.7B instruct coder, strong on repository-level completion."},
+      {id:"bartowski/Qwen2.5-Coder-14B-Instruct-GGUF", meta:"410k ↓  980", desc:"14B GGUF build for machines with more VRAM headroom."},
+      {id:"codellama/CodeLlama-7b-Instruct-hf", meta:"2.0M ↓  5.2k", desc:"Meta's Code Llama 7B instruct, broad language coverage."},
+    ].filter(m=> !q || m.id.toLowerCase().includes(q));
+    const models = all.map((m,i)=>({ ...m, mark: i===this.state.sel?"›":" ", col: i===this.state.sel?"var(--em)":"var(--fg)", open: i===this.state.sel, pick:()=>this.setState({sel:i}) }));
+    const backends = ["ollama","llama.cpp","vLLM","SGLang"];
+    const raw = this.state.input.trim();
+    const commanding = raw.startsWith("/");
+    const cmdWord = commanding ? raw.slice(1).split(/\s+/)[0].toLowerCase() : "";
+    const commands = COMMANDS.filter(cm=> !cmdWord || cm.name.slice(1).startsWith(cmdWord))
+      .map((cm,i)=>({ ...cm, mark: i===0?"›":" ", col: i===0?"var(--em)":"var(--fg)", run:()=>this.run(cm.name) }));
+    const placeholders = { chat:"message the agent…    / for commands", models:"search models — type to filter, Enter to run", runtimes:"/ for commands", remote:"/ for commands", backends:"/ for commands", bench:"/ for commands", settings:"/ for commands" };
+    return {
+      c, mode,
+      activity: FRAMES[this.state.frame],
+      isCommanding: commanding, commands,
+      isChat: !commanding && mode==="chat", isModels: !commanding && mode==="models", isRuntimes: !commanding && mode==="runtimes", isRemote: !commanding && mode==="remote", isSettings: !commanding && mode==="settings", isBackends: !commanding && mode==="backends", isBench: !commanding && mode==="bench",
+      showModeTag: mode!=="chat" && !commanding,
+      input:this.state.input, placeholder: commanding ? "run a command — ↵ to execute, Esc to cancel" : (placeholders[mode]||"type / for commands"),
+      hint: commanding ? "↵ run" : (mode==="models" ? "search" : "/ commands"),
+      onInput:(e)=>this.setState({input:e.target.value}),
+      onKey:(e)=>{ if(e.key==="Enter"){ this.run(this.state.input); } else if(e.key==="Escape"){ this.setState({mode:"chat", input:""}); } },
+      query:this.state.query||"all", resultCount:all.length, models,
+      backend:backends[this.state.backendIdx], cycleBackend:()=>this.setState(s=>({backendIdx:(s.backendIdx+1)%4})),
+      themeName:this.state.theme, themeLabel:this.state.theme,
+      darkCol: this.state.theme==="dark"?"var(--em)":"var(--dim)",
+      lightCol: this.state.theme==="light"?"var(--em)":"var(--dim)",
+      setDark:()=>this.setState({theme:"dark"}), setLight:()=>this.setState({theme:"light"}),
+      noop:()=>{},
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -117,8 +117,11 @@ fn python_prereq(os: &str, has: &dyn Fn(&str) -> bool) -> Option<InstallStep> {
                 "--id",
                 "Python.Python.3.12",
                 "-e",
+                "--scope",
+                "user",
                 "--accept-source-agreements",
                 "--accept-package-agreements",
+                "--disable-interactivity",
             ],
         )),
         "macos" if has("brew") => Some(InstallStep::command("brew", &["install", "python"])),
@@ -134,6 +137,10 @@ fn ollama_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
         "macos" if has("brew") => {
             InstallPlan::automated(vec![InstallStep::command("brew", &["install", "ollama"])])
         }
+        // `--scope user` installs into the user profile (Ollama ships a
+        // per-user installer) so no UAC/admin-password prompt appears, and
+        // `--disable-interactivity` stops winget blocking on any prompt — the
+        // child runs with stdin null and could never answer one.
         "windows" if has("winget") => InstallPlan::automated(vec![InstallStep::command(
             "winget",
             &[
@@ -141,8 +148,11 @@ fn ollama_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
                 "--id",
                 "Ollama.Ollama",
                 "-e",
+                "--scope",
+                "user",
                 "--accept-source-agreements",
                 "--accept-package-agreements",
+                "--disable-interactivity",
             ],
         )]),
         _ => InstallPlan::Manual {
@@ -207,7 +217,48 @@ fn pip_backend_plan(
 /// Resolve an install plan against the real environment.
 pub fn resolve_install_plan(kind: BackendKind) -> InstallPlan {
     let has = |b: &str| which::which(b).is_ok();
-    install_plan(kind, std::env::consts::OS, &has, discover_python().is_some())
+    let plan = install_plan(kind, std::env::consts::OS, &has, discover_python().is_some());
+    // The official Ollama Linux installer runs `sudo` internally. Our install
+    // steps spawn with stdin null, so if we can't elevate without a password
+    // that `sudo` just fails ("a password is required") — a confusing failure.
+    // Per the module's honesty rule, offer manual steps instead unless we can
+    // elevate non-interactively (already root, or passwordless sudo).
+    if kind == BackendKind::Ollama
+        && std::env::consts::OS == "linux"
+        && !can_elevate_noninteractively()
+    {
+        return InstallPlan::Manual {
+            summary: "The Ollama installer needs root (it runs `sudo`), which can't be entered here."
+                .into(),
+            steps: vec![
+                "Run this in a terminal where sudo can prompt for your password:".into(),
+                "curl -fsSL https://ollama.com/install.sh | sh".into(),
+                "Ollama starts a local service automatically — then re-detect.".into(),
+            ],
+            url: "https://ollama.com/download/linux".into(),
+        };
+    }
+    plan
+}
+
+/// Whether this process can gain root without an interactive password prompt:
+/// either it is already root, or `sudo` is configured passwordless. Used to
+/// decide whether a `sudo`-requiring installer can run non-interactively.
+fn can_elevate_noninteractively() -> bool {
+    use std::process::{Command, Stdio};
+    if let Ok(o) = Command::new("id").arg("-u").output() {
+        if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0" {
+            return true;
+        }
+    }
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Find a Python interpreter, resilient to a just-installed one not yet on this
@@ -392,8 +443,12 @@ mod tests {
     fn ollama_windows_winget() {
         let has = |b: &str| b == "winget";
         let steps = automated(install_plan(BackendKind::Ollama, "windows", &has, false));
-        assert!(steps[0].display().contains("winget"));
-        assert!(steps[0].display().contains("Ollama.Ollama"));
+        let d = steps[0].display();
+        assert!(d.contains("winget"));
+        assert!(d.contains("Ollama.Ollama"));
+        // Non-interactive + user scope so no UAC/password prompt can block it.
+        assert!(d.contains("--disable-interactivity"));
+        assert!(d.contains("--scope user"));
     }
 
     #[test]

@@ -1,17 +1,22 @@
-//! Shared TUI widgets: modal, command palette, status strip helpers.
+//! Inline banner state + renderer.
+//!
+//! The redesign has no popups: confirms, warnings, errors and info that used to
+//! be centered modals are now **inline banners** rendered at the top of the
+//! working area (see the TUI redesign spec §8). The `ModalState`/`ConfirmAction`
+//! semantics and click wiring are unchanged — only the presentation moved.
 
 use localcode_backends::BackendKind;
 use localcode_core::error::LocalCodeError;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use localcode_core::theme::ThemeToken;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme;
-use unicode_width::UnicodeWidthStr;
 
-/// What a Confirm modal's "Confirm" button actually does.
+/// What a Confirm banner's "Confirm" button actually does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmAction {
     /// Quit the app (asked when managed runtimes would be stopped).
@@ -37,11 +42,6 @@ pub enum ModalKind {
     },
     Error {
         error: LocalCodeError,
-    },
-    Payment {
-        title: String,
-        body: String,
-        amount: String,
     },
     Info {
         title: String,
@@ -112,8 +112,7 @@ impl ModalState {
             }
             ModalKind::Warning { .. } => vec!["Continue", "Cancel"],
             ModalKind::Confirm { .. } => vec!["Confirm", "Cancel"],
-            ModalKind::Payment { .. } => vec!["Confirm pay", "Cancel"],
-            ModalKind::Info { .. } => vec!["OK"],
+            ModalKind::Info { .. } => vec!["Dismiss"],
         }
     }
 
@@ -126,143 +125,115 @@ impl ModalState {
     }
 }
 
-pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+/// Title + wrapped body content of a banner (no button row), styled per kind.
+/// Errors render bold `Fg` (never red); everything else uses `Fg`/`Muted`.
+fn content_rows(modal: &ModalState, th: &localcode_core::Theme) -> Vec<Line<'static>> {
+    let fg = Style::default().fg(theme::color(th, ThemeToken::Fg));
+    let bold = fg.add_modifier(Modifier::BOLD);
+    match &modal.kind {
+        ModalKind::Error { error } => {
+            let mut lines = vec![Line::from(Span::styled(
+                format!("{}: {}", error.code, error.message),
+                bold,
+            ))];
+            for c in &error.causes {
+                lines.push(Line::from(Span::styled(format!("cause  {c}"), theme::muted(th))));
+            }
+            for h in &error.hints {
+                lines.push(Line::from(Span::styled(format!("try    {h}"), theme::muted(th))));
+            }
+            lines
+        }
+        ModalKind::Warning { title, body } => banner_text(title, body, bold, th),
+        ModalKind::Confirm { title, body, .. } => banner_text(title, body, bold, th),
+        ModalKind::Info { title, body } => banner_text(title, body, bold, th),
+    }
 }
 
-/// Returns the on-screen rect of each button (with its index) so the caller can
-/// register click regions that map to `modal.buttons()`.
-pub fn draw_modal(
+fn banner_text(
+    title: &str,
+    body: &str,
+    title_style: Style,
+    th: &localcode_core::Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(title.to_string(), title_style))];
+    for l in body.lines() {
+        lines.push(Line::from(Span::styled(l.to_string(), theme::muted(th))));
+    }
+    lines
+}
+
+/// Rows the banner needs at `width`: wrapped content + one button row, capped so
+/// a long error can't swallow the whole working area.
+pub fn banner_height(modal: &ModalState, th: &localcode_core::Theme, width: u16) -> u16 {
+    let w = width.saturating_sub(2).max(1) as usize;
+    let body: usize = content_rows(modal, th)
+        .iter()
+        .map(|l| (l.width().max(1)).div_ceil(w))
+        .sum();
+    // content + blank + buttons + the bottom rule.
+    (body as u16 + 3).clamp(3, 16)
+}
+
+/// Render the banner at the top of the working area. Returns each button's rect
+/// with its index so the caller can register `ModalButton` click regions.
+pub fn draw_inline_banner(
     f: &mut Frame,
     area: Rect,
     modal: &ModalState,
     th: &localcode_core::Theme,
 ) -> Vec<(Rect, usize)> {
-    let rect = centered_rect(70, 60, area);
-    f.render_widget(Clear, rect);
-
-    let (title, body_lines, style) = match &modal.kind {
-        ModalKind::Error { error } => {
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    format!("{}: {}", error.code, error.message),
-                    theme::error(th).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled("Possible causes:", theme::muted(th))),
-            ];
-            for c in &error.causes {
-                lines.push(Line::from(format!("  • {c}")));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("What to try:", theme::muted(th))));
-            for h in &error.hints {
-                lines.push(Line::from(format!("  → {h}")));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "correlation_id: {}",
-                error.correlation_id
-            )));
-            ("Error", lines, theme::error(th))
-        }
-        ModalKind::Warning { title, body } => (
-            title.as_str(),
-            body.lines().map(|l| Line::from(l.to_string())).collect(),
-            theme::warn(th),
-        ),
-        ModalKind::Confirm { title, body, .. } => (
-            title.as_str(),
-            body.lines().map(|l| Line::from(l.to_string())).collect(),
-            theme::accent(th),
-        ),
-        ModalKind::Payment {
-            title,
-            body,
-            amount,
-        } => (
-            title.as_str(),
-            vec![
-                Line::from(body.as_str()),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("Amount: {amount}"),
-                    theme::warn(th).add_modifier(Modifier::BOLD),
-                )),
-            ],
-            theme::warn(th),
-        ),
-        ModalKind::Info { title, body } => (
-            title.as_str(),
-            body.lines().map(|l| Line::from(l.to_string())).collect(),
-            theme::accent(th),
-        ),
-    };
-
+    // A single thin rule separates the banner from the view below it.
     let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(style);
+        .borders(Borders::BOTTOM)
+        .border_type(BorderType::Plain)
+        .border_style(theme::border(th));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    let mut rows = content_rows(modal, th);
+    let button_y = inner.y + inner.height.saturating_sub(1);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
+    // Body fills all but the last inner row (reserved for buttons).
+    let body_rect = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    // Drop content that would collide with the button row.
+    let max_body = body_rect.height as usize;
+    if rows.len() > max_body {
+        rows.truncate(max_body);
+    }
+    f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), body_rect);
 
-    f.render_widget(
-        Paragraph::new(body_lines).wrap(Wrap { trim: true }),
-        chunks[0],
-    );
-
+    // Inline action words: `[ confirm ] [ cancel ]`.
     let buttons = modal.buttons();
     let sel = modal.selected.min(buttons.len().saturating_sub(1));
     let mut spans: Vec<Span> = Vec::new();
     let mut hits: Vec<(Rect, usize)> = Vec::new();
-    let mut x = chunks[1].x;
+    let mut x = inner.x;
     for (i, b) in buttons.iter().enumerate() {
-        let st = if i == sel {
-            Style::default()
-                .fg(theme::color(th, localcode_core::theme::ThemeToken::Bg))
-                .bg(theme::color(th, localcode_core::theme::ThemeToken::Accent))
-                .add_modifier(Modifier::BOLD)
+        let label = format!("[ {} ]", b.to_lowercase());
+        let w = label.chars().count() as u16;
+        let style = if i == sel {
+            theme::accent(th).add_modifier(Modifier::BOLD)
         } else {
             theme::muted(th)
         };
-        let label = format!(" [{b}] ");
-        let w = label.width() as u16;
-        hits.push((
-            Rect {
-                x,
-                y: chunks[1].y,
-                width: w,
-                height: 1,
-            },
-            i,
-        ));
-        spans.push(Span::styled(label, st));
+        if x + w <= inner.x + inner.width {
+            hits.push((Rect { x, y: button_y, width: w, height: 1 }, i));
+        }
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
         x = x.saturating_add(w + 1);
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
+    f.render_widget(Paragraph::new(Line::from(spans)), Rect {
+        x: inner.x,
+        y: button_y,
+        width: inner.width,
+        height: 1,
+    });
     hits
 }
-

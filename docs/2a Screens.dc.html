@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    html,body{margin:0;background:#050505;}
+    *{box-sizing:border-box;}
+    .lc-scroll::-webkit-scrollbar{width:8px;height:8px;} .lc-scroll::-webkit-scrollbar-thumb{background:var(--line);}
+    ::selection{background:var(--sel);}
+    .bar{display:inline-block;height:6px;background:var(--faint);position:relative;vertical-align:middle;}
+    .bar > i{position:absolute;left:0;top:0;bottom:0;background:var(--fg);}
+  </style>
+</helmet>
+<div style="--bg:{{ c.bg }};--fg:{{ c.fg }};--dim:{{ c.dim }};--faint:{{ c.faint }};--line:{{ c.line }};--em:{{ c.em }};--work:{{ c.work }};--sel:{{ c.sel }};width:1000px;height:660px;background:var(--bg);color:var(--fg);font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:14px;display:flex;flex-direction:column;border:1px solid var(--line);">
+
+  <!-- STATUS BAR -->
+  <div style="flex:0 0 32px;display:flex;align-items:center;padding:0 14px;border-bottom:1px solid var(--line);font-size:12.5px;white-space:nowrap;overflow:hidden;">
+    <span style="color:var(--work);width:11px;display:inline-block;">{{ activity }}</span>
+    <span style="color:var(--fg);margin-left:7px;">qwen2.5-coder:7b</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">vram </span><span style="color:var(--fg);">14.2/24G</span>
+    <span class="bar" style="width:44px;margin-left:8px;"><i style="width:59%;"></i></span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">tok/s </span><span style="color:var(--fg);">48</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span style="color:var(--dim);">ctx </span><span style="color:var(--fg);">12k/32k</span>
+    <span class="bar" style="width:44px;margin-left:8px;"><i style="width:38%;"></i></span>
+    <span style="flex:1;"></span>
+    <span style="color:var(--dim);">v0.4.1</span>
+    <span style="color:var(--faint);margin:0 12px;">·</span>
+    <span onClick="{{ setDark }}" style="color:{{ darkCol }};cursor:pointer;">dark</span>
+    <span style="color:var(--faint);margin:0 6px;">/</span>
+    <span onClick="{{ setLight }}" style="color:{{ lightCol }};cursor:pointer;">light</span>
+  </div>
+
+  <!-- REVIEW SWITCHER (nav aid — real app switches via /commands) -->
+  <div style="flex:0 0 26px;display:flex;align-items:center;gap:2px;padding:0 14px;border-bottom:1px solid var(--line);font-size:12px;">
+    <span style="color:var(--faint);margin-right:8px;">screens</span>
+    <sc-for list="{{ screens }}" as="s" hint-placeholder-count="4">
+      <span onClick="{{ s.go }}" style="color:{{ s.col }};cursor:pointer;padding:1px 10px;border-bottom:2px solid {{ s.bar }};">{{ s.label }}</span>
+    </sc-for>
+  </div>
+
+  <!-- WORKING AREA -->
+  <div class="lc-scroll" style="flex:1;min-height:0;overflow:auto;">
+
+    <!-- ============ MODELS ============ -->
+    <sc-if value="{{ isModels }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;height:100%;min-height:0;">
+        <!-- list -->
+        <div class="lc-scroll" style="flex:0 0 42%;overflow:auto;border-right:1px solid var(--line);padding:14px 16px;">
+          <div style="color:var(--dim);margin-bottom:10px;">results&nbsp;&nbsp;<span style="color:var(--faint);">“{{ query }}” · {{ resultCount }}</span></div>
+          <sc-for list="{{ models }}" as="m" hint-placeholder-count="5">
+            <div onClick="{{ m.pick }}" style="display:flex;gap:10px;padding:6px 0;cursor:pointer;border-bottom:1px solid var(--line);">
+              <span style="color:var(--faint);width:12px;">{{ m.mark }}</span>
+              <div style="flex:1;min-width:0;">
+                <div style="color:{{ m.col }};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ m.id }}</div>
+                <div style="color:var(--dim);font-size:12px;">{{ m.dl }} dl · {{ m.likes }} likes{{ m.gguf }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        <!-- detail -->
+        <div class="lc-scroll" style="flex:1;min-width:0;overflow:auto;padding:14px 18px;">
+          <div style="color:var(--em);font-size:15px;">{{ detail.id }}</div>
+          <div style="color:var(--dim);margin:4px 0 12px;">{{ detail.dl }} downloads · {{ detail.likes }} likes · {{ detail.lic }} · {{ detail.params }} · {{ detail.pipeline }}</div>
+          <div style="color:var(--fg);line-height:1.65;max-width:460px;">{{ detail.desc }}</div>
+
+          <div style="color:var(--dim);margin:16px 0 6px;">quantizations&nbsp;&nbsp;<span style="color:var(--faint);">click to select</span></div>
+          <sc-for list="{{ quants }}" as="q" hint-placeholder-count="4">
+            <div onClick="{{ q.pick }}" style="display:flex;align-items:center;gap:12px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--line);">
+              <span style="color:var(--faint);width:12px;">{{ q.mark }}</span>
+              <span style="color:{{ q.col }};width:88px;">{{ q.label }}</span>
+              <span style="color:var(--dim);width:78px;">{{ q.size }}</span>
+              <span class="bar" style="width:90px;"><i style="width:{{ q.fitPct }};"></i></span>
+              <span style="color:var(--dim);font-size:12px;">{{ q.fitLabel }}</span>
+            </div>
+          </sc-for>
+
+          <div style="display:flex;align-items:center;gap:22px;margin-top:16px;white-space:nowrap;">
+            <span style="color:var(--dim);">backend <span onClick="{{ cycleBackend }}" style="color:var(--em);cursor:pointer;">{{ backend }} ⟳</span></span>
+            <span style="color:var(--dim);">context <span style="color:var(--fg);">32768</span></span>
+          </div>
+          <div style="margin-top:10px;color:var(--dim);">vram fit&nbsp;&nbsp;<span style="color:var(--fg);">est {{ detail.est }} · free 21.1 / 24.0 GiB</span></div>
+          <div class="bar" style="width:220px;margin-top:5px;"><i style="width:{{ detail.estPct }};"></i></div>
+          <div style="margin-top:16px;"><span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:4px 20px;cursor:pointer;">deploy</span></div>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- ============ REMOTE ============ -->
+    <sc-if value="{{ isRemote }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;height:100%;min-height:0;">
+        <!-- server list -->
+        <div style="flex:0 0 30%;border-right:1px solid var(--line);padding:14px 14px;display:flex;flex-direction:column;">
+          <div style="color:var(--dim);margin-bottom:10px;">servers</div>
+          <sc-for list="{{ servers }}" as="s" hint-placeholder-count="2">
+            <div onClick="{{ s.pick }}" style="padding:6px 8px;cursor:pointer;background:{{ s.bg }};">
+              <div style="color:{{ s.col }};">{{ s.name }}</div>
+              <div style="color:var(--dim);font-size:12px;">{{ s.status }} · {{ s.host }}</div>
+            </div>
+          </sc-for>
+          <div style="flex:1;"></div>
+          <div onClick="{{ noop }}" style="color:var(--em);cursor:pointer;padding:6px 8px;">+ new server</div>
+        </div>
+        <!-- form + progress -->
+        <div class="lc-scroll" style="flex:1;min-width:0;overflow:auto;padding:14px 18px;">
+          <div style="color:var(--dim);margin-bottom:10px;">gpu-box — click a field to edit</div>
+          <sc-for list="{{ fields }}" as="fld" hint-placeholder-count="4">
+            <div onClick="{{ fld.pick }}" style="display:flex;gap:14px;padding:5px 0;cursor:text;border-bottom:1px solid var(--line);">
+              <span style="color:var(--dim);width:92px;">{{ fld.label }}</span>
+              <span style="color:{{ fld.col }};">{{ fld.value }}{{ fld.caret }}</span>
+            </div>
+          </sc-for>
+          <div style="display:flex;gap:8px;margin-top:14px;">
+            <span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:3px 16px;cursor:pointer;">connect</span>
+            <span onClick="{{ noop }}" style="border:1px solid var(--faint);color:var(--dim);padding:3px 16px;cursor:pointer;">save</span>
+            <span onClick="{{ noop }}" style="border:1px solid var(--faint);color:var(--dim);padding:3px 16px;cursor:pointer;">disconnect</span>
+            <span onClick="{{ noop }}" style="border:1px solid var(--faint);color:var(--dim);padding:3px 16px;cursor:pointer;">delete</span>
+          </div>
+
+          <div style="color:var(--dim);margin:18px 0 8px;">connecting…</div>
+          <sc-for list="{{ steps }}" as="st" hint-placeholder-count="4">
+            <div style="display:flex;gap:12px;padding:3px 0;">
+              <span style="color:{{ st.mc }};width:14px;">{{ st.mark }}</span>
+              <span style="color:{{ st.tc }};">{{ st.text }}</span>
+            </div>
+          </sc-for>
+          <div style="color:var(--dim);margin-top:14px;font-size:12px;">⚠ passwords are stored in plaintext in config.toml — prefer key_path.</div>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- ============ BENCH ============ -->
+    <sc-if value="{{ isBench }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px 20px;max-width:820px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <div style="color:var(--dim);">suite&nbsp;&nbsp;<span style="color:var(--fg);">localcode-sample-coding v1.0.0</span>&nbsp;&nbsp;<span style="color:var(--faint);">· 24 tasks · target qwen2.5-coder:7b</span></div>
+          <span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:3px 18px;cursor:pointer;">run</span>
+        </div>
+
+        <div style="color:var(--dim);margin:18px 0 8px;">last run · 2h ago</div>
+        <div style="display:flex;gap:0;border:1px solid var(--line);">
+          <sc-for list="{{ stats }}" as="k" hint-placeholder-count="5">
+            <div style="flex:1;padding:10px 12px;border-right:1px solid var(--line);">
+              <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em;">{{ k.label }}</div>
+              <div style="color:var(--em);font-size:18px;margin:3px 0;">{{ k.value }}</div>
+              <sc-if value="{{ k.hasBar }}" hint-placeholder-val="{{ false }}"><div class="bar" style="width:100%;"><i style="width:{{ k.pct }};"></i></div></sc-if>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="color:var(--dim);margin:18px 0 6px;">tasks</div>
+        <sc-for list="{{ tasks }}" as="t" hint-placeholder-count="5">
+          <div style="display:flex;gap:12px;padding:4px 0;border-bottom:1px solid var(--line);">
+            <span style="color:var(--fg);flex:1;">{{ t.name }}</span>
+            <span style="color:{{ t.rc }};width:60px;">{{ t.result }}</span>
+            <span style="color:var(--dim);width:80px;text-align:right;">{{ t.latency }}</span>
+          </div>
+        </sc-for>
+
+        <div style="color:var(--dim);margin:18px 0 6px;">recent runs</div>
+        <sc-for list="{{ history }}" as="h" hint-placeholder-count="4">
+          <div style="display:flex;align-items:center;gap:12px;padding:3px 0;">
+            <span style="color:var(--dim);width:74px;">{{ h.when }}</span>
+            <span style="color:var(--fg);width:44px;">{{ h.score }}</span>
+            <span class="bar" style="width:200px;"><i style="width:{{ h.pct }};"></i></span>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <!-- ============ SETUP ============ -->
+    <sc-if value="{{ isSetup }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px 20px;max-width:760px;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="color:var(--dim);">get started</span>
+          <span class="bar" style="width:120px;"><i style="width:50%;"></i></span>
+          <span style="color:var(--faint);">3 of 6</span>
+        </div>
+        <div style="margin-top:14px;">
+          <sc-for list="{{ setup }}" as="s" hint-placeholder-count="6">
+            <div style="display:flex;gap:12px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line);">
+              <span style="color:{{ s.mc }};width:26px;">{{ s.mark }}</span>
+              <div style="flex:1;">
+                <div style="color:{{ s.tc }};">{{ s.title }}</div>
+                <div style="color:var(--dim);font-size:12px;">{{ s.desc }}</div>
+              </div>
+              <span onClick="{{ noop }}" style="border:1px solid {{ s.bc }};color:{{ s.ac }};padding:1px 12px;cursor:pointer;">{{ s.cta }}</span>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:18px;">
+          <span style="color:var(--dim);">doctor</span>
+          <span onClick="{{ noop }}" style="border:1px solid var(--em);color:var(--em);padding:3px 16px;cursor:pointer;">run doctor</span>
+        </div>
+        <div style="color:var(--dim);line-height:1.9;margin-top:8px;">
+          nvidia-smi&nbsp;&nbsp;<span style="color:var(--fg);">ok</span> — 1 gpu, driver 550.90<br>
+          ollama&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">ok</span> — serving on :11434<br>
+          hf&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">reachable</span> — endpoint huggingface.co<br>
+          disk&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--fg);">84% used</span> — 61 GiB free
+        </div>
+        <div style="color:var(--faint);margin-top:12px;font-size:12px;">config ~/.config/localcode/config.toml — Ctrl+S to save</div>
+      </div>
+    </sc-if>
+
+  </div>
+
+  <!-- OMNIBAR -->
+  <div style="flex:0 0 auto;border-top:1px solid var(--line);padding:9px 14px;display:flex;align-items:center;gap:10px;">
+    <span style="border:1px solid var(--line);color:var(--dim);padding:1px 8px;">{{ screen }}</span>
+    <span style="color:var(--dim);">❯</span>
+    <span style="flex:1;color:var(--dim);">{{ placeholder }}</span>
+    <span style="color:var(--faint);font-size:12px;">{{ hint }}</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1000,&quot;height&quot;:660}}">
+const FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+const THEMES = {
+  dark:  { bg:"#0d0d0f", fg:"#d7d7da", dim:"#6c6c72", faint:"#3c3c42", line:"#222226", em:"#f3f3f5", work:"#cfcfd4", sel:"rgba(255,255,255,.14)" },
+  light: { bg:"#f4f4f3", fg:"#2b2b2d", dim:"#86868a", faint:"#bcbcbc", line:"#e0e0dd", em:"#0f0f11", work:"#3a3a3e", sel:"rgba(0,0,0,.10)" },
+};
+class Component extends DCLogic {
+  state = { theme:"dark", screen:"models", modelSel:0, quantSel:1, backendIdx:0, remoteSel:0, field:0, frame:0 };
+  componentDidMount(){ this.t = setInterval(()=> this.setState(s=>({frame:(s.frame+1)%FRAMES.length})), 90); }
+  componentWillUnmount(){ clearInterval(this.t); }
+
+  renderVals(){
+    const c = THEMES[this.state.theme];
+    const sc = this.state.screen;
+    const screenDef = [["models","models"],["remote","remote"],["bench","bench"],["setup","setup"]];
+    const screens = screenDef.map(([id,label])=>({ label, go:()=>this.setState({screen:id}), col: id===sc?"var(--em)":"var(--dim)", bar: id===sc?"var(--em)":"transparent" }));
+
+    // models
+    const md = [
+      {id:"Qwen/Qwen2.5-Coder-7B-Instruct", dl:"1.2M", likes:"3.4k", gguf:" · gguf", lic:"apache-2.0", params:"7.6B", pipeline:"text-generation", desc:"Code-specialized causal LM tuned for fill-in-the-middle and instruction following across 40+ programming languages. Recommended context 32k, extendable to 128k with YaRN.", est:"5.9 GiB", estPct:"25%"},
+      {id:"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", dl:"890k", likes:"2.1k", gguf:" · gguf", lic:"apache-2.0", params:"7.6B", pipeline:"text-generation", desc:"Prebuilt GGUF quants of Qwen2.5-Coder-7B — deploys through Ollama in one step as hf.co/{org}/{repo}:{quant}.", est:"5.1 GiB", estPct:"21%"},
+      {id:"deepseek-ai/deepseek-coder-6.7b-instruct", dl:"640k", likes:"1.8k", gguf:"", lic:"deepseek", params:"6.7B", pipeline:"text-generation", desc:"DeepSeek's 6.7B instruct coder, strong on repository-level completion.", est:"5.4 GiB", estPct:"22%"},
+      {id:"bartowski/Qwen2.5-Coder-14B-Instruct-GGUF", dl:"410k", likes:"980", gguf:" · gguf", lic:"apache-2.0", params:"14B", pipeline:"text-generation", desc:"14B GGUF build for machines with more VRAM headroom.", est:"9.8 GiB", estPct:"41%"},
+      {id:"codellama/CodeLlama-7b-Instruct-hf", dl:"2.0M", likes:"5.2k", gguf:"", lic:"llama2", params:"6.7B", pipeline:"text-generation", desc:"Meta's Code Llama 7B instruct, broad language coverage.", est:"5.5 GiB", estPct:"23%"},
+    ];
+    const models = md.map((m,i)=>({ ...m, mark: i===this.state.modelSel?"›":" ", col: i===this.state.modelSel?"var(--em)":"var(--fg)", pick:()=>this.setState({modelSel:i}) }));
+    const detail = md[this.state.modelSel];
+    const qd = [["Q4_K_M","4.37 GiB","18%","fits"],["Q5_K_M","5.13 GiB","21%","fits"],["Q6_K","6.25 GiB","26%","fits"],["Q8_0","8.10 GiB","34%","fits"]];
+    const quants = qd.map(([label,size,fitPct,fitLabel],i)=>({ label, size, fitPct, fitLabel, mark: i===this.state.quantSel?"›":" ", col: i===this.state.quantSel?"var(--em)":"var(--fg)", pick:()=>this.setState({quantSel:i}) }));
+    const backends = ["ollama","llama.cpp","vLLM","SGLang"];
+
+    // remote
+    const svd = [["gpu-box","connected","10.8.0.2"],["workstation","offline","192.168.1.20"]];
+    const servers = svd.map(([name,status,host],i)=>({ name, status, host, col: i===this.state.remoteSel?"var(--em)":"var(--fg)", bg: i===this.state.remoteSel?"var(--line)":"transparent", pick:()=>this.setState({remoteSel:i}) }));
+    const fvals = [["host","10.8.0.2"],["username","ubuntu"],["password","••••••••••"],["port","22"]];
+    const fields = fvals.map(([label,value],i)=>({ label, value, col: i===this.state.field?"var(--em)":"var(--fg)", caret: i===this.state.field?"▌":"", pick:()=>this.setState({field:i}) }));
+    const steps = [
+      {mark:"ok", mc:"var(--fg)", text:"reach host 10.8.0.2:22", tc:"var(--dim)"},
+      {mark:"ok", mc:"var(--fg)", text:"detect GPU (nvidia-smi) — RTX 3090", tc:"var(--dim)"},
+      {mark:FRAMES[this.state.frame], mc:"var(--work)", text:"install & start ollama", tc:"var(--fg)"},
+      {mark:"·", mc:"var(--faint)", text:"open tunnel localhost:11434", tc:"var(--faint)"},
+    ];
+
+    // bench
+    const stats = [
+      {label:"score", value:"0.82", hasBar:true, pct:"82%"},
+      {label:"pass", value:"90%", hasBar:true, pct:"90%"},
+      {label:"p50", value:"240ms", hasBar:false, pct:"0%"},
+      {label:"p95", value:"610ms", hasBar:false, pct:"0%"},
+      {label:"tok/s", value:"47", hasBar:false, pct:"0%"},
+    ];
+    const tk = [["fizzbuzz.rs","pass","180 ms"],["binary-search","pass","210 ms"],["json-parse","pass","240 ms"],["async-refactor","fail","—"],["sql-migration","pass","390 ms"]];
+    const tasks = tk.map(([name,result,latency])=>({ name, result, latency, rc: result==="pass"?"var(--fg)":"var(--em)" }));
+    const hd = [["2h ago","0.82","82%"],["1d ago","0.79","79%"],["3d ago","0.81","81%"],["5d ago","0.74","74%"]];
+    const history = hd.map(([when,score,pct])=>({ when, score, pct }));
+
+    // setup
+    const stp = [
+      {done:true,  title:"GPU detected", desc:"RTX 4090 · 24 GiB", cta:"recheck"},
+      {done:true,  title:"Backend installed", desc:"ollama ready · default", cta:"manage"},
+      {done:true,  title:"Deploy a model", desc:"qwen2.5-coder:7b · healthy", cta:"open"},
+      {done:false, title:"Connect a remote GPU (optional)", desc:"run models on a GPU box over SSH", cta:"add"},
+      {done:false, title:"Configure the assistant", desc:"OPENROUTER_API_KEY for the Ask helper", cta:"set"},
+      {done:false, title:"Updates", desc:"checked on startup: on", cta:"settings"},
+    ];
+    const setup = stp.map(s=>({ ...s, mark: s.done?"[x]":"[ ]", mc: s.done?"var(--fg)":"var(--faint)", tc: s.done?"var(--dim)":"var(--fg)", bc: s.done?"var(--faint)":"var(--em)", ac: s.done?"var(--dim)":"var(--em)" }));
+
+    const placeholders = { models:"search HuggingFace models — type to filter, Enter to run", remote:"/remote add <name> <host> <user> <password>", bench:"Enter runs the suite on the active runtime", setup:"type / for commands" };
+    return {
+      c, activity: FRAMES[this.state.frame], screens, screen: sc,
+      isModels: sc==="models", isRemote: sc==="remote", isBench: sc==="bench", isSetup: sc==="setup",
+      query:"qwen coder", resultCount: md.length, models, detail, quants,
+      backend: backends[this.state.backendIdx], cycleBackend:()=>this.setState(s=>({backendIdx:(s.backendIdx+1)%4})),
+      servers, fields, steps, stats, tasks, history, setup,
+      placeholder: placeholders[sc]||"type / for commands",
+      hint: sc==="models" ? "search" : "/ commands",
+      darkCol: this.state.theme==="dark"?"var(--em)":"var(--dim)",
+      lightCol: this.state.theme==="light"?"var(--em)":"var(--dim)",
+      setDark:()=>this.setState({theme:"dark"}), setLight:()=>this.setState({theme:"light"}),
+      noop:()=>{},
+    };
+  }
+}
+</script>
+</body>
+</html>
