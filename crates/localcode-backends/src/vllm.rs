@@ -1,5 +1,5 @@
 use crate::{
-    port_in_use, probe_client, spawn_io_drain, BackendKind, DetectReport, Health,
+    port_in_use, probe_client, spawn_io_capture, BackendKind, DetectReport, Health,
     InferenceBackend, ModelDeploySpec, RunningEndpoint,
 };
 use async_trait::async_trait;
@@ -101,15 +101,9 @@ impl InferenceBackend for VllmBackend {
             message: "Starting vLLM (model download may take a while)".into(),
         });
 
+        let args = serve_args(&model, &self.cfg.host, port, spec.context_length);
         let mut child = tokio::process::Command::new(&self.cfg.bin)
-            .args([
-                "serve",
-                &model,
-                "--host",
-                &self.cfg.host,
-                "--port",
-                &port.to_string(),
-            ])
+            .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -122,20 +116,43 @@ impl InferenceBackend for VllmBackend {
                     .with_hint("Check CUDA version compatibility")
                     .retryable(true)
             })?;
-        spawn_io_drain("vllm".into(), &mut child);
+        // Keep the tail of vLLM's own output so a failure below can explain
+        // itself instead of surfacing a bare exit code.
+        let logs = spawn_io_capture("vllm".into(), &mut child, 50);
+        let tail = |n: usize| -> String {
+            logs.lock()
+                .ok()
+                .map(|b| {
+                    let start = b.len().saturating_sub(n);
+                    b.iter().skip(start).cloned().collect::<Vec<_>>().join("\n")
+                })
+                .unwrap_or_default()
+        };
 
         let base_url = format!("http://{}:{}/v1", self.cfg.host, port);
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(180);
+        // vLLM downloads the model *during* `serve` (unlike llama.cpp, which we
+        // pre-download), then loads weights and compiles CUDA graphs — a cold
+        // start on a large model routinely exceeds a few minutes. A hard crash
+        // still fails fast via `try_wait` below, so a generous ceiling only
+        // affects a server that is genuinely still making progress.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1800);
         let mut last_progress = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() > deadline {
                 let _ = child.kill().await;
-                return Err(LocalCodeError::new(
+                let mut err = LocalCodeError::new(
                     ErrorCode::BackendHealthTimeout,
                     "vLLM did not become healthy in time",
                 )
                 .with_correlation(cid)
-                .retryable(true));
+                .with_hint("First-run model downloads can be large — re-running resumes them")
+                .with_hint("If the GPU is out of memory, lower the context with /context")
+                .retryable(true);
+                let t = tail(6);
+                if !t.trim().is_empty() {
+                    err = err.with_cause(format!("last vLLM output:\n{t}"));
+                }
+                return Err(err);
             }
             if let Ok(h) = self.health(&base_url).await {
                 if h.healthy {
@@ -143,18 +160,34 @@ impl InferenceBackend for VllmBackend {
                 }
             }
             if let Ok(Some(st)) = child.try_wait() {
-                return Err(LocalCodeError::new(
+                let mut err = LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
                     format!("vLLM exited: {st}"),
                 )
-                .with_correlation(cid));
+                .with_correlation(cid)
+                .with_cause("vLLM stopped before serving the model")
+                .with_hint("GGUF-only repos aren't served by vLLM — pick a full (safetensors) model")
+                .with_hint("A too-large context or low VRAM can OOM at startup — try /context");
+                let t = tail(10);
+                if !t.trim().is_empty() {
+                    err = err.with_cause(format!("vLLM output:\n{t}"));
+                }
+                return Err(err);
             }
             if last_progress.elapsed() > tokio::time::Duration::from_secs(10) {
                 last_progress = tokio::time::Instant::now();
+                // Show vLLM's own latest line so a long download/load reads as
+                // progress rather than a hang.
+                let latest = tail(1);
+                let message = if latest.trim().is_empty() {
+                    "Waiting for vLLM to become healthy…".to_string()
+                } else {
+                    format!("vLLM: {}", latest.trim())
+                };
                 events.publish(AppEvent::DeployProgress {
                     job_id: spec.job_id.clone(),
                     percent: 60,
-                    message: "Waiting for vLLM to become healthy…".into(),
+                    message,
                 });
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -203,5 +236,48 @@ impl InferenceBackend for VllmBackend {
                 message: e.to_string(),
             }),
         }
+    }
+}
+
+/// Build the `vllm serve …` argument list.
+///
+/// `--max-model-len` is the load-bearing part: without it vLLM sizes the KV
+/// cache for the model's full native context (often 128k) and OOMs at startup
+/// on a single consumer GPU. We bound it to the context the user picked — the
+/// same value llama.cpp receives via `-c`. A zero context (unset) is skipped so
+/// vLLM keeps its own default.
+fn serve_args(model: &str, host: &str, port: u16, context_length: u32) -> Vec<String> {
+    let mut args = vec![
+        "serve".into(),
+        model.to_string(),
+        "--host".into(),
+        host.to_string(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    if context_length > 0 {
+        args.push("--max-model-len".into());
+        args.push(context_length.to_string());
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_args_bound_kv_cache_to_context() {
+        let args = serve_args("org/model", "127.0.0.1", 8000, 8192);
+        assert_eq!(&args[..2], &["serve", "org/model"]);
+        // The KV-cache bound that keeps vLLM from OOMing on a 128k default.
+        let i = args.iter().position(|a| a == "--max-model-len").expect("flag present");
+        assert_eq!(args[i + 1], "8192");
+    }
+
+    #[test]
+    fn serve_args_omit_context_when_zero() {
+        let args = serve_args("org/model", "127.0.0.1", 8000, 0);
+        assert!(!args.iter().any(|a| a == "--max-model-len"));
     }
 }

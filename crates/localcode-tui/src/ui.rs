@@ -222,6 +222,19 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     left.push(sep(&th));
     left.push(Span::styled("ctx ", theme::muted(&th)));
     left.push(Span::styled(human_ctx(app.deploy_ctx), fg(&th)));
+    // Transient status / feedback (set_status, raise_error). The redesign
+    // dropped its dedicated row, orphaning `status_line` — so `/logs`, deploy
+    // progress, "unknown command", etc. set text that nothing drew. Render it
+    // here; the right cluster is drawn afterwards and clips a long message.
+    if !app.status_line.is_empty() {
+        left.push(sep(&th));
+        let style = if app.status_is_error {
+            fg(&th).add_modifier(Modifier::BOLD)
+        } else {
+            theme::muted(&th)
+        };
+        left.push(Span::styled(app.status_line.clone(), style));
+    }
     f.render_widget(Paragraph::new(Line::from(left)), inner);
 
     // Right cluster: version/update · dark / light.

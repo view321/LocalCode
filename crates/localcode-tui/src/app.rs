@@ -418,7 +418,9 @@ impl App {
             paths,
             mode: Mode::Chat,
             click_regions: vec![],
-            status_line: "Type to chat with the agent · press / for commands".into(),
+            // Empty at rest: the omnibar placeholder already invites input, and
+            // the status bar now appends this after the model/ctx cluster.
+            status_line: String::new(),
             status_is_error: false,
             last_error: None,
             last_failed_action: None,
@@ -2119,7 +2121,7 @@ impl App {
                     self.cycle_deploy_backend();
                 }
             }
-            "logs" => self.set_status(format!("Logs: {}", self.paths.log_dir.display()), false),
+            "logs" => self.open_logs(),
             "help" => self.open_help(),
             "quit" | "exit" | "q" => self.request_quit(),
             "" => {}
@@ -2147,6 +2149,44 @@ impl App {
     // ------------------------------------------------------------------
     // Help / quit
     // ------------------------------------------------------------------
+
+    /// `/logs` — show where logs live plus a readable tail, inline (the
+    /// redesign renders info as a banner, not a popup). Structured JSON lines
+    /// are compacted to `HH:MM:SS LEVEL message` so the banner is skimmable.
+    fn open_logs(&mut self) {
+        fn compact(line: &str) -> String {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                return line.to_string();
+            };
+            let time = v
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(|ts| ts.split('T').nth(1))
+                .map(|s| s.split('.').next().unwrap_or(s))
+                .unwrap_or("");
+            let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("");
+            match v
+                .get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                Some(m) => format!("{time} {level:<5} {m}").trim().to_string(),
+                None => line.to_string(),
+            }
+        }
+
+        let dir = self.paths.log_dir.display().to_string();
+        let redact = self.config.logging.redact_secrets;
+        let tail = localcode_log::read_recent_logs(&self.paths.log_dir, 8, None, redact)
+            .ok()
+            .map(|s| s.lines().map(compact).collect::<Vec<_>>().join("\n"))
+            .filter(|s| !s.trim().is_empty());
+        let body = match tail {
+            Some(t) => format!("{dir}\n\n{t}"),
+            None => format!("{dir}\n\n(no log entries yet)"),
+        };
+        self.modal = Some(ModalState::info("Logs", body));
+    }
 
     fn open_help(&mut self) {
         let body = "\
@@ -3031,5 +3071,57 @@ mod tests {
         // A tiny terminal must not panic either.
         let mut tiny = Terminal::new(TestBackend::new(30, 8)).unwrap();
         tiny.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
+
+    /// Full frame flattened to text, for asserting what actually reaches screen.
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn status_line_message_is_rendered() {
+        // Regression: the "Complete redesign" orphaned `status_line` — set_status
+        // wrote text that nothing drew, so `/logs`, errors and deploy progress
+        // showed nothing. The status bar must render it.
+        let mut app = test_app();
+        app.set_status("hello-status-xyz", false);
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(
+            screen.contains("hello-status-xyz"),
+            "status_line must be drawn in the status bar"
+        );
+    }
+
+    #[test]
+    fn logs_command_opens_inline_banner_with_path() {
+        let mut app = test_app();
+        typ(&mut app, "/logs");
+        app.handle_key(key(KeyCode::Enter));
+        let modal = app
+            .modal
+            .as_ref()
+            .expect("/logs must open an inline banner");
+        match &modal.kind {
+            crate::widgets::ModalKind::Info { title, body } => {
+                assert_eq!(title, "Logs");
+                assert!(
+                    body.contains(&app.paths.log_dir.display().to_string()),
+                    "banner shows the log directory path"
+                );
+            }
+            _ => panic!("expected an Info banner"),
+        }
+        assert!(render_to_string(&mut app, 120, 40).contains("Logs"));
     }
 }
