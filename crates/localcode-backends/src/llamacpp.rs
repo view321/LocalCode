@@ -144,6 +144,12 @@ impl InferenceBackend for LlamaCppBackend {
             args.push("--n-gpu-layers".into());
             args.push(ngl.to_string());
         }
+        // Model-card / assistant recommended flags (already validated as tokens).
+        for a in &spec.tuning.extra_args {
+            if !a.is_empty() {
+                args.push(a.clone());
+            }
+        }
         let mut child = tokio::process::Command::new(&bin)
             .args(&args)
             .kill_on_drop(true)

@@ -59,7 +59,14 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
         },
         "assistant": {
             "provider": cfg.assistant.provider,
-            "configured": cfg.assistant_api_key().is_some() || cfg.assistant.provider == "self_hosted",
+            "local_preference": format!("{:?}", cfg.assistant.local_preference),
+            "local_ready": localcode_assistant::is_installed(cfg, paths),
+            "configured": cfg.assistant_api_key().is_some()
+                || matches!(
+                    cfg.assistant.provider.as_str(),
+                    "self_hosted" | "openai_compatible" | "custom" | "local"
+                )
+                || localcode_assistant::is_installed(cfg, paths),
         },
         "disk": disk,
         "keyring": { "preferred": true, "note": "OS keyring preferred; env vars used as fallback" },

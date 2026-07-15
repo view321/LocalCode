@@ -161,6 +161,11 @@ impl InferenceBackend for SglangBackend {
             args.push("--tp-size".into());
             args.push(tp.to_string());
         }
+        for a in &spec.tuning.extra_args {
+            if !a.is_empty() {
+                args.push(a.clone());
+            }
+        }
         let mut child = tokio::process::Command::new(py)
             .args(&args)
             .kill_on_drop(true)

@@ -1,12 +1,12 @@
 //! View rendering.
 //!
-//! Three chrome-light zones (redesign spec §2): a one-line **status bar**, a
-//! single scrollable **working area**, and a bordered multi-line **omnibar**
-//! anchored at the bottom. No popups or overlays — every former panel renders
-//! inline in the working area, and confirms/errors are inline banners. The
-//! command palette ('/') and the file picker ('@') dock directly above the
-//! omnibar, where the eye already is. The only animated glyph is the braille
-//! spinner, shown only while busy.
+//! Three chrome-light zones (redesign spec §2): a bordered **status dashboard**
+//! (rounded frame, matching the omnibar), a single scrollable **working area**,
+//! and a bordered multi-line **omnibar** anchored at the bottom. No popups or
+//! overlays — every former panel renders inline in the working area, and
+//! confirms/errors are inline banners. The command palette ('/') and the file
+//! picker ('@') dock directly above the omnibar, where the eye already is. The
+//! only animated glyph is the braille spinner, shown only while busy.
 
 use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode, SettingAction, SettingsRowKind};
 use crate::markdown;
@@ -154,9 +154,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // The omnibar is a bordered multi-line composer: at least two text rows
     // (so it always reads as *the* input box), growing with the input up to
     // ui.composer_rows. The '/' command palette and the '@' file picker dock
-    // directly above it.
+    // directly above it. The status dashboard is a matching bordered frame
+    // (3 rows: top border · metrics · bottom border).
     let cap = app.config.ui.composer_rows.clamp(1, 10).max(2);
-    let max_by_area = area.height.saturating_sub(7).max(1);
+    let max_by_area = area.height.saturating_sub(8).max(1);
     let composer_h = (app.coding_input.split('\n').count().max(1) as u16)
         .max(2)
         .min(cap)
@@ -170,15 +171,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let band_rows = band_rows.min(area.height.saturating_sub(composer_h + 5));
+    let band_rows = band_rows.min(area.height.saturating_sub(composer_h + 6));
 
-    // Status (1) · rule (1) · working area (min) · picker band · omnibar
-    // (composer + top/bottom border).
+    // Status frame (3) · working area (min) · picker band · omnibar
+    // (composer + top/bottom border). The status frame's bottom border replaces
+    // the old thin rule under a single-line status bar.
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(band_rows),
             Constraint::Length(composer_h + 2),
@@ -186,18 +187,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(area);
 
     draw_status_bar(f, main[0], app);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_type(BorderType::Plain)
-            .border_style(theme::border(&app.theme)),
-        main[1],
-    );
-    draw_working_area(f, main[2], app);
-    if main[3].height > 0 {
-        draw_picker_band(f, main[3], app);
+    draw_working_area(f, main[1], app);
+    if main[2].height > 0 {
+        draw_picker_band(f, main[2], app);
     }
-    draw_omnibar(f, main[4], app);
+    draw_omnibar(f, main[3], app);
 }
 
 /// The working area: an inline banner (if any) at the top, otherwise the
@@ -239,14 +233,34 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Status bar (§5)
+// Status dashboard (§5) — bordered frame matching the omnibar
 // ---------------------------------------------------------------------------
 
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
-    let inner = pad(area);
 
-    // Left cluster: select-mode chip · spinner · model · vram · ctx.
+    // Full rounded pseudographic frame in the accent colour — same treatment as
+    // the omnibar so the live metrics read as a fixed chrome dashboard, not a
+    // free-floating text row.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent(&th))
+        .title(Span::styled(" status ", theme::muted(&th)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height == 0 {
+        return;
+    }
+    // One-cell inset so content doesn't sit hard against the left border glyph.
+    let row = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(1),
+        height: 1,
+    };
+
+    // Left cluster: select-mode chip · spinner · model · vram · temp · ctx.
     let mut left: Vec<Span> = Vec::new();
     if !app.mouse_capture {
         // The mouse is released for terminal-native copy; F2 is the way back.
@@ -276,14 +290,34 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         ));
         left.push(Span::raw(" "));
         left.extend(meter(&th, used as f64 / total.max(1) as f64, 6));
+        if let Some(temp) = app.gpu.max_temperature_c() {
+            left.push(sep(&th));
+            left.push(Span::styled("temp ", theme::muted(&th)));
+            left.push(Span::styled(format!("{temp}°C"), fg(&th)));
+        }
+        if let Some(util) = app.gpu.avg_utilization_pct() {
+            left.push(sep(&th));
+            left.push(Span::styled("gpu ", theme::muted(&th)));
+            left.push(Span::styled(format!("{util}%"), fg(&th)));
+        }
     }
+    // Context: used/max with a meter. Used is estimated from the session
+    // (chars÷4); max is the deploy context window. Previously only the max was
+    // shown, so the meter never moved and "ctx" looked broken mid-session.
+    let ctx_max = app.deploy_ctx.max(1);
+    let ctx_used = app.ctx_used_tokens.min(ctx_max.saturating_mul(2));
     left.push(sep(&th));
     left.push(Span::styled("ctx ", theme::muted(&th)));
-    left.push(Span::styled(human_ctx(app.deploy_ctx), fg(&th)));
+    left.push(Span::styled(
+        format!("{}/{}", human_ctx(ctx_used), human_ctx(ctx_max)),
+        fg(&th),
+    ));
+    left.push(Span::raw(" "));
+    left.extend(meter(&th, ctx_used as f64 / ctx_max as f64, 6));
     // Agent approval mode — always visible (it decides what runs unprompted),
     // clickable to cycle. The region is registered after the width is known.
     left.push(sep(&th));
-    let approval_x = inner.x + spans_width(&left);
+    let approval_x = row.x + spans_width(&left);
     let approval_label = "approvals ";
     let approval_tag = app.config.agent.approval().tag();
     left.push(Span::styled(approval_label, theme::muted(&th)));
@@ -292,7 +326,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         app,
         Rect {
             x: approval_x,
-            y: inner.y,
+            y: row.y,
             width: (approval_label.width() + approval_tag.width()) as u16,
             height: 1,
         },
@@ -311,7 +345,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         };
         left.push(Span::styled(app.status_line.clone(), style));
     }
-    f.render_widget(Paragraph::new(Line::from(left)), inner);
+    f.render_widget(Paragraph::new(Line::from(left)), row);
 
     // Right cluster: version/update · theme swatches. Each theme is a dot in
     // its own accent colour (the active one is ◉); hovering a dot reveals its
@@ -333,12 +367,12 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let ver_w = ver_text.width() as u16;
     let dots_w = (ThemeMode::SWITCHER.len() as u16) * 2; // "◉ " per theme
     let rw = label_slot + ver_w + 3 + dots_w;
-    if inner.width > rw + 8 {
-        let rx = inner.x + inner.width - rw;
+    if row.width > rw + 8 {
+        let rx = row.x + row.width - rw;
         let dots_x = rx + label_slot + ver_w + 3;
         // Which dot is the mouse over (if any)?
         let hovered: Option<ThemeMode> = app.hover.and_then(|(hc, hr)| {
-            if hr != inner.y {
+            if hr != row.y {
                 return None;
             }
             ThemeMode::SWITCHER
@@ -369,19 +403,19 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         }
         f.render_widget(
             Paragraph::new(Line::from(right)),
-            Rect { x: rx, y: inner.y, width: rw, height: 1 },
+            Rect { x: rx, y: row.y, width: rw, height: 1 },
         );
         // Click regions: version badge, then one per swatch dot.
         if is_update {
             click(
                 app,
-                Rect { x: rx + label_slot, y: inner.y, width: ver_w, height: 1 },
+                Rect { x: rx + label_slot, y: row.y, width: ver_w, height: 1 },
                 ClickTarget::UpdateBadge,
             );
         }
         for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
             let x = dots_x + (i as u16) * 2;
-            click(app, Rect { x, y: inner.y, width: 2, height: 1 }, ClickTarget::Theme(*m));
+            click(app, Rect { x, y: row.y, width: 2, height: 1 }, ClickTarget::Theme(*m));
         }
     }
 }
@@ -632,28 +666,57 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .is_some_and(|b| b.kind == crate::app::BusyKind::Coding);
 
+    // Each logical line is tagged with the transcript entry that produced it
+    // so we can register per-entry click regions after scroll is applied.
     let mut lines: Vec<Line> = Vec::new();
+    let mut line_entry: Vec<Option<usize>> = Vec::new();
+
     for (idx, e) in app.coding_transcript.iter().enumerate() {
         if e.kind == EntryKind::You && idx > 0 {
             lines.push(Line::from(""));
+            line_entry.push(None);
         }
-        let (prefix, style) = match e.kind {
-            EntryKind::You => ("❯ ", theme::accent(&th).add_modifier(Modifier::BOLD)),
-            EntryKind::Agent => ("", fg(&th)),
-            EntryKind::Tool => ("", theme::muted(&th)),
-            EntryKind::System => ("· ", theme::muted(&th)),
-            EntryKind::Error => ("", fg(&th).add_modifier(Modifier::BOLD)),
+
+        let body_style = match e.kind {
+            EntryKind::You => theme::accent(&th).add_modifier(Modifier::BOLD),
+            EntryKind::Agent => fg(&th),
+            EntryKind::Thinking => theme::faint(&th).add_modifier(Modifier::ITALIC),
+            EntryKind::Tool => theme::muted(&th),
+            EntryKind::System => theme::muted(&th),
+            EntryKind::Error => fg(&th).add_modifier(Modifier::BOLD),
         };
-        let part_count = e.text.split('\n').count();
-        let mut first = true;
-        for (pi, part) in e.text.split('\n').enumerate() {
+        let header_style = match e.kind {
+            EntryKind::Thinking => theme::muted(&th).add_modifier(Modifier::ITALIC),
+            EntryKind::Tool => theme::muted(&th),
+            _ => body_style,
+        };
+
+        // Build the visible text for this entry (collapsed header vs full body).
+        let display = chat_entry_display(e);
+        let mut parts: Vec<&str> = display.lines().collect();
+        if parts.is_empty() {
+            parts.push("");
+        }
+        let part_count = parts.len();
+        let prefix = match e.kind {
+            EntryKind::You => "❯ ",
+            EntryKind::System => "· ",
+            _ => "",
+        };
+
+        for (pi, part) in parts.iter().enumerate() {
+            let style = if pi == 0 { header_style } else { body_style };
             let mut spans: Vec<Span> = Vec::new();
-            if first && !prefix.is_empty() {
+            if pi == 0 && !prefix.is_empty() {
                 spans.push(Span::styled(prefix.to_string(), style));
-            } else if !first && !prefix.is_empty() {
+            } else if pi > 0 && !prefix.is_empty() {
                 spans.push(Span::raw(" ".repeat(prefix.width())));
             }
-            spans.push(Span::styled(part.to_string(), style));
+            // Indent multi-line thinking / tool detail under the header.
+            if pi > 0 && matches!(e.kind, EntryKind::Thinking | EntryKind::Tool) {
+                spans.push(Span::styled("  ".to_string(), style));
+            }
+            spans.push(Span::styled((*part).to_string(), style));
             if e.live && agent_running && pi + 1 == part_count {
                 spans.push(Span::styled(" ", style));
                 if let Some(c) = spinner_frame(app) {
@@ -661,11 +724,22 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
             lines.push(Line::from(spans));
-            first = false;
+            // Header + expanded body rows are all clickable for toggleable entries.
+            line_entry.push(if e.can_toggle() { Some(idx) } else { None });
         }
     }
 
-    let total: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner_w)).sum();
+    // Paragraph wraps long lines; mirror that to map screen rows → entries.
+    let mut wrapped_entry: Vec<Option<usize>> = Vec::new();
+    for (line, entry) in lines.iter().zip(line_entry.iter()) {
+        let cells = line.width().max(1);
+        let rows = cells.div_ceil(inner_w).max(1);
+        for _ in 0..rows {
+            wrapped_entry.push(*entry);
+        }
+    }
+
+    let total = wrapped_entry.len();
     app.coding_total_lines = total;
     app.coding_view_height = inner.height;
     let max_scroll = total.saturating_sub(inner.height as usize);
@@ -674,12 +748,78 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         app.coding_scroll.min(max_scroll)
     };
+
+    // One click region per visible screen row that belongs to a toggleable entry.
+    let view_h = inner.height as usize;
+    for row in 0..view_h {
+        let virt = offset + row;
+        if let Some(Some(entry_idx)) = wrapped_entry.get(virt) {
+            click(
+                app,
+                Rect {
+                    x: inner.x,
+                    y: inner.y + row as u16,
+                    width: inner.width,
+                    height: 1,
+                },
+                ClickTarget::TranscriptEntry(*entry_idx),
+            );
+        }
+    }
+
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((offset as u16, 0)),
         inner,
     );
+}
+
+/// Visible text for a transcript entry, respecting expand/collapse.
+fn chat_entry_display(e: &crate::app::TranscriptEntry) -> String {
+    match e.kind {
+        crate::app::EntryKind::Thinking => {
+            let n = e.text.chars().count();
+            let show_full = e.live || e.expanded;
+            if show_full {
+                let chev = if e.live {
+                    ""
+                } else if e.can_toggle() {
+                    "  ▾"
+                } else {
+                    ""
+                };
+                if e.text.trim().is_empty() {
+                    format!("thinking…{chev}")
+                } else {
+                    format!("thinking{chev}\n{}", e.text)
+                }
+            } else {
+                format!("thinking  · {n} chars  ▸")
+            }
+        }
+        crate::app::EntryKind::Tool => {
+            // Header chevron is derived from expand state so click and keyboard
+            // toggles stay consistent without rewriting `text`.
+            let mut header = e
+                .text
+                .trim_end_matches(['▾', '▸', ' '])
+                .to_string();
+            if e.detail.as_ref().is_some_and(|d| !d.trim().is_empty()) {
+                header.push_str(if e.expanded { "  ▾" } else { "  ▸" });
+            }
+            if e.expanded {
+                if let Some(detail) = &e.detail {
+                    format!("{header}\n{detail}")
+                } else {
+                    header
+                }
+            } else {
+                header
+            }
+        }
+        _ => e.text.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------

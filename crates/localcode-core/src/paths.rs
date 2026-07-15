@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
     pub models_cache: PathBuf,
     pub workspaces_dir: PathBuf,
+    pub sessions_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -40,6 +41,7 @@ impl AppPaths {
             cache_dir: dirs.cache_dir().to_path_buf(),
             models_cache: dirs.cache_dir().join("models"),
             workspaces_dir: dirs.data_dir().join("workspaces"),
+            sessions_dir: dirs.data_dir().join("sessions"),
         })
     }
 
@@ -51,6 +53,7 @@ impl AppPaths {
             cache_dir: home.join("cache"),
             models_cache: home.join("cache").join("models"),
             workspaces_dir: home.join("data").join("workspaces"),
+            sessions_dir: home.join("data").join("sessions"),
             home,
         }
     }
@@ -59,7 +62,18 @@ impl AppPaths {
         self.config_dir.join("config.toml")
     }
 
+    /// Managed llama.cpp install root (prebuilt `llama-server` lives here).
+    pub fn llamacpp_dir(&self) -> PathBuf {
+        self.data_dir.join("backends").join("llamacpp")
+    }
+
+    /// Bundled local Bonsai assistant weights and state.
+    pub fn assistant_dir(&self) -> PathBuf {
+        self.data_dir.join("assistant")
+    }
+
     pub fn ensure_dirs(&self) -> Result<(), LocalCodeError> {
+        let assistant = self.assistant_dir();
         for dir in [
             &self.config_dir,
             &self.data_dir,
@@ -67,6 +81,8 @@ impl AppPaths {
             &self.cache_dir,
             &self.models_cache,
             &self.workspaces_dir,
+            &self.sessions_dir,
+            &assistant,
         ] {
             std::fs::create_dir_all(dir).map_err(|e| {
                 LocalCodeError::from(e)
@@ -91,5 +107,8 @@ mod tests {
             || paths.config_file().ends_with("config\\config.toml"));
         paths.ensure_dirs().unwrap();
         assert!(paths.log_dir.exists());
+        assert!(paths.sessions_dir.ends_with("data/sessions")
+            || paths.sessions_dir.ends_with("data\\sessions"));
+        assert!(paths.sessions_dir.exists());
     }
 }

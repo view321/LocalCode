@@ -13,6 +13,12 @@ pub struct GpuDevice {
     pub free_vram_bytes: u64,
     pub driver_version: Option<String>,
     pub backend_affinity: Vec<String>,
+    /// Die temperature in °C when reported by the probe (`None` if unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<u32>,
+    /// GPU SM utilization percent 0–100 when reported (`None` if unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization_pct: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +37,21 @@ impl GpuInventory {
         self.devices.iter().map(|d| d.free_vram_bytes).sum()
     }
 
+    /// Hottest reported die temperature across devices, if any.
+    pub fn max_temperature_c(&self) -> Option<u32> {
+        self.devices.iter().filter_map(|d| d.temperature_c).max()
+    }
+
+    /// Mean SM utilization across devices that report it, if any.
+    pub fn avg_utilization_pct(&self) -> Option<u32> {
+        let vals: Vec<u32> = self.devices.iter().filter_map(|d| d.utilization_pct).collect();
+        if vals.is_empty() {
+            None
+        } else {
+            Some(vals.iter().sum::<u32>() / vals.len() as u32)
+        }
+    }
+
     pub fn summary(&self) -> String {
         if self.devices.is_empty() {
             return "No GPU detected".into();
@@ -38,12 +59,19 @@ impl GpuInventory {
         self.devices
             .iter()
             .map(|d| {
-                format!(
+                let mut s = format!(
                     "{} {:.1}/{:.1} GiB free",
                     d.name,
                     d.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                     d.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                )
+                );
+                if let Some(t) = d.temperature_c {
+                    s.push_str(&format!(" · {t}°C"));
+                }
+                if let Some(u) = d.utilization_pct {
+                    s.push_str(&format!(" · {u}%"));
+                }
+                s
             })
             .collect::<Vec<_>>()
             .join(" | ")
@@ -77,10 +105,7 @@ pub fn discover() -> Result<GpuInventory, LocalCodeError> {
 
 fn discover_nvidia_smi() -> Result<GpuInventory, LocalCodeError> {
     let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,memory.total,memory.free,driver_version",
-            "--format=csv,noheader,nounits",
-        ])
+        .args(NVIDIA_SMI_QUERY_ARGS)
         .output()
         .map_err(|e| {
             LocalCodeError::new(ErrorCode::GpuDetectFailed, e.to_string())
@@ -103,10 +128,29 @@ fn discover_nvidia_smi() -> Result<GpuInventory, LocalCodeError> {
 
 /// The exact `nvidia-smi` argument list [`discover`] uses. Exposed so remote
 /// discovery (running nvidia-smi over SSH) produces identically-parseable CSV.
+///
+/// Columns: index, name, memory.total (MiB), memory.free (MiB), driver_version,
+/// temperature.gpu (°C), utilization.gpu (%). Older 4–5-column CSVs still parse
+/// (temp/util become `None`).
 pub const NVIDIA_SMI_QUERY_ARGS: [&str; 2] = [
-    "--query-gpu=index,name,memory.total,memory.free,driver_version",
+    "--query-gpu=index,name,memory.total,memory.free,driver_version,temperature.gpu,utilization.gpu",
     "--format=csv,noheader,nounits",
 ];
+
+/// Parse a numeric nvidia-smi CSV field. Treats `[N/A]`, empty, and non-numeric
+/// values as missing so a probe that can't read a sensor still yields a device.
+fn parse_smi_opt_u32(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("[N/A]") || t.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    // Some drivers append units even with `nounits`; strip trailing non-digits.
+    let digits: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
 
 /// Parse `nvidia-smi --format=csv,noheader,nounits` output (MiB values) into a
 /// [`GpuInventory`]. Shared by local discovery and remote (over-SSH) discovery
@@ -125,7 +169,23 @@ pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventor
         let name = parts[1].to_string();
         let total_mib: u64 = parts[2].parse().unwrap_or(0);
         let free_mib: u64 = parts[3].parse().unwrap_or(0);
-        let driver = parts.get(4).map(|s| s.to_string());
+        // Column 4 is driver_version when present; columns 5/6 are temp / util.
+        // Legacy 4-column CSVs (no driver) leave all of these None.
+        let (driver, temperature_c, utilization_pct) = if parts.len() >= 5 {
+            let driver = {
+                let d = parts[4];
+                if d.is_empty() || d.eq_ignore_ascii_case("[N/A]") {
+                    None
+                } else {
+                    Some(d.to_string())
+                }
+            };
+            let temp = parts.get(5).and_then(|s| parse_smi_opt_u32(s));
+            let util = parts.get(6).and_then(|s| parse_smi_opt_u32(s));
+            (driver, temp, util)
+        } else {
+            (None, None, None)
+        };
         devices.push(GpuDevice {
             index,
             name,
@@ -133,6 +193,8 @@ pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventor
             free_vram_bytes: free_mib * 1024 * 1024,
             driver_version: driver,
             backend_affinity: vec!["cuda".into()],
+            temperature_c,
+            utilization_pct,
         });
     }
 
@@ -302,6 +364,8 @@ mod tests {
                 free_vram_bytes: 4 * 1024 * 1024 * 1024,
                 driver_version: None,
                 backend_affinity: vec!["cuda".into()],
+                temperature_c: Some(62),
+                utilization_pct: Some(40),
             }],
             detection_method: "test".into(),
             warnings: vec![],
@@ -343,7 +407,7 @@ mod tests {
 
     #[test]
     fn parses_nvidia_smi_csv() {
-        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104\n1, NVIDIA A100, 40960, 40000, 535.104\n";
+        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104, 58, 12\n1, NVIDIA A100, 40960, 40000, 535.104, 42, 0\n";
         let inv = parse_nvidia_smi_csv(csv, "nvidia-smi-remote");
         assert_eq!(inv.detection_method, "nvidia-smi-remote");
         assert_eq!(inv.devices.len(), 2);
@@ -351,6 +415,19 @@ mod tests {
         assert_eq!(inv.devices[0].total_vram_bytes, 24576 * 1024 * 1024);
         assert_eq!(inv.devices[1].free_vram_bytes, 40000 * 1024 * 1024);
         assert_eq!(inv.devices[0].driver_version.as_deref(), Some("535.104"));
+        assert_eq!(inv.devices[0].temperature_c, Some(58));
+        assert_eq!(inv.devices[0].utilization_pct, Some(12));
+        assert_eq!(inv.max_temperature_c(), Some(58));
+        assert_eq!(inv.avg_utilization_pct(), Some(6));
+    }
+
+    #[test]
+    fn parses_legacy_csv_without_temp() {
+        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104\n";
+        let inv = parse_nvidia_smi_csv(csv, "legacy");
+        assert_eq!(inv.devices.len(), 1);
+        assert_eq!(inv.devices[0].temperature_c, None);
+        assert_eq!(inv.devices[0].utilization_pct, None);
     }
 
     #[test]

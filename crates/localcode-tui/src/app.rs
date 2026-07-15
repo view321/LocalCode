@@ -21,12 +21,17 @@ use crossterm::terminal::{
 };
 use localcode_agent::{AgentEvent, AgentSession, CodingAgent, Skill, SkillLoader, ToolApprover, ToolRegistry};
 use localcode_api_client::ApiClient;
-use localcode_assistant::{Assistant, AssistantRequest};
+use localcode_assistant::{
+    extract_deploy_hints, install_local_assistant, install_need, install_offer_body, is_installed,
+    quant_compatibility_note, should_offer_install, startup_greeting, Assistant, AssistantContext,
+    ASSISTANT_DISPLAY_NAME, InstallNeed,
+};
 use localcode_backends::{
     can_elevate_noninteractively, diagnose, resolve_install_plan, resolve_repair, run_install,
     run_repair, smoke_test, BackendKind, BackendRegistry, DeployRequest, DeployService, DeployTuning,
     DetectReport, Diagnosis, InstallPlan, RepairPlan, Repoint, SmokeReport, DEFAULT_DEPLOY_CTX,
 };
+use localcode_core::config::LocalAssistantPreference;
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
 use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -99,6 +104,8 @@ impl Mode {
 pub enum EntryKind {
     You,
     Agent,
+    /// Model chain-of-thought / reasoning (streamed; collapsible when done).
+    Thinking,
     Tool,
     System,
     Error,
@@ -108,8 +115,12 @@ pub enum EntryKind {
 pub struct TranscriptEntry {
     pub kind: EntryKind,
     pub text: String,
-    /// Still receiving streamed text (Agent) or still running (Tool).
+    /// Still receiving streamed text (Agent/Thinking) or still running (Tool).
     pub live: bool,
+    /// Expandable body: full tool args+output, or (unused for plain agent text).
+    pub detail: Option<String>,
+    /// Whether [`Self::detail`] (or full thinking body) is shown.
+    pub expanded: bool,
 }
 
 impl TranscriptEntry {
@@ -118,6 +129,26 @@ impl TranscriptEntry {
             kind,
             text: text.into(),
             live: false,
+            detail: None,
+            expanded: false,
+        }
+    }
+
+    /// Entries the user can click to toggle verbose / collapsed body.
+    pub fn can_toggle(&self) -> bool {
+        match self.kind {
+            EntryKind::Tool => self
+                .detail
+                .as_ref()
+                .is_some_and(|d| !d.trim().is_empty()),
+            EntryKind::Thinking => !self.live && !self.text.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    pub fn toggle_expanded(&mut self) {
+        if self.can_toggle() {
+            self.expanded = !self.expanded;
         }
     }
 }
@@ -147,6 +178,8 @@ pub enum ClickTarget {
     ModalButton(usize),
     // Chat
     Transcript,
+    /// A collapsible transcript row (thinking or tool). Index into `coding_transcript`.
+    TranscriptEntry(usize),
     // Models (two-pane)
     ModelList,
     QuantList,
@@ -325,6 +358,7 @@ pub enum RetryAction {
     InstallBackend(BackendKind),
     ConnectRemote(usize),
     ApplyRepair,
+    InstallLocalAssistant,
 }
 
 /// What a collected sudo password authorizes — an elevated backend install
@@ -388,6 +422,11 @@ pub enum BgMsg {
     },
     BenchDone(Result<localcode_bench::RunResult, LocalCodeError>),
     AssistantDone(Result<String, LocalCodeError>),
+    /// Background auto-repair: assistant finished diagnosing an error.
+    AssistantAutoDone(Result<String, LocalCodeError>),
+    /// Local Bonsai assistant install progress / completion.
+    AssistantInstallProgress(String),
+    AssistantInstallDone(Result<Option<Repoint>, LocalCodeError>),
     DoctorDone(String),
     DetectDone(Vec<DetectReport>),
     ApiHealth(bool),
@@ -497,6 +536,10 @@ pub struct App {
     /// None while the startup probe is still running.
     pub api_healthy: Option<bool>,
     pub gpu: GpuInventory,
+    /// Approximate tokens currently in the coding session (chars÷4). Refreshed
+    /// from the live session every GPU poll so the status-bar context meter
+    /// moves as the conversation grows.
+    pub ctx_used_tokens: u32,
     pub runtimes: Vec<ActiveRuntime>,
     pub runtime_selected: usize,
     pub runtime_list_state: ListState,
@@ -546,10 +589,19 @@ pub struct App {
     pub deploy_gpu_frac: Option<f32>,
     pub deploy_tensor_parallel: Option<u32>,
     pub deploy_gpu_layers: Option<i32>,
+    /// Extra CLI flags from model-card / assistant (merged into DeployTuning).
+    pub deploy_extra_args: Vec<String>,
+    /// Notes from the last model-card parse (shown in status when applied).
+    deploy_hints_notes: Vec<String>,
     /// Which deploy parameter is being edited inline (Models view), if any.
     deploy_editing: Option<DeployField>,
     deploy_field_edit: String,
     pub deploy_progress: u8,
+    /// Local Bonsai weights + llama-server are present.
+    pub local_assistant_ready: bool,
+    /// Install of the local assistant in progress.
+    pub assistant_install_busy: Option<Busy>,
+    pub assistant_install_progress: String,
     pub last_fit: Option<FitPrediction>,
     pub pending_oversize_deploy: Option<DeployRequest>,
     // Omnibar (prompt / search / command bar) — always focused.
@@ -613,7 +665,12 @@ impl App {
         .ok();
 
         let assistant = Assistant::new(config.assistant.clone());
-        let assistant_configured = assistant.is_configured(config.assistant_api_key().as_deref());
+        let local_assistant_ready = is_installed(&config, &paths);
+        let assistant_configured = assistant.is_configured(
+            config.assistant_api_key().as_deref(),
+            Some(&paths),
+            Some(&config),
+        ) || local_assistant_ready;
 
         let agent_probe = CodingAgent::new(config.agent.clone());
         let skill_count = agent_probe.skills.list().len();
@@ -661,6 +718,7 @@ impl App {
             assistant_configured,
             api_healthy: None,
             gpu,
+            ctx_used_tokens: 0,
             runtimes: vec![],
             runtime_selected: 0,
             runtime_list_state: ListState::default(),
@@ -700,19 +758,33 @@ impl App {
             deploy_gpu_frac: None,
             deploy_tensor_parallel: None,
             deploy_gpu_layers: None,
+            deploy_extra_args: Vec::new(),
+            deploy_hints_notes: Vec::new(),
             deploy_editing: None,
             deploy_field_edit: String::new(),
             deploy_progress: 0,
+            local_assistant_ready,
+            assistant_install_busy: None,
+            assistant_install_progress: String::new(),
             last_fit: None,
             pending_oversize_deploy: None,
             coding_input: String::new(),
             coding_cursor: 0,
             coding_history: vec![],
             coding_hist_idx: None,
-            coding_transcript: vec![TranscriptEntry::new(
-                EntryKind::System,
-                "Welcome to LocalCode. Type a message to chat with the agent, or press / for commands (/models, /remote, /backends, /help). Deploy a model with /models, or connect a remote GPU with /remote.",
-            )],
+            coding_transcript: {
+                let mut t = vec![TranscriptEntry::new(
+                    EntryKind::System,
+                    "Welcome to LocalCode. Type a message to chat with the agent, or press / for commands (/models, /remote, /backends, /help). Deploy a model with /models, or connect a remote GPU with /remote.",
+                )];
+                if config.assistant.greet_on_startup {
+                    t.push(TranscriptEntry::new(
+                        EntryKind::System,
+                        startup_greeting(local_assistant_ready),
+                    ));
+                }
+                t
+            },
             coding_scroll: 0,
             coding_follow: true,
             coding_view_height: 0,
@@ -748,6 +820,26 @@ impl App {
         if let Some(hf) = &app.hf {
             if let Some(cached) = hf.cache().get_search("code") {
                 app.models = cached;
+            }
+        }
+
+        // One-time offer to install the local Bonsai assistant (user can decline).
+        if should_offer_install(&app.config) {
+            let need = install_need(&app.config, &app.paths);
+            if need != InstallNeed::Ready {
+                app.modal = Some(ModalState::confirm(
+                    format!("Install local {ASSISTANT_DISPLAY_NAME} assistant?"),
+                    format!(
+                        "{}\n\n{}",
+                        install_offer_body(&need),
+                        quant_compatibility_note()
+                    ),
+                    ConfirmAction::InstallLocalAssistant,
+                ));
+            } else {
+                // Files already present (e.g. copied in) — mark accepted.
+                app.config.assistant.local_preference = LocalAssistantPreference::Accepted;
+                let _ = app.config.save(&app.paths);
             }
         }
 
@@ -871,51 +963,116 @@ impl App {
 
     /// Close any live transcript entries (stream ended, cancelled, or errored).
     fn finalize_transcript_live(&mut self) {
-        self.coding_transcript
-            .retain(|e| !(e.live && e.kind == EntryKind::Agent && e.text.trim().is_empty()));
+        self.coding_transcript.retain(|e| {
+            !(e.live
+                && matches!(e.kind, EntryKind::Agent | EntryKind::Thinking)
+                && e.text.trim().is_empty())
+        });
         for e in &mut self.coding_transcript {
             e.live = false;
         }
     }
 
+    /// Mark currently-live Agent/Thinking rows as finished (before a new kind starts).
+    fn seal_live_stream_entries(&mut self) {
+        for e in &mut self.coding_transcript {
+            if e.live && matches!(e.kind, EntryKind::Agent | EntryKind::Thinking) {
+                e.live = false;
+            }
+        }
+        // Drop empty sealed stream rows.
+        self.coding_transcript.retain(|e| {
+            !(matches!(e.kind, EntryKind::Agent | EntryKind::Thinking)
+                && !e.live
+                && e.text.trim().is_empty())
+        });
+    }
+
     /// Apply one live agent event to the transcript.
     fn apply_agent_event(&mut self, ev: AgentEvent) {
         match ev {
+            AgentEvent::ThinkingDelta(text) => {
+                // Seal prior agent text if any; thinking usually precedes the answer.
+                if let Some(e) = self.coding_transcript.last_mut() {
+                    if e.kind == EntryKind::Agent && e.live {
+                        e.live = false;
+                    }
+                }
+                match self.coding_transcript.last_mut() {
+                    Some(e) if e.kind == EntryKind::Thinking && e.live => e.text.push_str(&text),
+                    _ => self.coding_transcript.push(TranscriptEntry {
+                        kind: EntryKind::Thinking,
+                        text,
+                        live: true,
+                        detail: None,
+                        // Stream expanded so users see reasoning live.
+                        expanded: true,
+                    }),
+                }
+                self.coding_follow = true;
+            }
             AgentEvent::Delta(text) => {
+                if let Some(e) = self.coding_transcript.last_mut() {
+                    if e.kind == EntryKind::Thinking && e.live {
+                        e.live = false;
+                    }
+                }
                 match self.coding_transcript.last_mut() {
                     Some(e) if e.kind == EntryKind::Agent && e.live => e.text.push_str(&text),
                     _ => self.coding_transcript.push(TranscriptEntry {
                         kind: EntryKind::Agent,
                         text,
                         live: true,
+                        detail: None,
+                        expanded: false,
                     }),
                 }
                 self.coding_follow = true;
             }
             AgentEvent::MessageComplete => {
-                if let Some(e) = self.coding_transcript.last_mut() {
-                    if e.kind == EntryKind::Agent && e.live {
-                        if e.text.trim().is_empty() {
-                            self.coding_transcript.pop();
-                        } else {
-                            e.live = false;
-                        }
+                // Seal live thinking and agent rows for this round.
+                for e in &mut self.coding_transcript {
+                    if e.live && matches!(e.kind, EntryKind::Agent | EntryKind::Thinking) {
+                        e.live = false;
                     }
                 }
+                self.coding_transcript.retain(|e| {
+                    !(matches!(e.kind, EntryKind::Agent | EntryKind::Thinking)
+                        && e.text.trim().is_empty()
+                        && e.detail.is_none())
+                });
             }
             AgentEvent::ToolStarted { name, args_preview } => {
+                self.seal_live_stream_entries();
+                let preview = if args_preview.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {args_preview}")
+                };
                 self.coding_transcript.push(TranscriptEntry {
                     kind: EntryKind::Tool,
-                    text: format!("⋯ {name}  {args_preview}"),
+                    text: format!("⋯ {name}{preview}"),
                     live: true,
+                    detail: None,
+                    expanded: false,
                 });
                 self.coding_follow = true;
             }
-            AgentEvent::ToolFinished { name, ok, summary } => {
-                let text = if ok {
-                    format!("✓ {name}  {summary}")
+            AgentEvent::ToolFinished {
+                name,
+                ok,
+                summary,
+                args,
+                output,
+            } => {
+                let mark = if ok { "✓" } else { "✗" };
+                let text = format!("{mark} {name}  {summary}");
+                let detail = format_tool_detail(&args, &output);
+                let expandable = !detail.trim().is_empty();
+                let text = if expandable {
+                    format!("{text}  ▸")
                 } else {
-                    format!("✗ {name}  {summary}")
+                    text
                 };
                 match self
                     .coding_transcript
@@ -926,10 +1083,16 @@ impl App {
                     Some(e) => {
                         e.text = text;
                         e.live = false;
+                        e.detail = if expandable { Some(detail) } else { None };
+                        e.expanded = false;
                     }
-                    None => self
-                        .coding_transcript
-                        .push(TranscriptEntry::new(EntryKind::Tool, text)),
+                    None => {
+                        let mut entry = TranscriptEntry::new(EntryKind::Tool, text);
+                        if expandable {
+                            entry.detail = Some(detail);
+                        }
+                        self.coding_transcript.push(entry);
+                    }
                 }
                 self.coding_follow = true;
             }
@@ -973,6 +1136,16 @@ impl App {
         self.last_diagnosis = diagnosis;
         self.last_error = Some(err.clone());
         self.modal = Some(ModalState::error(err, has_repair));
+
+        // When the local assistant is ready, kick off a background diagnosis
+        // first so install/backend errors get agent help without an extra click.
+        if self.config.assistant.auto_handle_errors
+            && self.local_assistant_ready
+            && !self.fg_busy()
+            && self.assistant_install_busy.is_none()
+        {
+            self.start_assistant_auto();
+        }
     }
 
     fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
@@ -1000,6 +1173,7 @@ impl App {
             Some(RetryAction::InstallBackend(kind)) => self.start_install(kind),
             Some(RetryAction::ConnectRemote(idx)) => self.connect_remote(idx),
             Some(RetryAction::ApplyRepair) => self.start_repair(),
+            Some(RetryAction::InstallLocalAssistant) => self.start_install_local_assistant(),
             None => self.set_status("Nothing to retry", false),
         }
     }
@@ -1008,15 +1182,14 @@ impl App {
     // Background task starters (all non-blocking)
     // ------------------------------------------------------------------
 
-    /// Poll GPU/VRAM in the background and stream it back to the UI. `discover()`
-    /// shells out to `nvidia-smi` (blocking, ~100-300ms), so it runs on the
-    /// blocking pool — never on the render thread — and the result arrives as a
-    /// `BgMsg`, mirroring how every other slow probe feeds the loop. Without this
-    /// the status-bar VRAM meter is frozen at whatever was free at startup.
+    /// Poll GPU/VRAM/temp in the background and stream it back to the UI.
+    /// `discover()` shells out to `nvidia-smi` (blocking, ~100-300ms), so it runs
+    /// on the blocking pool — never on the render thread — and the result arrives
+    /// as a `BgMsg`. Interval is 1s so the status dashboard meters stay live.
     pub fn start_gpu_refresh(&mut self) {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
             // Skip the immediate first tick: `new()` already seeded `app.gpu`.
             tick.tick().await;
             loop {
@@ -1030,10 +1203,40 @@ impl App {
                     }
                     // A failed probe (no nvidia-smi, driver hiccup) just means we
                     // keep the last good inventory and try again next tick.
-                    _ => continue,
+                    // Still wake the UI so context usage can refresh on the same
+                    // cadence even when nvidia-smi is missing.
+                    Ok(Err(_)) | Err(_) => {
+                        if tx
+                            .send(BgMsg::GpuRefreshed(GpuInventory {
+                                devices: vec![],
+                                detection_method: "probe-failed".into(),
+                                warnings: vec![],
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         });
+    }
+
+    /// Recompute `ctx_used_tokens` from the live agent session when the lock is
+    /// free; otherwise fall back to an estimate from the transcript. Called on
+    /// the 1s GPU tick and after coding turns so the status meter stays honest.
+    pub fn refresh_ctx_usage(&mut self) {
+        if let Ok(session) = self.session.try_lock() {
+            self.ctx_used_tokens = estimate_session_tokens(&session);
+            return;
+        }
+        // Session locked mid-turn — approximate from the transcript the UI already has.
+        let chars: usize = self
+            .coding_transcript
+            .iter()
+            .map(|e| e.text.chars().count())
+            .sum();
+        self.ctx_used_tokens = (chars / 4) as u32;
     }
 
     pub fn start_detect(&mut self) {
@@ -1204,6 +1407,8 @@ impl App {
                 gpu_memory_fraction: self.deploy_gpu_frac,
                 tensor_parallel: self.deploy_tensor_parallel,
                 gpu_layers: self.deploy_gpu_layers,
+                // Filled by the local assistant when auto_deploy_hints is on.
+                extra_args: self.deploy_extra_args.clone(),
             },
             continue_despite_oversize: continue_oversize,
         })
@@ -1384,10 +1589,65 @@ impl App {
     }
 
     fn start_deploy(&mut self, continue_oversize: bool) {
+        // When enabled, parse the model card for backend flags before deploy.
+        if self.config.assistant.auto_deploy_hints {
+            self.apply_card_deploy_hints();
+        }
         let Some(req) = self.build_deploy_request(continue_oversize) else {
             return;
         };
         self.spawn_deploy(req);
+    }
+
+    /// Read the loaded model card and fill deploy knobs / extra_args.
+    fn apply_card_deploy_hints(&mut self) {
+        let Some(detail) = &self.model_detail else {
+            return;
+        };
+        let Some(card) = detail.card_markdown.as_deref() else {
+            return;
+        };
+        let hints = extract_deploy_hints(card, self.deploy_backend);
+        if hints.is_empty() {
+            return;
+        }
+        if self.deploy_gpu_frac.is_none() {
+            if let Some(v) = hints.gpu_memory_fraction {
+                self.deploy_gpu_frac = Some(v);
+            }
+        }
+        if self.deploy_tensor_parallel.is_none() {
+            if let Some(v) = hints.tensor_parallel {
+                self.deploy_tensor_parallel = Some(v);
+            }
+        }
+        if self.deploy_gpu_layers.is_none() {
+            if let Some(v) = hints.gpu_layers {
+                self.deploy_gpu_layers = Some(v);
+            }
+        }
+        if let Some(ctx) = hints.context_length {
+            // Only raise context when the card recommends more than the default
+            // and the user hasn't customized (still on DEFAULT).
+            if self.deploy_ctx == DEFAULT_DEPLOY_CTX && ctx > self.deploy_ctx {
+                self.deploy_ctx = ctx.min(131_072);
+            }
+        }
+        for a in &hints.extra_args {
+            if !self.deploy_extra_args.iter().any(|e| e == a) {
+                self.deploy_extra_args.push(a.clone());
+            }
+        }
+        self.deploy_hints_notes = hints.notes.clone();
+        if !self.deploy_hints_notes.is_empty() {
+            self.set_status(
+                format!(
+                    "Deploy hints from model card: {}",
+                    self.deploy_hints_notes.join("; ")
+                ),
+                false,
+            );
+        }
     }
 
     fn spawn_deploy(&mut self, req: DeployRequest) {
@@ -1466,9 +1726,21 @@ impl App {
     }
 
     fn start_assistant(&mut self) {
-        if !self.assistant_configured {
+        if !self.assistant_configured && !self.local_assistant_ready {
+            // Offer local install when nothing is configured yet.
+            if should_offer_install(&self.config)
+                || self.config.assistant.local_preference == LocalAssistantPreference::Declined
+            {
+                let need = install_need(&self.config, &self.paths);
+                self.modal = Some(ModalState::confirm(
+                    format!("Install local {ASSISTANT_DISPLAY_NAME} assistant?"),
+                    install_offer_body(&need),
+                    ConfirmAction::InstallLocalAssistant,
+                ));
+                return;
+            }
             self.set_status(
-                "Assistant not configured — set OPENROUTER_API_KEY (or a self-hosted URL), see the Setup tab",
+                "Assistant not configured — accept the local Bonsai install or set OPENROUTER_API_KEY",
                 true,
             );
             return;
@@ -1477,14 +1749,42 @@ impl App {
             self.set_status("Busy — Esc to cancel first", false);
             return;
         }
+        self.spawn_assistant_turn(false);
+    }
+
+    /// Background auto-handle after an error (no modal until the reply arrives).
+    fn start_assistant_auto(&mut self) {
+        if self.fg_busy() || !self.local_assistant_ready {
+            return;
+        }
+        self.spawn_assistant_turn(true);
+    }
+
+    fn spawn_assistant_turn(&mut self, auto: bool) {
         let assistant = Assistant::new(self.config.assistant.clone());
         let api_key = self.config.assistant_api_key();
         let error_context = self.last_error.as_ref().map(|e| e.assistant_context());
         let user_message = self
             .last_error
             .as_ref()
-            .map(|e| format!("Help me fix: {}", e.message))
-            .unwrap_or_else(|| "Help me diagnose LocalCode setup.".into());
+            .map(|e| {
+                if auto {
+                    format!(
+                        "An error just occurred in LocalCode. Diagnose and fix it if possible \
+                         (use tools: shell, doctor.snapshot, fs). Error: {}",
+                        e.message
+                    )
+                } else {
+                    format!("Help me fix: {}", e.message)
+                }
+            })
+            .unwrap_or_else(|| {
+                if auto {
+                    "Help me diagnose LocalCode setup.".into()
+                } else {
+                    "How can you help me with LocalCode right now?".into()
+                }
+            });
         let correlation = self
             .last_error
             .as_ref()
@@ -1496,27 +1796,125 @@ impl App {
             "backends": config.backends.default.kind,
             "registry": config.registry.endpoint,
             "api": config.api.base_url,
+            "assistant_local": self.local_assistant_ready,
         });
+        // Coding chat excerpt so the assistant has access to recent conversation.
+        let chat_excerpt = {
+            let lines: Vec<String> = self
+                .coding_transcript
+                .iter()
+                .rev()
+                .take(24)
+                .map(|e| format!("{:?}: {}", e.kind, e.text.chars().take(400).collect::<String>()))
+                .collect();
+            let mut lines = lines;
+            lines.reverse();
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        };
+        let deploy_model_id = self.model_detail.as_ref().map(|d| d.summary.id.clone());
+        let deploy_backend = Some(self.deploy_backend.as_str().to_string());
+        let model_card_markdown = self
+            .model_detail
+            .as_ref()
+            .and_then(|d| d.card_markdown.clone());
+        let workspace = self.workspace_path();
+        let hf_arc = self.hf.clone().map(Arc::new);
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
             let logs =
                 localcode_log::read_recent_logs(&paths.log_dir, 80, correlation.as_deref(), redact)
                     .ok();
             let doctor = run_doctor(&paths, &config).await;
-            let req = AssistantRequest {
-                user_message,
+            let ctx = AssistantContext {
+                user_message: user_message.clone(),
                 error_context,
                 doctor_report: Some(doctor),
                 recent_logs: logs,
                 config_snapshot_redacted: Some(config_snapshot),
+                chat_excerpt,
+                deploy_model_id,
+                deploy_backend,
+                model_card_markdown,
+            };
+            // Interactive /assistant gets a tool approver; background auto-repair
+            // refuses gated tools (no silent destructive shell).
+            let approver = if auto {
+                None
+            } else {
+                Some(ChannelApprover { tx: tx.clone() })
             };
             let result = assistant
-                .ask(req, api_key.as_deref())
+                .ask_with_context(
+                    &config,
+                    &paths,
+                    ctx,
+                    api_key.as_deref(),
+                    hf_arc,
+                    workspace,
+                    None,
+                    approver
+                        .as_ref()
+                        .map(|a| a as &dyn localcode_agent::ToolApprover),
+                )
                 .await
                 .map(|r| r.message);
-            let _ = tx.send(BgMsg::AssistantDone(result));
+            if auto {
+                let _ = tx.send(BgMsg::AssistantAutoDone(result));
+            } else {
+                let _ = tx.send(BgMsg::AssistantDone(result));
+            }
         });
-        self.begin_busy(BusyKind::Assistant, "Asking assistant", handle);
+        let label = if auto {
+            format!("{ASSISTANT_DISPLAY_NAME} diagnosing error…")
+        } else {
+            "Asking assistant".into()
+        };
+        self.begin_busy(BusyKind::Assistant, label, handle);
+    }
+
+    /// Persist accept/decline and kick off the llama.cpp + GGUF install.
+    fn start_install_local_assistant(&mut self) {
+        self.config.assistant.local_preference = LocalAssistantPreference::Accepted;
+        let _ = self.config.save(&self.paths);
+        if self.assistant_install_busy.is_some() {
+            self.set_status("Assistant install already running", false);
+            return;
+        }
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let tx = self.bg_tx.clone();
+        let (p_tx, mut p_rx) = mpsc::unbounded_channel::<String>();
+        let progress_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = p_rx.recv().await {
+                let _ = progress_tx.send(BgMsg::AssistantInstallProgress(line));
+            }
+        });
+        let handle = tokio::spawn(async move {
+            let result = install_local_assistant(&config, &paths, p_tx).await;
+            let _ = tx.send(BgMsg::AssistantInstallDone(result));
+        });
+        self.assistant_install_busy = Some(Busy {
+            kind: BusyKind::Install,
+            label: format!("Installing {ASSISTANT_DISPLAY_NAME}"),
+            started: Instant::now(),
+            handle,
+        });
+        self.assistant_install_progress = "Starting…".into();
+        self.set_status(format!("Installing local {ASSISTANT_DISPLAY_NAME} assistant…"), false);
+    }
+
+    fn decline_local_assistant(&mut self) {
+        self.config.assistant.local_preference = LocalAssistantPreference::Declined;
+        let _ = self.config.save(&self.paths);
+        self.set_status(
+            "Local assistant declined — you can install later with /assistant install",
+            false,
+        );
     }
 
     fn start_doctor(&mut self) {
@@ -1654,6 +2052,7 @@ impl App {
         )];
         self.coding_scroll = 0;
         self.coding_follow = true;
+        self.ctx_used_tokens = 0;
         self.set_status("New coding session", false);
     }
 
@@ -2351,6 +2750,12 @@ impl App {
                             self.selected_quant = detail.quants.first().map(|q| q.label.clone());
                             self.model_detail = Some(detail);
                             self.card_scroll = 0;
+                            // Fresh model: clear previous card-derived flags, then re-parse.
+                            self.deploy_extra_args.clear();
+                            self.deploy_hints_notes.clear();
+                            if self.config.assistant.auto_deploy_hints {
+                                self.apply_card_deploy_hints();
+                            }
                             self.refresh_fit();
                             self.set_status(
                                 "Model loaded — → focus card, [,/.] quant, [d] deploy",
@@ -2379,7 +2784,11 @@ impl App {
                         ));
                     }
                 }
-                BgMsg::CodingEvent(ev) => self.apply_agent_event(ev),
+                BgMsg::CodingEvent(ev) => {
+                    self.apply_agent_event(ev);
+                    // Keep the context meter moving while the turn streams.
+                    self.refresh_ctx_usage();
+                }
                 BgMsg::CodingDone(result) => {
                     // Turn stats for the status line: duration from the busy
                     // marker (grabbed before finish_busy clears it) + tool
@@ -2390,6 +2799,7 @@ impl App {
                         .filter(|b| b.kind == BusyKind::Coding)
                         .map(|b| b.started.elapsed());
                     self.finish_busy();
+                    self.refresh_ctx_usage();
                     match result {
                         Ok(reply) => {
                             self.finalize_transcript_live();
@@ -2476,12 +2886,103 @@ impl App {
                     self.finish_busy();
                     match result {
                         Ok(message) => {
-                            self.modal = Some(ModalState::info("Assistant", message));
+                            self.coding_transcript.push(TranscriptEntry::new(
+                                EntryKind::System,
+                                format!("[{ASSISTANT_DISPLAY_NAME}] {message}"),
+                            ));
+                            self.modal = Some(ModalState::info(
+                                format!("{ASSISTANT_DISPLAY_NAME} assistant"),
+                                message,
+                            ));
                             self.set_status("Assistant replied", false);
                         }
                         Err(e) => {
                             self.last_failed_action = Some(RetryAction::AskAssistant);
+                            // Don't re-enter auto-handle loop on assistant failure.
+                            let prev = self.config.assistant.auto_handle_errors;
+                            self.config.assistant.auto_handle_errors = false;
                             self.raise_error(e);
+                            self.config.assistant.auto_handle_errors = prev;
+                        }
+                    }
+                }
+                BgMsg::AssistantAutoDone(result) => {
+                    self.finish_busy();
+                    match result {
+                        Ok(message) => {
+                            self.coding_transcript.push(TranscriptEntry::new(
+                                EntryKind::System,
+                                format!("[{ASSISTANT_DISPLAY_NAME} auto] {message}"),
+                            ));
+                            self.set_status(
+                                format!("{ASSISTANT_DISPLAY_NAME} finished diagnosing — see chat"),
+                                false,
+                            );
+                            // Replace error modal with assistant findings when still open.
+                            if matches!(
+                                self.modal.as_ref().map(|m| &m.kind),
+                                Some(ModalKind::Error { .. })
+                            ) {
+                                self.modal = Some(ModalState::info(
+                                    format!("{ASSISTANT_DISPLAY_NAME} diagnosis"),
+                                    message,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Quiet failure on auto path — the error modal is already shown.
+                            self.set_status(
+                                format!("Assistant auto-diagnose failed: {}", e.message),
+                                true,
+                            );
+                        }
+                    }
+                }
+                BgMsg::AssistantInstallProgress(line) => {
+                    self.assistant_install_progress = line.clone();
+                    self.set_status(line, false);
+                }
+                BgMsg::AssistantInstallDone(result) => {
+                    if let Some(b) = self.assistant_install_busy.take() {
+                        // Task finished; drop handle.
+                        drop(b);
+                    }
+                    match result {
+                        Ok(repoint) => {
+                            if let Some(r) = repoint {
+                                self.config.backends.llamacpp.bin = r.bin;
+                                let _ = self.config.save(&self.paths);
+                            }
+                            self.local_assistant_ready =
+                                is_installed(&self.config, &self.paths);
+                            self.assistant_configured = true;
+                            self.config.assistant.local_preference =
+                                LocalAssistantPreference::Accepted;
+                            let _ = self.config.save(&self.paths);
+                            self.coding_transcript.push(TranscriptEntry::new(
+                                EntryKind::System,
+                                startup_greeting(self.local_assistant_ready),
+                            ));
+                            self.set_status(
+                                format!("{ASSISTANT_DISPLAY_NAME} installed and ready"),
+                                false,
+                            );
+                            self.modal = Some(ModalState::info(
+                                format!("{ASSISTANT_DISPLAY_NAME} ready"),
+                                format!(
+                                    "Local assistant is installed.\n\n{}\n\n{}",
+                                    quant_compatibility_note(),
+                                    "It will help with errors automatically and read model cards on deploy."
+                                ),
+                            ));
+                        }
+                        Err(e) => {
+                            self.last_failed_action =
+                                Some(RetryAction::InstallLocalAssistant);
+                            let prev = self.config.assistant.auto_handle_errors;
+                            self.config.assistant.auto_handle_errors = false;
+                            self.raise_error(e);
+                            self.config.assistant.auto_handle_errors = prev;
                         }
                     }
                 }
@@ -2505,6 +3006,9 @@ impl App {
                     if !inv.devices.is_empty() {
                         self.gpu = inv;
                     }
+                    // Same 1s cadence refreshes the context meter even when the
+                    // GPU probe is a no-op (CPU-only host / failed smi).
+                    self.refresh_ctx_usage();
                 }
                 BgMsg::RuntimeStopped { result } => match result {
                     Ok(()) => self.set_status("Runtime stopped", false),
@@ -2754,7 +3258,7 @@ impl App {
             ("/new", "", "start a new conversation"),
             ("/deploy", "", "deploy the selected model"),
             ("/doctor", "", "run environment diagnostics"),
-            ("/assistant", "", "ask the in-app assistant"),
+            ("/assistant", "[install]", "ask the local Bonsai assistant (or install it)"),
             ("/update", "", "install the available update"),
             ("/logs", "", "show the log directory path"),
             ("/help", "", "keyboard & mouse help"),
@@ -3076,7 +3580,13 @@ impl App {
                 self.set_mode(Mode::Chat);
                 self.new_coding_session();
             }
-            "assistant" | "ask" => self.start_assistant(),
+            "assistant" | "ask" => {
+                if args.first().map(|s| s.as_str()) == Some("install") {
+                    self.start_install_local_assistant();
+                } else {
+                    self.start_assistant();
+                }
+            }
             "update" => self.open_update_modal(),
             "redetect" | "detect" => {
                 self.start_detect();
@@ -4143,6 +4653,10 @@ to select, click deploy. Remote: click a field to edit, then connect."
                         action: ConfirmAction::ToolApproval,
                         ..
                     } => self.respond_tool_confirm(false),
+                    ModalKind::Confirm {
+                        action: ConfirmAction::InstallLocalAssistant,
+                        ..
+                    } => self.decline_local_assistant(),
                     ModalKind::Warning { .. } => {
                         self.pending_oversize_deploy = None;
                     }
@@ -4209,6 +4723,20 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 },
                 "Confirm",
             ) => self.confirm_repair(),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::InstallLocalAssistant,
+                    ..
+                },
+                "Confirm",
+            ) => self.start_install_local_assistant(),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::InstallLocalAssistant,
+                    ..
+                },
+                "Cancel",
+            ) => self.decline_local_assistant(),
             (
                 ModalKind::Confirm {
                     action: ConfirmAction::ToolApproval,
@@ -4287,6 +4815,17 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 }
             }
             ClickTarget::Transcript => {}
+            ClickTarget::TranscriptEntry(i) => {
+                if let Some(e) = self.coding_transcript.get_mut(i) {
+                    if e.can_toggle() {
+                        e.expanded = !e.expanded;
+                        // Expanding often needs a re-scroll so the detail is visible.
+                        if e.expanded {
+                            self.coding_follow = true;
+                        }
+                    }
+                }
+            }
             // Models.
             ClickTarget::ModelList => {
                 if !self.models.is_empty() {
@@ -4431,7 +4970,9 @@ to select, click deploy. Remote: click a field to edit, then connect."
         match self.region_at(col, row).map(|r| r.target) {
             Some(ClickTarget::ModelList) => self.scroll_list_models(delta),
             Some(ClickTarget::QuantList) => self.scroll_card(delta),
-            Some(ClickTarget::Transcript) => self.scroll_transcript(delta),
+            Some(ClickTarget::Transcript) | Some(ClickTarget::TranscriptEntry(_)) => {
+                self.scroll_transcript(delta)
+            }
             Some(ClickTarget::RuntimeList) => self.scroll_runtimes(delta),
             _ => self.wheel_scroll(delta),
         }
@@ -4492,11 +5033,43 @@ pub(crate) const BACKEND_ORDER: [BackendKind; 4] = [
     BackendKind::Sglang,
 ];
 
+/// Rough token estimate for the status-bar context meter: ~4 chars per token
+/// (latin code-heavy text). Not a tokenizer — just a live fill level.
+fn estimate_session_tokens(session: &AgentSession) -> u32 {
+    let chars: usize = session
+        .messages
+        .iter()
+        .map(|m| {
+            m.content.chars().count()
+                + m.tool_calls
+                    .as_ref()
+                    .map(|v| v.to_string().chars().count())
+                    .unwrap_or(0)
+        })
+        .sum();
+    (chars / 4) as u32
+}
+
 /// Editable fields of a remote server, in display order.
 pub(crate) const REMOTE_FIELDS: [&str; 6] =
     ["name", "host", "port", "username", "password", "local_port"];
 
 /// Extra context shown above the install confirm command, per backend.
+/// Build the expandable tool body (args + full output) for the transcript.
+fn format_tool_detail(args: &str, output: &str) -> String {
+    let mut parts = Vec::new();
+    if !args.trim().is_empty() {
+        parts.push(format!("args\n{args}"));
+    }
+    let n = output.chars().count();
+    if n == 0 {
+        parts.push("output\n(empty)".into());
+    } else {
+        parts.push(format!("output ({n} chars)\n{output}"));
+    }
+    parts.join("\n\n")
+}
+
 fn install_caveat(kind: BackendKind) -> String {
     match kind {
         BackendKind::Vllm | BackendKind::Sglang => {
@@ -4841,6 +5414,75 @@ mod tests {
         typ(&mut app, "hello world");
         assert!(!app.slash_active());
         assert_eq!(app.coding_input, "hello world");
+    }
+
+    #[test]
+    fn thinking_streams_and_tools_toggle_verbose_detail() {
+        let mut app = test_app();
+        app.apply_agent_event(AgentEvent::ThinkingDelta("plan A".into()));
+        app.apply_agent_event(AgentEvent::ThinkingDelta(" then B".into()));
+        app.apply_agent_event(AgentEvent::Delta("answer".into()));
+        app.apply_agent_event(AgentEvent::MessageComplete);
+        app.apply_agent_event(AgentEvent::ToolStarted {
+            name: "fs.read".into(),
+            args_preview: "path=a.txt".into(),
+        });
+        app.apply_agent_event(AgentEvent::ToolFinished {
+            name: "fs.read".into(),
+            ok: true,
+            summary: "hello  · 5 chars".into(),
+            args: "path: a.txt".into(),
+            output: "hello".into(),
+        });
+
+        let thinking = app
+            .coding_transcript
+            .iter()
+            .find(|e| e.kind == EntryKind::Thinking)
+            .expect("thinking entry");
+        assert_eq!(thinking.text, "plan A then B");
+        assert!(!thinking.live);
+        assert!(thinking.expanded);
+        assert!(thinking.can_toggle());
+
+        let tool = app
+            .coding_transcript
+            .iter()
+            .find(|e| e.kind == EntryKind::Tool)
+            .expect("tool entry");
+        assert!(tool.text.contains("fs.read"));
+        assert!(tool.text.contains('▸'));
+        assert!(!tool.expanded);
+        assert!(tool.detail.as_ref().unwrap().contains("hello"));
+        assert!(tool.can_toggle());
+
+        // Toggle tool verbose body on.
+        let tool_idx = app
+            .coding_transcript
+            .iter()
+            .position(|e| e.kind == EntryKind::Tool)
+            .unwrap();
+        app.coding_transcript[tool_idx].toggle_expanded();
+        assert!(app.coding_transcript[tool_idx].expanded);
+
+        // Toggle thinking collapsed.
+        let think_idx = app
+            .coding_transcript
+            .iter()
+            .position(|e| e.kind == EntryKind::Thinking)
+            .unwrap();
+        app.coding_transcript[think_idx].toggle_expanded();
+        assert!(!app.coding_transcript[think_idx].expanded);
+
+        let screen = render_to_string(&mut app, 100, 30);
+        assert!(
+            screen.contains("thinking") && screen.contains("chars"),
+            "collapsed thinking summary should render: {screen}"
+        );
+        assert!(
+            screen.contains("fs.read") && screen.contains("output"),
+            "expanded tool detail should render: {screen}"
+        );
     }
 
     #[test]

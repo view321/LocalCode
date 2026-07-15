@@ -309,6 +309,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
                     gpu_memory_fraction,
                     tensor_parallel,
                     gpu_layers,
+                    extra_args: Vec::new(),
                 },
                 continue_despite_oversize: force,
             };

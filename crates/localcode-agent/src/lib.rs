@@ -1,12 +1,18 @@
 //! Coding agent with tools, skills, and MCP configuration.
 
 mod mcp;
+mod session_store;
 mod skills;
 mod tools;
 
 pub use mcp::{McpConfig, McpManager, McpServerStatus};
+pub use session_store::{
+    list_sessions, sessions_root, LoadedSession, SessionMeta, SessionStore,
+};
 pub use skills::{Skill, SkillLoader};
-pub use tools::{approval_request, ToolApprover, ToolCall, ToolRegistry, ToolResult};
+pub use tools::{
+    approval_request, ToolApprover, ToolCall, ToolRegistry, ToolResult, ToolRisk,
+};
 
 use futures::StreamExt;
 use localcode_core::config::AgentConfig;
@@ -26,6 +32,9 @@ pub enum AgentEvent {
     /// Streamed assistant text (a token when streaming, or a whole message
     /// when the runtime doesn't stream).
     Delta(String),
+    /// Streamed model reasoning / chain-of-thought (OpenAI-style
+    /// `reasoning_content`, or `<think>` tags inside content).
+    ThinkingDelta(String),
     /// The assistant message of the current round is complete; later deltas
     /// belong to a new message.
     MessageComplete,
@@ -36,7 +45,12 @@ pub enum AgentEvent {
     ToolFinished {
         name: String,
         ok: bool,
+        /// One-line summary for the compact transcript row.
         summary: String,
+        /// Pretty-printed tool arguments (for the expandable detail pane).
+        args: String,
+        /// Full tool output returned to the model (for the expandable detail pane).
+        output: String,
     },
 }
 
@@ -56,6 +70,63 @@ fn preview(s: &str, max: usize) -> String {
     out
 }
 
+/// Compact one-line view of tool args (`key=value key2=value2 …`).
+fn args_preview(args: &Value, max: usize) -> String {
+    let raw = match args {
+        Value::Object(map) if !map.is_empty() => map
+            .iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    Value::String(s) => preview(s, 40),
+                    other => other.to_string(),
+                };
+                format!("{k}={val}")
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    preview(&raw, max)
+}
+
+/// Multi-line pretty args for the expandable tool detail pane.
+fn format_args_detail(args: &Value) -> String {
+    match args {
+        Value::Object(map) if !map.is_empty() => map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => {
+                    if s.contains('\n') || s.chars().count() > 80 {
+                        format!("{k}:\n{s}")
+                    } else {
+                        format!("{k}: {s}")
+                    }
+                }
+                other => format!("{k}: {other}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Compact tool-result summary with size so users know they can expand.
+fn tool_output_summary(output: &str) -> String {
+    let n = output.chars().count();
+    let head = preview(output, 72);
+    if n == 0 {
+        "(empty)".into()
+    } else if head.is_empty() {
+        format!("{n} chars")
+    } else if n > 72 || output.lines().nth(1).is_some() {
+        format!("{head}  · {n} chars")
+    } else {
+        head
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -73,7 +144,7 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    fn user(content: impl Into<String>) -> Self {
+    pub(crate) fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
@@ -83,7 +154,7 @@ impl ChatMessage {
         }
     }
 
-    fn assistant(content: impl Into<String>, tool_calls: Option<Value>) -> Self {
+    pub(crate) fn assistant(content: impl Into<String>, tool_calls: Option<Value>) -> Self {
         Self {
             role: "assistant".into(),
             content: content.into(),
@@ -93,7 +164,7 @@ impl ChatMessage {
         }
     }
 
-    fn tool(content: impl Into<String>, call_id: String, name: String) -> Self {
+    pub(crate) fn tool(content: impl Into<String>, call_id: String, name: String) -> Self {
         Self {
             role: "tool".into(),
             content: content.into(),
@@ -112,6 +183,19 @@ pub struct AgentSession {
     pub workspace_root: PathBuf,
     pub subagents_enabled: bool,
     pub runtime_id: Option<String>,
+    /// Compacted-view marker: when set, requests replace
+    /// `messages[..first_kept_index]` with the summary. The full history stays
+    /// in `messages` and in the session file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<SessionCompaction>,
+}
+
+/// See [`AgentSession::compaction`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCompaction {
+    pub first_kept_index: usize,
+    pub summary: String,
+    pub chars_before: usize,
 }
 
 impl AgentSession {
@@ -123,8 +207,53 @@ impl AgentSession {
             workspace_root: workspace,
             subagents_enabled,
             runtime_id: None,
+            compaction: None,
         }
     }
+}
+
+/// Truncate `messages` at the first protocol violation: an assistant message
+/// carrying `tool_calls` must be followed by one `role:"tool"` reply per call
+/// id, and a tool reply must follow such an assistant message. Heals
+/// histories cut short by an aborted turn (the only way LocalCode produces
+/// them); truncation is the one repair that is always protocol-valid.
+/// Returns how many messages were dropped.
+pub(crate) fn sanitize_history(messages: &mut Vec<ChatMessage>) -> usize {
+    let mut valid = messages.len();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        if m.role == "assistant" {
+            if let Some(calls) = m.tool_calls.as_ref().and_then(|v| v.as_array()) {
+                let mut awaiting: std::collections::HashSet<&str> = calls
+                    .iter()
+                    .filter_map(|c| c.get("id").and_then(Value::as_str))
+                    .collect();
+                let mut j = i + 1;
+                while j < messages.len() && messages[j].role == "tool" {
+                    if let Some(id) = &messages[j].tool_call_id {
+                        awaiting.remove(id.as_str());
+                    }
+                    j += 1;
+                }
+                if !awaiting.is_empty() {
+                    valid = i;
+                    break;
+                }
+                i = j;
+                continue;
+            }
+        }
+        if m.role == "tool" {
+            // A tool reply not consumed above has no matching assistant call.
+            valid = i;
+            break;
+        }
+        i += 1;
+    }
+    let dropped = messages.len() - valid;
+    messages.truncate(valid);
+    dropped
 }
 
 pub struct CodingAgent {
@@ -192,6 +321,13 @@ impl CodingAgent {
             .with_cause("No workspace root"));
         }
 
+        // Heal a history cut short by an aborted turn (dangling tool calls)
+        // before extending it — strict servers reject the broken shape.
+        let healed = sanitize_history(&mut session.messages);
+        if healed > 0 {
+            debug!(healed, "dropped incomplete trailing tool exchange from history");
+        }
+
         session.messages.push(ChatMessage::user(user_text));
 
         let system = self.build_system_prompt(session);
@@ -211,6 +347,9 @@ impl CodingAgent {
             // When the runtime didn't stream, surface the whole message as one
             // delta so UIs render intermediate rounds the same way.
             if !response.streamed {
+                if let Some(t) = response.thinking.as_deref().filter(|c| !c.is_empty()) {
+                    emit(events, AgentEvent::ThinkingDelta(t.to_string()));
+                }
                 if let Some(c) = response.content.as_deref().filter(|c| !c.is_empty()) {
                     emit(events, AgentEvent::Delta(c.to_string()));
                 }
@@ -227,11 +366,12 @@ impl CodingAgent {
                 ));
 
                 for tc in tool_calls {
+                    let args_full = format_args_detail(&tc.arguments);
                     emit(
                         events,
                         AgentEvent::ToolStarted {
                             name: tc.name.clone(),
-                            args_preview: preview(&tc.arguments.to_string(), 60),
+                            args_preview: args_preview(&tc.arguments, 60),
                         },
                     );
 
@@ -275,7 +415,9 @@ impl CodingAgent {
                         AgentEvent::ToolFinished {
                             name: tc.name.clone(),
                             ok: result.is_ok(),
-                            summary: preview(&content, 80),
+                            summary: tool_output_summary(&content),
+                            args: args_full,
+                            output: content.clone(),
                         },
                     );
 
@@ -498,8 +640,9 @@ impl CodingAgent {
         Ok(response)
     }
 
-    /// Consume an OpenAI-style SSE stream, emitting `Delta` events as content
-    /// arrives and accumulating tool-call fragments into a full response.
+    /// Consume an OpenAI-style SSE stream, emitting `Delta` / `ThinkingDelta`
+    /// events as tokens arrive and accumulating tool-call fragments into a
+    /// full response.
     async fn read_sse_response(
         &self,
         resp: reqwest::Response,
@@ -523,8 +666,11 @@ impl CodingAgent {
                     done = true;
                     break;
                 }
-                if let Some(delta) = acc.feed(&payload)? {
-                    emit(events, AgentEvent::Delta(delta));
+                for piece in acc.feed(&payload)? {
+                    match piece {
+                        StreamPiece::Content(t) => emit(events, AgentEvent::Delta(t)),
+                        StreamPiece::Thinking(t) => emit(events, AgentEvent::ThinkingDelta(t)),
+                    }
                 }
             }
             if done {
@@ -533,7 +679,10 @@ impl CodingAgent {
         }
 
         let response = acc.finish();
-        if response.content.is_none() && response.tool_calls.is_none() {
+        if response.content.is_none()
+            && response.tool_calls.is_none()
+            && response.thinking.is_none()
+        {
             return Err(LocalCodeError::new(
                 ErrorCode::Internal,
                 "Runtime stream ended without content or tool calls",
@@ -544,6 +693,13 @@ impl CodingAgent {
         }
         Ok(response)
     }
+}
+
+/// One streamed token bucket: final answer text vs model reasoning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamPiece {
+    Content(String),
+    Thinking(String),
 }
 
 /// Parse a non-streaming chat completion body.
@@ -558,7 +714,29 @@ fn parse_full_response(v: &Value) -> Result<LlmResponse, LocalCodeError> {
                 .with_hint("Check runtime logs")
         })?;
     let choice = &choices[0]["message"];
-    let content = choice["content"].as_str().map(|s| s.to_string());
+    let mut content = choice["content"].as_str().map(|s| s.to_string());
+    // Structured reasoning fields (OpenAI o-series, DeepSeek, OpenRouter, …).
+    let mut thinking = choice
+        .get("reasoning_content")
+        .or_else(|| choice.get("reasoning"))
+        .or_else(|| choice.get("thinking"))
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // Local models often put CoT inside `<think>…</think>` in content.
+    if let Some(c) = content.take() {
+        let (tag_think, rest) = split_think_tags(&c);
+        if let Some(t) = tag_think {
+            thinking = Some(match thinking {
+                Some(mut existing) => {
+                    existing.push_str(&t);
+                    existing
+                }
+                None => t,
+            });
+        }
+        content = if rest.is_empty() { None } else { Some(rest) };
+    }
 
     let mut tool_calls = None;
     let mut raw_tool_calls = None;
@@ -585,10 +763,76 @@ fn parse_full_response(v: &Value) -> Result<LlmResponse, LocalCodeError> {
 
     Ok(LlmResponse {
         content,
+        thinking,
         tool_calls,
         raw_tool_calls,
         streamed: false,
     })
+}
+
+/// Pull `<think>…</think>` (and `<thinking>…`) blocks out of assistant text.
+/// Returns `(thinking, remaining_content)`.
+fn split_think_tags(s: &str) -> (Option<String>, String) {
+    let lower = s.to_ascii_lowercase();
+    let open_tags = ["<think>", "<thinking>"];
+    let close_tags = ["</think>", "</thinking>"];
+
+    let mut thinking = String::new();
+    let mut content = String::new();
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    let lower_bytes = lower.as_bytes();
+
+    while i < bytes.len() {
+        // Find the next open tag at or after i.
+        let mut open_at: Option<(usize, usize, usize)> = None; // (pos, open_len, close_idx)
+        for (ti, tag) in open_tags.iter().enumerate() {
+            if let Some(rel) = find_bytes(&lower_bytes[i..], tag.as_bytes()) {
+                let pos = i + rel;
+                let candidate = (pos, tag.len(), ti);
+                open_at = Some(match open_at {
+                    Some(prev) if prev.0 <= pos => prev,
+                    _ => candidate,
+                });
+            }
+        }
+        let Some((pos, open_len, ti)) = open_at else {
+            content.push_str(&s[i..]);
+            break;
+        };
+        content.push_str(&s[i..pos]);
+        let body_start = pos + open_len;
+        let close = close_tags[ti].as_bytes();
+        if let Some(rel) = find_bytes(&lower_bytes[body_start..], close) {
+            let body_end = body_start + rel;
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(&s[body_start..body_end]);
+            i = body_end + close.len();
+        } else {
+            // Unclosed tag: rest is thinking.
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(&s[body_start..]);
+            i = bytes.len();
+        }
+    }
+
+    let thinking = if thinking.is_empty() {
+        None
+    } else {
+        Some(thinking)
+    };
+    (thinking, content)
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Append `chunk` and drain complete lines, returning the payload of each
@@ -611,12 +855,15 @@ fn drain_sse_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
     out
 }
 
-/// Accumulates OpenAI streaming deltas (content text and indexed tool-call
-/// fragments) into a complete [`LlmResponse`].
+/// Accumulates OpenAI streaming deltas (content, reasoning, and indexed
+/// tool-call fragments) into a complete [`LlmResponse`].
 #[derive(Default)]
 struct SseAccumulator {
     content: String,
+    thinking: String,
     tool_calls: Vec<PartialToolCall>,
+    /// Streaming splitter for models that emit CoT as `<think>` inside content.
+    think_filter: ThinkTagFilter,
 }
 
 #[derive(Default, Clone)]
@@ -626,16 +873,116 @@ struct PartialToolCall {
     arguments: String,
 }
 
+/// Incremental splitter for `<think>…</think>` / `<thinking>…</thinking>` tags
+/// that arrive mid-stream inside `delta.content`.
+#[derive(Default)]
+struct ThinkTagFilter {
+    in_think: bool,
+    /// Partial match for an open/close tag split across chunks.
+    hold: String,
+}
+
+impl ThinkTagFilter {
+    fn push(&mut self, text: &str) -> Vec<StreamPiece> {
+        let mut out = Vec::new();
+        // Work on a combined buffer so tags split across chunks still match.
+        self.hold.push_str(text);
+        loop {
+            if self.hold.is_empty() {
+                break;
+            }
+            let lower = self.hold.to_ascii_lowercase();
+            if self.in_think {
+                let close = if let Some(i) = lower.find("</think>") {
+                    Some((i, 8))
+                } else if let Some(i) = lower.find("</thinking>") {
+                    Some((i, 11))
+                } else {
+                    None
+                };
+                if let Some((i, n)) = close {
+                    let body = self.hold[..i].to_string();
+                    if !body.is_empty() {
+                        out.push(StreamPiece::Thinking(body));
+                    }
+                    self.hold = self.hold[i + n..].to_string();
+                    self.in_think = false;
+                    continue;
+                }
+                // Keep a short tail that might be a partial close tag.
+                let keep = partial_tag_suffix(&lower, &["</think>", "</thinking>"]);
+                let emit_len = self.hold.len().saturating_sub(keep);
+                if emit_len > 0 {
+                    out.push(StreamPiece::Thinking(self.hold[..emit_len].to_string()));
+                    self.hold = self.hold[emit_len..].to_string();
+                }
+                break;
+            } else {
+                let open = if let Some(i) = lower.find("<think>") {
+                    Some((i, 7))
+                } else if let Some(i) = lower.find("<thinking>") {
+                    Some((i, 10))
+                } else {
+                    None
+                };
+                if let Some((i, n)) = open {
+                    let body = self.hold[..i].to_string();
+                    if !body.is_empty() {
+                        out.push(StreamPiece::Content(body));
+                    }
+                    self.hold = self.hold[i + n..].to_string();
+                    self.in_think = true;
+                    continue;
+                }
+                let keep = partial_tag_suffix(&lower, &["<think>", "<thinking>"]);
+                let emit_len = self.hold.len().saturating_sub(keep);
+                if emit_len > 0 {
+                    out.push(StreamPiece::Content(self.hold[..emit_len].to_string()));
+                    self.hold = self.hold[emit_len..].to_string();
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    /// Flush any held partial tag text at end of stream (treat as content/thinking).
+    fn finish(&mut self) -> Option<StreamPiece> {
+        if self.hold.is_empty() {
+            return None;
+        }
+        let rest = std::mem::take(&mut self.hold);
+        Some(if self.in_think {
+            StreamPiece::Thinking(rest)
+        } else {
+            StreamPiece::Content(rest)
+        })
+    }
+}
+
+/// Bytes at the end of `lower` that could still grow into one of `tags`.
+fn partial_tag_suffix(lower: &str, tags: &[&str]) -> usize {
+    let max = tags.iter().map(|t| t.len()).max().unwrap_or(0);
+    let n = lower.len().min(max.saturating_sub(1));
+    for keep in (1..=n).rev() {
+        let suffix = &lower[lower.len() - keep..];
+        if tags.iter().any(|t| t.starts_with(suffix)) {
+            return keep;
+        }
+    }
+    0
+}
+
 impl SseAccumulator {
-    /// Feed one `data:` payload. Returns the content delta to surface, if any.
+    /// Feed one `data:` payload. Returns zero or more content/thinking pieces.
     /// Unparsable payloads are skipped (some servers interleave keep-alives);
     /// an explicit `error` object fails the turn.
-    fn feed(&mut self, payload: &str) -> Result<Option<String>, LocalCodeError> {
+    fn feed(&mut self, payload: &str) -> Result<Vec<StreamPiece>, LocalCodeError> {
         let v: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, payload, "skipping unparsable SSE payload");
-                return Ok(None);
+                return Ok(Vec::new());
             }
         };
         if let Some(err) = v.get("error") {
@@ -670,20 +1017,50 @@ impl SseAccumulator {
                 }
             }
         }
-        if let Some(text) = delta["content"].as_str() {
-            if !text.is_empty() {
-                self.content.push_str(text);
-                return Ok(Some(text.to_string()));
+
+        let mut pieces = Vec::new();
+
+        // Structured reasoning channels (preferred over tag scraping).
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(text) = delta.get(key).and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    self.thinking.push_str(text);
+                    pieces.push(StreamPiece::Thinking(text.to_string()));
+                }
             }
         }
-        Ok(None)
+
+        if let Some(text) = delta["content"].as_str() {
+            if !text.is_empty() {
+                for piece in self.think_filter.push(text) {
+                    match &piece {
+                        StreamPiece::Content(t) => self.content.push_str(t),
+                        StreamPiece::Thinking(t) => self.thinking.push_str(t),
+                    }
+                    pieces.push(piece);
+                }
+            }
+        }
+        Ok(pieces)
     }
 
-    fn finish(self) -> LlmResponse {
+    fn finish(mut self) -> LlmResponse {
+        if let Some(piece) = self.think_filter.finish() {
+            match piece {
+                StreamPiece::Content(t) => self.content.push_str(&t),
+                StreamPiece::Thinking(t) => self.thinking.push_str(&t),
+            }
+        }
+
         let content = if self.content.is_empty() {
             None
         } else {
             Some(self.content)
+        };
+        let thinking = if self.thinking.is_empty() {
+            None
+        } else {
+            Some(self.thinking)
         };
 
         let mut tool_calls = None;
@@ -725,6 +1102,7 @@ impl SseAccumulator {
 
         LlmResponse {
             content,
+            thinking,
             tool_calls,
             raw_tool_calls,
             streamed: true,
@@ -734,9 +1112,10 @@ impl SseAccumulator {
 
 struct LlmResponse {
     content: Option<String>,
+    thinking: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
     raw_tool_calls: Option<Value>,
-    /// True when content already went out as `Delta` events.
+    /// True when content already went out as `Delta` / `ThinkingDelta` events.
     streamed: bool,
 }
 
@@ -933,6 +1312,48 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_history_truncates_at_first_violation() {
+        let user = |s: &str| ChatMessage::user(s);
+        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc);
+        let tool = |s: &str, id: &str| ChatMessage::tool(s, id.into(), "fs.read".into());
+        let calls = |ids: &[&str]| {
+            let arr: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+            Some(json!(arr))
+        };
+
+        // A complete history is untouched.
+        let mut ok = vec![
+            user("q"),
+            asst("", calls(&["c1", "c2"])),
+            tool("r1", "c1"),
+            tool("r2", "c2"),
+            asst("answer", None),
+        ];
+        assert_eq!(sanitize_history(&mut ok), 0);
+        assert_eq!(ok.len(), 5);
+
+        // Aborted turn: calls with no replies drop from the assistant on.
+        let mut aborted = vec![user("q"), asst("", calls(&["c1"]))];
+        assert_eq!(sanitize_history(&mut aborted), 1);
+        assert_eq!(aborted.len(), 1);
+
+        // Partial replies count as a violation too.
+        let mut partial = vec![
+            user("q"),
+            asst("", calls(&["c1", "c2"])),
+            tool("r1", "c1"),
+            user("later"),
+        ];
+        assert_eq!(sanitize_history(&mut partial), 3);
+        assert_eq!(partial.len(), 1);
+
+        // A stray tool reply with no preceding call is a violation.
+        let mut stray = vec![user("q"), tool("r", "c9"), asst("a", None)];
+        assert_eq!(sanitize_history(&mut stray), 2);
+        assert_eq!(stray.len(), 1);
+    }
+
+    #[test]
     fn tool_messages_serialize_protocol_fields() {
         let m = ChatMessage::tool("ok", "call_1".into(), "fs.read".into());
         let v = serde_json::to_value(&m).unwrap();
@@ -965,20 +1386,63 @@ mod tests {
         let d1 = acc
             .feed(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#)
             .unwrap();
-        assert_eq!(d1.as_deref(), Some("Hel"));
+        assert_eq!(d1, vec![StreamPiece::Content("Hel".into())]);
         let d2 = acc
             .feed(r#"{"choices":[{"delta":{"content":"lo"}}]}"#)
             .unwrap();
-        assert_eq!(d2.as_deref(), Some("lo"));
+        assert_eq!(d2, vec![StreamPiece::Content("lo".into())]);
         // Role-only / finish chunks produce no delta.
         assert!(acc
             .feed(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
             .unwrap()
-            .is_none());
+            .is_empty());
         let resp = acc.finish();
         assert_eq!(resp.content.as_deref(), Some("Hello"));
+        assert!(resp.thinking.is_none());
         assert!(resp.tool_calls.is_none());
         assert!(resp.streamed);
+    }
+
+    #[test]
+    fn sse_accumulates_reasoning_content() {
+        let mut acc = SseAccumulator::default();
+        let d = acc
+            .feed(r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#)
+            .unwrap();
+        assert_eq!(d, vec![StreamPiece::Thinking("hmm".into())]);
+        let d = acc
+            .feed(r#"{"choices":[{"delta":{"content":"ok"}}]}"#)
+            .unwrap();
+        assert_eq!(d, vec![StreamPiece::Content("ok".into())]);
+        let resp = acc.finish();
+        assert_eq!(resp.thinking.as_deref(), Some("hmm"));
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn sse_splits_think_tags_in_content() {
+        let mut acc = SseAccumulator::default();
+        // Tag split across chunks.
+        for payload in [
+            r#"{"choices":[{"delta":{"content":"<thi"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"nk>plan"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"</think>done"}}]}"#,
+        ] {
+            acc.feed(payload).unwrap();
+        }
+        let resp = acc.finish();
+        assert_eq!(resp.thinking.as_deref(), Some("plan"));
+        assert_eq!(resp.content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn split_think_tags_extracts_blocks() {
+        let (t, c) = split_think_tags("<think>reason</think>\nanswer");
+        assert_eq!(t.as_deref(), Some("reason"));
+        assert_eq!(c, "\nanswer");
+        let (t, c) = split_think_tags("no tags here");
+        assert!(t.is_none());
+        assert_eq!(c, "no tags here");
     }
 
     #[test]
@@ -1014,6 +1478,6 @@ mod tests {
             .expect_err("error payload must fail");
         assert!(err.message.contains("model exploded"));
         // Garbage payloads are skipped, not fatal.
-        assert!(acc.feed("not json").unwrap().is_none());
+        assert!(acc.feed("not json").unwrap().is_empty());
     }
 }

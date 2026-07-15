@@ -278,6 +278,11 @@ fn serve_args(
         args.push("--tensor-parallel-size".into());
         args.push(tp.to_string());
     }
+    for a in &tuning.extra_args {
+        if !a.is_empty() {
+            args.push(a.clone());
+        }
+    }
     args
 }
 
@@ -347,6 +352,7 @@ mod tests {
             gpu_memory_fraction: Some(0.85),
             tensor_parallel: Some(2),
             gpu_layers: None,
+            extra_args: vec!["--enforce-eager".into()],
         };
         let args = serve_args("org/model", "127.0.0.1", 8000, 8192, &tuning);
         let i = args
@@ -359,6 +365,7 @@ mod tests {
             .position(|a| a == "--tensor-parallel-size")
             .expect("tp flag present");
         assert_eq!(args[j + 1], "2");
+        assert!(args.iter().any(|a| a == "--enforce-eager"));
     }
 
     #[test]

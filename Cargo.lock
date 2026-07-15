@@ -1656,13 +1656,21 @@ dependencies = [
 name = "localcode-assistant"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "localcode-agent",
+ "localcode-backends",
  "localcode-core",
+ "localcode-hf",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+ "which",
 ]
 
 [[package]]

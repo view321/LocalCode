@@ -230,8 +230,26 @@ impl Default for SglangConfig {
     }
 }
 
+/// Whether the user has accepted, declined, or not yet been asked about the
+/// bundled local Bonsai assistant (~3.8 GB GGUF + llama.cpp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalAssistantPreference {
+    /// First launch: show the install offer.
+    #[default]
+    NotPrompted,
+    /// User declined; do not auto-offer again (can re-enable in Settings).
+    Declined,
+    /// User accepted; llama.cpp + model should be installed / kept ready.
+    Accepted,
+}
+
+/// In-app repair assistant. Prefer the local Bonsai model (llama.cpp) when
+/// installed; fall back to a hosted OpenAI-compatible provider when configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantConfig {
+    /// Hosted provider id when not using the local Bonsai runtime:
+    /// `openrouter` | `openai_compatible` | `self_hosted` | `custom` | `local`.
     #[serde(default = "default_assistant_provider")]
     pub provider: String,
     #[serde(default = "default_openrouter_url")]
@@ -241,6 +259,33 @@ pub struct AssistantConfig {
     /// Env var name holding the API key (never store key in config).
     #[serde(default = "default_assistant_key_env")]
     pub api_key_env: String,
+    /// Install decision for the bundled local Bonsai assistant.
+    #[serde(default)]
+    pub local_preference: LocalAssistantPreference,
+    /// When true (default), use the local Bonsai runtime whenever it is ready,
+    /// even if a hosted provider is also configured.
+    #[serde(default = "default_true")]
+    pub prefer_local: bool,
+    /// Dedicated `llama-server` port for the assistant (avoids clashing with
+    /// user deploys on the default 8080).
+    #[serde(default = "default_assistant_port")]
+    pub local_port: u16,
+    /// Context length for the local assistant server.
+    #[serde(default = "default_assistant_ctx")]
+    pub local_context: u32,
+    /// GPU layers for the local assistant (`-1` / large = offload all).
+    #[serde(default = "default_assistant_ngl")]
+    pub local_gpu_layers: i32,
+    /// On structured errors, invoke the local assistant first (when ready)
+    /// before relying only on the Fix/Retry UI.
+    #[serde(default = "default_true")]
+    pub auto_handle_errors: bool,
+    /// Before deploy, read the HF model card and apply recommended server flags.
+    #[serde(default = "default_true")]
+    pub auto_deploy_hints: bool,
+    /// Offer help when the user enters the app (transcript system line).
+    #[serde(default = "default_true")]
+    pub greet_on_startup: bool,
 }
 
 impl Default for AssistantConfig {
@@ -250,6 +295,14 @@ impl Default for AssistantConfig {
             base_url: default_openrouter_url(),
             model: String::new(),
             api_key_env: default_assistant_key_env(),
+            local_preference: LocalAssistantPreference::default(),
+            prefer_local: true,
+            local_port: default_assistant_port(),
+            local_context: default_assistant_ctx(),
+            local_gpu_layers: default_assistant_ngl(),
+            auto_handle_errors: true,
+            auto_deploy_hints: true,
+            greet_on_startup: true,
         }
     }
 }
@@ -396,6 +449,22 @@ pub struct AgentConfig {
     /// session keeps everything. 0 disables trimming.
     #[serde(default = "default_history_chars")]
     pub max_history_chars: usize,
+    /// Persist coding sessions to disk (JSONL under the data dir) so they can
+    /// be resumed after a restart. On by default; the full history is always
+    /// kept in the file even when the request view is trimmed or compacted.
+    #[serde(default = "default_true")]
+    pub sessions_enabled: bool,
+    /// Override directory for session files. Default: `<data>/sessions`.
+    #[serde(default)]
+    pub sessions_dir: Option<String>,
+    /// When history exceeds `max_history_chars`, summarize the older turns
+    /// with the active model instead of silently dropping them. Falls back to
+    /// plain trimming if summarization fails.
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
+    /// How many chars of recent history stay verbatim after a compaction.
+    #[serde(default = "default_compact_keep_chars")]
+    pub compact_keep_recent_chars: usize,
 }
 
 impl AgentConfig {
@@ -428,6 +497,10 @@ impl Default for AgentConfig {
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
             max_history_chars: default_history_chars(),
+            sessions_enabled: true,
+            sessions_dir: None,
+            auto_compact: true,
+            compact_keep_recent_chars: default_compact_keep_chars(),
         }
     }
 }
@@ -657,13 +730,24 @@ fn default_sglang_port() -> u16 {
     30000
 }
 fn default_assistant_provider() -> String {
-    "openrouter".into()
+    // Prefer local Bonsai when installed; hosted providers remain available.
+    "local".into()
 }
 fn default_openrouter_url() -> String {
     "https://openrouter.ai/api/v1".into()
 }
 fn default_assistant_key_env() -> String {
     "OPENROUTER_API_KEY".into()
+}
+fn default_assistant_port() -> u16 {
+    18080
+}
+fn default_assistant_ctx() -> u32 {
+    8192
+}
+fn default_assistant_ngl() -> i32 {
+    // Offload as many layers as fit; llama.cpp clamps to model size.
+    99
 }
 fn default_max_tools() -> u32 {
     32
@@ -672,6 +756,11 @@ fn default_history_chars() -> usize {
     // ≈12k tokens — comfortable for the 16k–32k contexts local coding models
     // typically run with, while still leaving room for tool schemas + output.
     48_000
+}
+fn default_compact_keep_chars() -> usize {
+    // Recent tail kept verbatim through a compaction — enough for the current
+    // task's tool exchanges without re-triggering compaction immediately.
+    20_000
 }
 fn default_composer_rows() -> u16 {
     3
@@ -814,6 +903,12 @@ mod tests {
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.ui.theme, ThemeMode::default(), "default theme round-trips");
         assert_eq!(loaded.backends.default.kind, "ollama");
+        assert_eq!(
+            loaded.assistant.local_preference,
+            LocalAssistantPreference::NotPrompted
+        );
+        assert!(loaded.assistant.prefer_local);
+        assert_eq!(loaded.assistant.local_port, 18080);
     }
 
     #[test]

@@ -88,6 +88,25 @@ Coding is **local-first**: with no runtime deployed it will not silently fall ba
 to a cloud provider. Set `agent.allow_cloud_fallback = true` in config.toml to
 allow using the configured assistant provider instead.
 
+### Local Bonsai assistant (optional)
+
+On first launch LocalCode offers to install a **local repair assistant** based on
+[prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
+(~3.8 GB Q1_0) served by **llama.cpp** (auto-installed):
+
+- You can **decline** — preference is remembered (`assistant.local_preference`).
+- Re-install later with `/assistant install`.
+- When ready, the assistant greets you on each launch, can use **shell + Hugging Face
+  tools**, reads **model cards** to set deploy flags, and is invoked **automatically**
+  on structured errors when available.
+
+Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
+`18080`), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
+
+> Bonsai’s Q1_0_g128 format uses custom llama.cpp kernels from the
+> [PrismML fork](https://github.com/PrismML-Eng/llama.cpp). Stock prebuilds may
+> refuse the quant; point `backends.llamacpp.bin` at a PrismML `llama-server` if load fails.
+
 ### Remote GPU over SSH
 
 Code on your laptop, run the model on a GPU box — even one on an isolated LAN
@@ -239,7 +258,7 @@ crates/
   localcode-payments/   USDC balance client
   localcode-bench/      suites + runner + publish
   localcode-agent/      coding agent, skills, MCP, tools
-  localcode-assistant/  app-repair assistant
+  localcode-assistant/  local Bonsai + hosted app-repair assistant
   localcode-api-client/ VPS REST client
   localcode-upgrade/    update check + self-update
   localcode-tui/        ratatui UI

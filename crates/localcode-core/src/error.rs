@@ -37,6 +37,8 @@ pub enum ErrorCode {
     AgentToolFailed,
     AgentWorkspaceMissing,
     AgentMcpFailed,
+    AgentSessionLoadFailed,
+    AgentSessionSaveFailed,
     // Cloud
     CloudKeyMissing,
     CloudProvisionFailed,
@@ -93,6 +95,8 @@ impl ErrorCode {
             Self::AgentToolFailed => "AGENT_TOOL_FAILED",
             Self::AgentWorkspaceMissing => "AGENT_WORKSPACE_MISSING",
             Self::AgentMcpFailed => "AGENT_MCP_FAILED",
+            Self::AgentSessionLoadFailed => "AGENT_SESSION_LOAD_FAILED",
+            Self::AgentSessionSaveFailed => "AGENT_SESSION_SAVE_FAILED",
             Self::CloudKeyMissing => "CLOUD_KEY_MISSING",
             Self::CloudProvisionFailed => "CLOUD_PROVISION_FAILED",
             Self::CloudQuotaExceeded => "CLOUD_QUOTA_EXCEEDED",

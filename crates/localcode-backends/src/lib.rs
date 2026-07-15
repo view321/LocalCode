@@ -94,11 +94,10 @@ pub struct DetectReport {
     pub ready: bool,
 }
 
-/// Optional, backend-specific launch tuning chosen by the user at deploy time.
-/// Every field is optional; `None` means "use the backend's own default". Each
-/// backend maps the fields it understands onto concrete launch flags and
-/// ignores the rest (e.g. GPU-memory fraction is meaningless to llama.cpp).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Optional, backend-specific launch tuning chosen by the user at deploy time
+/// (or by the local assistant after reading a model card). Fields the backend
+/// does not understand are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeployTuning {
     /// Fraction (0.0–1.0) of VRAM the server may use. vLLM
     /// `--gpu-memory-utilization`, SGLang `--mem-fraction-static`.
@@ -109,6 +108,10 @@ pub struct DeployTuning {
     /// Layers to offload to the GPU. llama.cpp `--n-gpu-layers`, Ollama
     /// `num_gpu`. Negative (llama.cpp convention) offloads all layers.
     pub gpu_layers: Option<i32>,
+    /// Extra CLI flags recommended by the model card (or set by the user).
+    /// Appended after the standard args for llama.cpp / vLLM / SGLang.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

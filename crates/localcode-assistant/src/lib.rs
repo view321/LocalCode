@@ -1,34 +1,47 @@
-//! In-app repair assistant (OpenRouter / OpenAI-compatible / self-hosted).
+//! In-app repair assistant: local Bonsai 27B (llama.cpp) + hosted fallback.
+//!
+//! ## Local assistant
+//! - Model: [`constants::BONSAI_REPO`] / [`constants::BONSAI_FILE`] (~3.8 GB Q1_0)
+//! - Backend: managed `llama-server` (auto-installed)
+//! - Tools: shell, filesystem, git, Hugging Face model cards/search, doctor snapshot
+//! - Onboarding: user is prompted once; decline is remembered
+//!
+//! ## Hosted fallback
+//! OpenRouter / OpenAI-compatible when local is unavailable and a key is set.
 
-use localcode_core::config::AssistantConfig;
+mod agent;
+mod constants;
+mod deploy_hints;
+mod install;
+mod runtime;
+
+pub use agent::{
+    assistant_workspace, ensure_workspace, hints_from_card, AssistantAgent, AssistantContext,
+    AssistantReply, AssistantRequest, ProposedFix,
+};
+pub use constants::{
+    ASSISTANT_DISPLAY_NAME, ASSISTANT_MODEL_ID, ASSISTANT_SYSTEM_PROMPT, BONSAI_BYTES, BONSAI_FILE,
+    BONSAI_REPO,
+};
+pub use deploy_hints::{extract_deploy_hints, DeployHints};
+pub use install::{
+    install_local_assistant, install_need, install_offer_body, model_installed, model_path,
+    resolve_llama_bin, InstallNeed,
+};
+pub use runtime::{
+    ensure_running, is_installed, quant_compatibility_note, LocalAssistantRuntime,
+};
+
+use localcode_core::config::{AssistantConfig, Config, LocalAssistantPreference};
 use localcode_core::error::{ErrorCode, LocalCodeError};
-use serde::{Deserialize, Serialize};
+use localcode_core::paths::AppPaths;
+use localcode_core::runtime::ActiveRuntime;
+use localcode_hf::HfClient;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantRequest {
-    pub user_message: String,
-    pub error_context: Option<serde_json::Value>,
-    pub doctor_report: Option<serde_json::Value>,
-    pub recent_logs: Option<String>,
-    pub config_snapshot_redacted: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantReply {
-    pub message: String,
-    pub proposed_fixes: Vec<ProposedFix>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProposedFix {
-    pub title: String,
-    pub description: String,
-    pub risk: String,
-    pub auto_applyable: bool,
-    pub action: serde_json::Value,
-}
-
+/// High-level façade used by the TUI and CLI.
 pub struct Assistant {
     cfg: AssistantConfig,
     http: reqwest::Client,
@@ -44,39 +57,53 @@ impl Assistant {
         Self { cfg, http }
     }
 
-    /// Hosted providers (openrouter, openai, …) need an API key; the default
-    /// base_url is always non-empty so it must not count as "configured".
-    /// Self-hosted / custom endpoints only need a base_url.
-    pub fn is_configured(&self, api_key: Option<&str>) -> bool {
+    /// Hosted providers need an API key; self-hosted / custom need a base_url.
+    /// Local Bonsai is handled separately via [`is_installed`].
+    pub fn is_hosted_configured(&self, api_key: Option<&str>) -> bool {
         let has_key = api_key.map(|k| !k.is_empty()).unwrap_or(false);
         match self.cfg.provider.as_str() {
+            "local" => false,
             "self_hosted" | "openai_compatible" | "custom" => !self.cfg.base_url.is_empty(),
             _ => has_key,
         }
     }
 
-    pub async fn ask(
+    /// True when *some* assistant path can answer (local installed or hosted).
+    pub fn is_configured(&self, api_key: Option<&str>, paths: Option<&AppPaths>, full: Option<&Config>) -> bool {
+        if let (Some(paths), Some(full)) = (paths, full) {
+            if self.cfg.prefer_local && is_installed(full, paths) {
+                return true;
+            }
+        }
+        self.is_hosted_configured(api_key)
+    }
+
+    /// Legacy helper used by older call sites that only know the API key.
+    pub fn is_configured_legacy(&self, api_key: Option<&str>) -> bool {
+        self.is_hosted_configured(api_key)
+            || self.cfg.provider == "local"
+            || self.cfg.local_preference == LocalAssistantPreference::Accepted
+    }
+
+    /// Simple non-tool chat against a hosted endpoint (legacy OpenRouter path).
+    pub async fn ask_hosted(
         &self,
         req: AssistantRequest,
         api_key: Option<&str>,
     ) -> Result<AssistantReply, LocalCodeError> {
-        if !self.is_configured(api_key) {
+        if !self.is_hosted_configured(api_key) {
             return Err(LocalCodeError::new(
                 ErrorCode::BackendNotReady,
-                "Assistant is not configured",
+                "Hosted assistant is not configured",
             )
             .with_cause("No API key / base URL for assistant provider")
-            .with_hint("Open Setup → Assistant and set OpenRouter or OpenAI-compatible endpoint")
-            .with_hint("Or use a self-hosted model already deployed"));
+            .with_hint("Install the local Bonsai assistant, or set OPENROUTER_API_KEY")
+            .with_hint("Open Setup → Assistant"));
         }
 
-        info!(provider = %self.cfg.provider, "assistant ask");
+        info!(provider = %self.cfg.provider, "assistant hosted ask");
 
-        let system = r#"You are the LocalCode in-app assistant. Help users fix LocalCode itself:
-config, backends, deploys, GPU, cloud keys, payments. Be concrete: list causes and next steps.
-Never initiate crypto spend. Propose config edits as structured suggestions.
-If logs/errors are provided, ground your answer in them."#;
-
+        let system = ASSISTANT_SYSTEM_PROMPT;
         let mut user = req.user_message.clone();
         if let Some(ctx) = &req.error_context {
             user.push_str("\n\n## Error context\n");
@@ -147,17 +174,97 @@ If logs/errors are provided, ground your answer in them."#;
             .unwrap_or("No response")
             .to_string();
 
-        let proposed = extract_proposed_fixes(&message);
-
         Ok(AssistantReply {
-            message,
-            proposed_fixes: proposed,
+            message: message.clone(),
+            proposed_fixes: extract_proposed_fixes_legacy(&message),
+            deploy_hints: None,
         })
+    }
+
+    /// Full tool-using ask: prefer local Bonsai, else hosted.
+    pub async fn ask(
+        &self,
+        req: AssistantRequest,
+        api_key: Option<&str>,
+    ) -> Result<AssistantReply, LocalCodeError> {
+        // Hosted-only path when no paths/runtime were provided (CLI simplicity).
+        self.ask_hosted(req, api_key).await
+    }
+
+    /// Tool-using ask with full LocalCode context (preferred by the TUI).
+    pub async fn ask_with_context(
+        &self,
+        full_cfg: &Config,
+        paths: &AppPaths,
+        ctx: AssistantContext,
+        api_key: Option<&str>,
+        hf: Option<Arc<HfClient>>,
+        workspace: PathBuf,
+        local_runtime: Option<&LocalAssistantRuntime>,
+        approver: Option<&dyn localcode_agent::ToolApprover>,
+    ) -> Result<AssistantReply, LocalCodeError> {
+        let agent = AssistantAgent::new(full_cfg, workspace, hf, &ctx);
+        let user_text = if ctx.user_message.is_empty() {
+            "Help me with LocalCode.".into()
+        } else {
+            ctx.user_message.clone()
+        };
+
+        // Prefer local when ready.
+        if full_cfg.assistant.prefer_local {
+            if let Some(rt) = local_runtime {
+                if rt.is_healthy().await {
+                    info!("assistant ask via local Bonsai");
+                    return agent
+                        .run(&rt.as_active_runtime(), None, &user_text, approver)
+                        .await;
+                }
+            }
+            if is_installed(full_cfg, paths) {
+                match ensure_running(full_cfg, paths).await {
+                    Ok(rt) => {
+                        info!("assistant ask via freshly started local Bonsai");
+                        return agent
+                            .run(&rt.as_active_runtime(), None, &user_text, approver)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "local assistant start failed; trying hosted");
+                        if !self.is_hosted_configured(api_key) {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hosted with tools if OpenAI-compatible endpoint is configured.
+        if self.is_hosted_configured(api_key) {
+            let mut runtime = ActiveRuntime::new(
+                "assistant-hosted",
+                localcode_core::runtime::RuntimeKind::OpenAiCompatible,
+                full_cfg.assistant.base_url.clone(),
+            );
+            runtime.model_id = if full_cfg.assistant.model.is_empty() {
+                Some("openai/gpt-4o-mini".into())
+            } else {
+                Some(full_cfg.assistant.model.clone())
+            };
+            runtime.api_key = api_key.map(|s| s.to_string());
+            info!("assistant ask via hosted provider with tools");
+            return agent.run(&runtime, api_key, &user_text, approver).await;
+        }
+
+        Err(LocalCodeError::new(
+            ErrorCode::BackendNotReady,
+            "Assistant is not available",
+        )
+        .with_cause("Local Bonsai not installed/running and no hosted provider configured")
+        .with_hint("Accept the local assistant install offer, or set OPENROUTER_API_KEY"))
     }
 }
 
-fn extract_proposed_fixes(message: &str) -> Vec<ProposedFix> {
-    // Heuristic: lines starting with "FIX:" become proposed fixes
+fn extract_proposed_fixes_legacy(message: &str) -> Vec<ProposedFix> {
     message
         .lines()
         .filter_map(|l| {
@@ -170,4 +277,25 @@ fn extract_proposed_fixes(message: &str) -> Vec<ProposedFix> {
             })
         })
         .collect()
+}
+
+/// Whether the TUI should show the one-time install offer on startup.
+pub fn should_offer_install(cfg: &Config) -> bool {
+    cfg.assistant.local_preference == LocalAssistantPreference::NotPrompted
+}
+
+/// Greeting line when the user enters the app and the local assistant is ready.
+pub fn startup_greeting(ready: bool) -> String {
+    if ready {
+        format!(
+            "Local assistant ({ASSISTANT_DISPLAY_NAME}) is ready. I can fix backend errors, \
+             read model cards for deploy flags, search Hugging Face, and run shell commands. \
+             Type a question or /assistant — I'll also step in automatically when something fails."
+        )
+    } else {
+        format!(
+            "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant (~3.8 GB) for offline error \
+             repair and model-card-aware deploys. You'll be prompted once, or run /assistant install."
+        )
+    }
 }
