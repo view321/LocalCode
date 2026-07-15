@@ -1,13 +1,13 @@
-//! Install the local Bonsai assistant: managed llama.cpp + GGUF weights.
+//! Install the local Bonsai assistant: managed llama.cpp + first-run `-hf` pull.
 //!
-//! Reuses the backends install plan for llama.cpp and downloads
-//! `prism-ml/Bonsai-27B-gguf` `Bonsai-27B-Q1_0.gguf` (~3.8 GB) into the
-//! assistant data directory. Progress lines are streamed for the TUI.
+//! The model is served with:
+//!   `llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1`
+//! so llama.cpp downloads the GGUF into its cache on first start. We keep a
+//! small readiness marker under the assistant data dir so the TUI knows when
+//! a previous pull succeeded without re-scanning the llama cache.
 
-use crate::constants::{ASSISTANT_DISPLAY_NAME, BONSAI_BYTES, BONSAI_FILE, BONSAI_REPO};
-use localcode_backends::{
-    resolve_install_plan, run_install, InstallPlan, Repoint,
-};
+use crate::constants::{ASSISTANT_DISPLAY_NAME, BONSAI_BYTES, BONSAI_HF_REF, BONSAI_REPO};
+use localcode_backends::{resolve_install_plan, run_install, InstallPlan, Repoint};
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
@@ -15,17 +15,44 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
-/// Where the Bonsai GGUF lives under the assistant data dir.
-pub fn model_path(paths: &AppPaths) -> PathBuf {
-    paths.assistant_dir().join(BONSAI_FILE)
+/// Marker written after a successful `ensure_running` (model pulled + healthy).
+pub fn ready_marker_path(paths: &AppPaths) -> PathBuf {
+    paths.assistant_dir().join(".bonsai-hf-ready")
 }
 
-/// True when the GGUF is present and non-empty (partial downloads use `.part`).
+/// Record that the local assistant model is available (downloaded via -hf).
+pub fn mark_ready(paths: &AppPaths) {
+    let dir = paths.assistant_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        ready_marker_path(paths),
+        format!("{BONSAI_HF_REF}\n"),
+    );
+}
+
+/// True when a previous successful -hf start left a readiness marker, or when
+/// a GGUF from a prior manual install still sits in the assistant dir.
 pub fn model_installed(paths: &AppPaths) -> bool {
-    let p = model_path(paths);
-    std::fs::metadata(&p)
-        .map(|m| m.is_file() && m.len() > 1_000_000)
-        .unwrap_or(false)
+    if ready_marker_path(paths).is_file() {
+        return true;
+    }
+    // Backward-compat: older installs dropped a GGUF into the assistant dir.
+    let legacy = [
+        paths.assistant_dir().join("Bonsai-27B-dspark-Q4_1.gguf"),
+        paths.assistant_dir().join("Bonsai-27B-Q1_0.gguf"),
+    ];
+    legacy.iter().any(|p| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.len() > 1_000_000)
+            .unwrap_or(false)
+    })
+}
+
+/// Where a manually placed GGUF would live (legacy / diagnostics only).
+pub fn model_path(paths: &AppPaths) -> PathBuf {
+    paths
+        .assistant_dir()
+        .join("Bonsai-27B-dspark-Q4_1.gguf")
 }
 
 /// Resolve `llama-server`: config path → PATH → managed backends/llamacpp dir.
@@ -41,8 +68,15 @@ pub fn resolve_llama_bin(cfg: &Config, paths: &AppPaths) -> Option<PathBuf> {
     }
     // Managed install from FetchLlamaCpp.
     let managed = paths.llamacpp_dir();
-    find_file(&managed, if cfg!(windows) { "llama-server.exe" } else { "llama-server" })
-        .or_else(|| find_file(&managed, "llama-server"))
+    find_file(
+        &managed,
+        if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        },
+    )
+    .or_else(|| find_file(&managed, "llama-server"))
 }
 
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -73,11 +107,12 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 /// What still needs to happen before the local assistant can start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallNeed {
-    /// Both llama.cpp and the GGUF are present.
+    /// llama-server is present; model will be pulled via -hf on first start
+    /// (or is already marked ready).
     Ready,
-    /// Need llama.cpp only (model already on disk).
+    /// Need llama.cpp only.
     LlamaCppOnly,
-    /// Need GGUF only (llama-server already on PATH / managed).
+    /// Need first -hf model pull (llama already available).
     ModelOnly,
     /// Need both.
     Both,
@@ -98,28 +133,29 @@ pub fn install_need(cfg: &Config, paths: &AppPaths) -> InstallNeed {
 pub fn install_offer_body(need: &InstallNeed) -> String {
     let size_gb = BONSAI_BYTES as f64 / 1_073_741_824.0;
     match need {
-        InstallNeed::Ready => format!(
-            "{ASSISTANT_DISPLAY_NAME} is already installed and ready."
-        ),
+        InstallNeed::Ready => {
+            format!("{ASSISTANT_DISPLAY_NAME} is already installed and ready.")
+        }
         InstallNeed::LlamaCppOnly => format!(
             "Install llama.cpp (auto) so LocalCode can run the local {ASSISTANT_DISPLAY_NAME} \
-             assistant. The ~{size_gb:.1} GB model is already on disk."
+             assistant. The model pack is already marked ready."
         ),
         InstallNeed::ModelOnly => format!(
-            "Download {ASSISTANT_DISPLAY_NAME} (~{size_gb:.1} GB, {BONSAI_REPO}/{BONSAI_FILE}) \
-             for the local repair assistant. llama.cpp is already available."
+            "Pull {ASSISTANT_DISPLAY_NAME} via llama-server -hf {BONSAI_HF_REF} \
+             (~{size_gb:.1} GB on first launch). llama.cpp is already available."
         ),
         InstallNeed::Both => format!(
             "Install the local {ASSISTANT_DISPLAY_NAME} assistant?\n\n\
              • Auto-install llama.cpp (managed binary)\n\
-             • Download {BONSAI_REPO} ({BONSAI_FILE}, ~{size_gb:.1} GB)\n\n\
-             The assistant helps fix LocalCode errors, reads model cards for deploy flags, \
-             and can use shell + Hugging Face tools. You can decline and use a hosted provider later."
+             • First start: `llama-server -hf {BONSAI_HF_REF}` (~{size_gb:.1} GB)\n\n\
+             This becomes your default conversation model. It can search Hugging Face, \
+             read model cards, help deploy models, and fix LocalCode issues. \
+             You can decline and use a hosted provider later."
         ),
     }
 }
 
-/// Full install: llama.cpp (if needed) + Bonsai GGUF download.
+/// Full install: llama.cpp (if needed) + first -hf pull (start server until healthy).
 /// Returns optional [`Repoint`] when a managed llama-server was fetched.
 pub async fn install_local_assistant(
     cfg: &Config,
@@ -153,181 +189,55 @@ pub async fn install_local_assistant(
         }
     }
 
-    if matches!(need, InstallNeed::ModelOnly | InstallNeed::Both)
-        || !model_installed(paths)
-    {
-        download_bonsai(cfg, paths, &progress).await?;
+    // Ensure llama-server is resolvable after install.
+    let mut cfg = cfg.clone();
+    if let Some(r) = &repoint {
+        cfg.backends.llamacpp.bin = r.bin.clone();
+    }
+    if resolve_llama_bin(&cfg, paths).is_none() {
+        return Err(LocalCodeError::new(
+            ErrorCode::BackendBinaryMissing,
+            "llama-server not found after install",
+        )
+        .with_hint("Install llama.cpp from the Backends panel"));
+    }
+
+    if !model_installed(paths) {
+        let _ = progress.send(format!(
+            "Starting llama-server -hf {BONSAI_HF_REF} (downloads ~{:.1} GB on first run)…",
+            BONSAI_BYTES as f64 / 1_073_741_824.0
+        ));
+        let _ = progress.send(format!(
+            "Repo: https://huggingface.co/{BONSAI_REPO}"
+        ));
+        // Pull + load: ensure_running marks ready on health. Stop afterward so
+        // the TUI warm-start owns the long-lived child (avoids a leaked process).
+        let rt = crate::runtime::ensure_running(&cfg, paths).await.map_err(|e| {
+            e.with_hint(format!(
+                "First-run command: llama-server -hf {BONSAI_HF_REF}"
+            ))
+        })?;
+        rt.stop().await;
+        let _ = progress.send(format!(
+            "{ASSISTANT_DISPLAY_NAME} ready via -hf {BONSAI_HF_REF}"
+        ));
+    } else {
+        let _ = progress.send(format!(
+            "{ASSISTANT_DISPLAY_NAME} already marked ready ({BONSAI_HF_REF})"
+        ));
     }
 
     if !model_installed(paths) {
         return Err(LocalCodeError::new(
             ErrorCode::DeployDownloadFailed,
-            "Bonsai GGUF is missing after install",
+            "Bonsai model was not marked ready after install",
         )
-        .with_hint(format!("Expected {}", model_path(paths).display()))
+        .with_hint(format!("Expected readiness after: llama-server -hf {BONSAI_HF_REF}"))
         .retryable(true));
     }
 
-    let _ = progress.send(format!(
-        "{ASSISTANT_DISPLAY_NAME} ready at {}",
-        model_path(paths).display()
-    ));
-    info!(path = %model_path(paths).display(), "local assistant model installed");
+    info!(hf = BONSAI_HF_REF, "local assistant model installed via -hf");
     Ok(repoint)
-}
-
-async fn download_bonsai(
-    cfg: &Config,
-    paths: &AppPaths,
-    progress: &UnboundedSender<String>,
-) -> Result<(), LocalCodeError> {
-    let dest = model_path(paths);
-    if model_installed(paths) {
-        let _ = progress.send(format!("Cached: {}", dest.display()));
-        return Ok(());
-    }
-
-    let dir = paths.assistant_dir();
-    std::fs::create_dir_all(&dir).map_err(LocalCodeError::from)?;
-
-    let hosts = cfg.hf_mirror_hosts();
-    let mut urls: Vec<String> = hosts
-        .iter()
-        .map(|h| format!("{h}/{BONSAI_REPO}/resolve/main/{BONSAI_FILE}"))
-        .collect();
-    // Also try the HF hub CDN-style path used by some mirrors.
-    urls.push(format!(
-        "https://huggingface.co/{BONSAI_REPO}/resolve/main/{BONSAI_FILE}"
-    ));
-    // Dedupe
-    let mut seen = std::collections::HashSet::new();
-    urls.retain(|u| seen.insert(u.clone()));
-
-    let _ = progress.send(format!(
-        "Downloading {BONSAI_FILE} (~{:.1} GB)…",
-        BONSAI_BYTES as f64 / 1_073_741_824.0
-    ));
-
-    let client = reqwest::Client::builder()
-        .user_agent(format!("LocalCode/{}", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(20))
-        // Large download — no total timeout; cancellation is the caller's job.
-        .build()
-        .map_err(|e| {
-            LocalCodeError::new(ErrorCode::Internal, e.to_string())
-                .with_source("assistant", "download_client")
-        })?;
-
-    let part = dir.join(format!("{BONSAI_FILE}.part"));
-    let mut last_err: Option<LocalCodeError> = None;
-    let token = cfg.hf_token();
-
-    for (i, url) in urls.iter().enumerate() {
-        let label = if i == 0 {
-            format!("GET {BONSAI_FILE}")
-        } else {
-            format!("GET {BONSAI_FILE} (mirror {})", i + 1)
-        };
-        let _ = progress.send(label);
-
-        let mut req = client.get(url);
-        if let Some(t) = &token {
-            req = req.bearer_auth(t);
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(
-                    LocalCodeError::new(ErrorCode::DeployDownloadFailed, e.to_string())
-                        .with_cause(format!("Network error: {url}"))
-                        .retryable(true),
-                );
-                continue;
-            }
-        };
-        if !resp.status().is_success() {
-            last_err = Some(
-                LocalCodeError::new(
-                    ErrorCode::DeployDownloadFailed,
-                    format!("Download failed ({}): {BONSAI_FILE}", resp.status()),
-                )
-                .with_cause(url.clone())
-                .with_hint("Set HF_TOKEN if the repo is gated")
-                .retryable(true),
-            );
-            continue;
-        }
-
-        match stream_to_file(resp, &part, progress).await {
-            Ok(bytes) => {
-                tokio::fs::rename(&part, &dest).await.map_err(|e| {
-                    LocalCodeError::new(ErrorCode::IoError, e.to_string())
-                })?;
-                let _ = progress.send(format!(
-                    "Downloaded {BONSAI_FILE} ({:.1} GB)",
-                    bytes as f64 / 1_073_741_824.0
-                ));
-                return Ok(());
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&part).await;
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        LocalCodeError::new(ErrorCode::DeployDownloadFailed, "No download URLs for Bonsai")
-            .retryable(true)
-    }))
-}
-
-async fn stream_to_file(
-    resp: reqwest::Response,
-    part: &Path,
-    progress: &UnboundedSender<String>,
-) -> Result<u64, LocalCodeError> {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
-    let total = resp.content_length().unwrap_or(BONSAI_BYTES);
-    let mut file = tokio::fs::File::create(part).await.map_err(|e| {
-        LocalCodeError::new(ErrorCode::IoError, e.to_string())
-            .with_cause(format!("Cannot create {}", part.display()))
-    })?;
-
-    let mut stream = resp.bytes_stream();
-    let mut written: u64 = 0;
-    let mut last_pct: u8 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            LocalCodeError::new(ErrorCode::DeployDownloadFailed, e.to_string())
-                .with_cause("Download stream interrupted")
-                .retryable(true)
-        })?;
-        file.write_all(&chunk).await.map_err(|e| {
-            LocalCodeError::new(ErrorCode::IoError, e.to_string())
-                .with_cause("Disk write failed — is there enough free space?")
-        })?;
-        written += chunk.len() as u64;
-        let pct = if total > 0 {
-            ((written * 100) / total).min(100) as u8
-        } else {
-            0
-        };
-        if pct >= last_pct.saturating_add(5) || pct == 100 {
-            last_pct = pct;
-            let _ = progress.send(format!(
-                "Downloading {BONSAI_FILE}: {pct}% ({:.1}/{:.1} GB)",
-                written as f64 / 1_073_741_824.0,
-                total as f64 / 1_073_741_824.0
-            ));
-        }
-    }
-    file.flush().await.map_err(|e| {
-        LocalCodeError::new(ErrorCode::IoError, e.to_string())
-    })?;
-    Ok(written)
 }
 
 #[cfg(test)]
@@ -347,9 +257,20 @@ mod tests {
     }
 
     #[test]
-    fn offer_body_mentions_size() {
+    fn offer_body_mentions_hf_ref() {
         let body = install_offer_body(&InstallNeed::Both);
         assert!(body.contains("Bonsai"));
-        assert!(body.contains("3.5") || body.contains("3.8") || body.contains("GB"));
+        assert!(body.contains("Q4_1") || body.contains("-hf"));
+        assert!(body.contains("GB"));
+    }
+
+    #[test]
+    fn mark_ready_sets_installed() {
+        let dir = tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        assert!(!model_installed(&paths));
+        mark_ready(&paths);
+        assert!(model_installed(&paths));
     }
 }

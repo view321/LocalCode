@@ -231,7 +231,7 @@ impl Default for SglangConfig {
 }
 
 /// Whether the user has accepted, declined, or not yet been asked about the
-/// bundled local Bonsai assistant (~3.8 GB GGUF + llama.cpp).
+/// bundled local Bonsai assistant (`llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalAssistantPreference {
@@ -244,8 +244,9 @@ pub enum LocalAssistantPreference {
     Accepted,
 }
 
-/// In-app repair assistant. Prefer the local Bonsai model (llama.cpp) when
-/// installed; fall back to a hosted OpenAI-compatible provider when configured.
+/// In-app / default-conversation assistant. Prefer the local Bonsai model
+/// (`llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1`) when installed; fall back
+/// to a hosted OpenAI-compatible provider when configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantConfig {
     /// Hosted provider id when not using the local Bonsai runtime:
@@ -399,12 +400,9 @@ impl ApprovalMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    #[serde(default = "default_true")]
-    pub subagents_enabled: bool,
+    /// Directory of skill folders (`*/SKILL.md`). Default: `<data>/skills`.
     #[serde(default)]
     pub skills_dir: Option<String>,
-    #[serde(default)]
-    pub mcp_config: Option<String>,
     /// How much the agent asks before running tools. See [`ApprovalMode`];
     /// read it through [`AgentConfig::approval`], which honors the legacy
     /// `confirm_destructive_tools` off-switch from older configs.
@@ -435,18 +433,17 @@ pub struct AgentConfig {
     /// prompt so the agent follows repo-specific instructions. On by default.
     #[serde(default = "default_true")]
     pub use_agents_md: bool,
-    /// Tool names (e.g. `shell.exec`) the agent is NOT allowed to use. Disabled
+    /// Tool names (e.g. `bash`) the agent is NOT allowed to use. Disabled
     /// tools are hidden from the model and refused if the model asks for them.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
-    /// Skill names to hide from the agent's system prompt.
+    /// Skill names to hide from the agent's system prompt / skill tool.
     #[serde(default)]
     pub disabled_skills: Vec<String>,
     /// Char budget for the message history sent to the model per request.
     /// Local models often run with small context windows; when a session grows
-    /// past this, the oldest turns are dropped from the request (whole user
-    /// turns at a time, so tool-call exchanges are never split). The stored
-    /// session keeps everything. 0 disables trimming.
+    /// past this, the oldest turns are compacted (or trimmed). The stored
+    /// session keeps everything. 0 disables trimming/compaction budgets.
     #[serde(default = "default_history_chars")]
     pub max_history_chars: usize,
     /// Persist coding sessions to disk (JSONL under the data dir) so they can
@@ -465,6 +462,9 @@ pub struct AgentConfig {
     /// How many chars of recent history stay verbatim after a compaction.
     #[serde(default = "default_compact_keep_chars")]
     pub compact_keep_recent_chars: usize,
+    /// Confine `bash` to the workspace (cwd + path checks). On by default.
+    #[serde(default = "default_true")]
+    pub shell_sandbox: bool,
 }
 
 impl AgentConfig {
@@ -483,9 +483,7 @@ impl AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            subagents_enabled: true,
             skills_dir: None,
-            mcp_config: None,
             approval_mode: ApprovalMode::default(),
             confirm_destructive_tools: true,
             allow_cloud_fallback: false,
@@ -501,6 +499,7 @@ impl Default for AgentConfig {
             sessions_dir: None,
             auto_compact: true,
             compact_keep_recent_chars: default_compact_keep_chars(),
+            shell_sandbox: true,
         }
     }
 }

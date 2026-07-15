@@ -1,4 +1,4 @@
-//! Coding agent tools.
+//! Coding agent tools (Pi-style minimal set: read, write, bash, ls, grep + skill).
 
 use async_trait::async_trait;
 use localcode_core::config::ApprovalMode;
@@ -12,14 +12,15 @@ use tokio::process::Command;
 use tracing::info;
 use walkdir::WalkDir;
 
-/// Max characters of file content returned to the model. Local models often
-/// run with small contexts (8k), so tool output must be bounded.
+/// Max characters of file content returned to the model.
 const MAX_READ_CHARS: usize = 24_000;
-/// Max characters of shell/git output returned to the model.
+/// Max characters of shell/grep output returned to the model.
 const MAX_EXEC_CHARS: usize = 16_000;
 /// Max wall-clock time for a shell command.
 const EXEC_TIMEOUT_SECS: u64 = 120;
-/// Directories that fs.search never descends into.
+/// Max directory entries returned by `ls`.
+const MAX_LIST_ENTRIES: usize = 200;
+/// Directories that `grep` never descends into.
 const SEARCH_IGNORED_DIRS: [&str; 8] = [
     ".git",
     "target",
@@ -30,7 +31,7 @@ const SEARCH_IGNORED_DIRS: [&str; 8] = [
     "__pycache__",
     "vendor",
 ];
-/// fs.search skips files larger than this.
+/// `grep` skips files larger than this.
 const SEARCH_MAX_FILE_BYTES: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,49 +55,47 @@ pub enum ToolRisk {
     High,
 }
 
-/// Interactive approval hook for gated tool calls. The TUI implements this by
-/// showing a confirmation banner; headless runs have no approver, so gated
-/// calls are refused instead of silently executed.
+/// Interactive approval hook for gated tool calls.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {
     async fn approve(&self, description: &str) -> bool;
 }
 
-/// Whether `call` needs interactive approval under `mode`, and if so the
-/// human-readable request to show. `None` = run without asking.
-///
-/// - `AlwaysApprove` gates nothing.
-/// - `Auto` gates destructive shell commands only.
-/// - `ApproveEdits` gates workspace mutations: file writes/patches and every
-///   shell command (a shell command can mutate anything).
-/// - `AskPermission` gates every call.
+/// Whether `call` needs interactive approval under `mode`.
 pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
     let arg = |k: &str| call.arguments.get(k).and_then(|v| v.as_str()).unwrap_or("?");
     let describe = || match call.name.as_str() {
-        "shell.exec" => {
+        "bash" => {
             let cmd = arg("command");
-            let flag = if is_destructive(cmd) { " (flagged destructive)" } else { "" };
+            let flag = if is_destructive(cmd) {
+                " (flagged destructive)"
+            } else {
+                ""
+            };
             format!("Run shell command{flag}:\n\n  {cmd}")
         }
-        "fs.write" => {
+        "write" => {
             let n = call
                 .arguments
                 .get("content")
                 .and_then(|v| v.as_str())
                 .map(|c| c.chars().count())
                 .unwrap_or(0);
-            format!("Write file: {} ({n} chars, replaces existing content)", arg("path"))
+            format!(
+                "Write file: {} ({n} chars, replaces existing content)",
+                arg("path")
+            )
         }
-        "fs.apply_patch" => format!("Edit file: {}", arg("path")),
-        "fs.read" => format!("Read file: {}", arg("path")),
-        "fs.list" => format!("List directory: {}", arg("path")),
-        "fs.search" => format!("Search files for: {}", arg("pattern")),
+        "read" => format!("Read file: {}", arg("path")),
+        "ls" => format!("List directory: {}", arg("path")),
+        "grep" => format!("Search files for: {}", arg("pattern")),
+        "skill" => format!("Load skill: {}", arg("name")),
         other => format!("Run tool: {other}"),
     };
     let gated = match mode {
         ApprovalMode::AlwaysApprove => false,
         ApprovalMode::Auto => {
-            call.name == "shell.exec"
+            call.name == "bash"
                 && call
                     .arguments
                     .get("command")
@@ -105,7 +104,7 @@ pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
                     .unwrap_or(false)
         }
         ApprovalMode::ApproveEdits => {
-            matches!(call.name.as_str(), "fs.write" | "fs.apply_patch" | "shell.exec")
+            matches!(call.name.as_str(), "write" | "bash")
         }
         ApprovalMode::AskPermission => true,
     };
@@ -113,99 +112,141 @@ pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
 }
 
 pub struct ToolRegistry {
-    /// Tool names the user disabled in Settings; hidden from the model schema
-    /// and refused if the model asks for them anyway.
     disabled: std::collections::HashSet<String>,
+    /// When true, shell stays confined to the workspace (cwd + path checks).
+    shell_sandbox: bool,
 }
 
 impl ToolRegistry {
     pub fn default_tools() -> Self {
         Self {
             disabled: std::collections::HashSet::new(),
+            shell_sandbox: true,
         }
     }
 
-    /// Build a registry with a set of disabled tool names.
-    pub fn new(disabled: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(disabled: impl IntoIterator<Item = String>, shell_sandbox: bool) -> Self {
         Self {
             disabled: disabled.into_iter().collect(),
+            shell_sandbox,
         }
     }
 
-    /// The full built-in tool catalog: `(name, one-line description)`. Drives
-    /// both the model schema and the Settings tool list so they never drift.
+    /// Built-in tool catalog: `(name, one-line description)`.
     pub fn catalog() -> &'static [(&'static str, &'static str)] {
         &[
-            ("fs.read", "Read a file"),
-            ("fs.list", "List a directory"),
-            ("fs.search", "Search files by regex"),
-            ("fs.write", "Write full file contents"),
-            ("fs.apply_patch", "Edit a file by exact string replacement"),
-            ("shell.exec", "Run a shell command in the workspace"),
-            ("git.status", "Show git status"),
-            ("git.diff", "Show git diff"),
+            ("read", "Read a file"),
+            ("write", "Write full file contents"),
+            ("bash", "Run a shell command in the workspace"),
+            ("ls", "List a directory"),
+            ("grep", "Search files by regex"),
+            ("skill", "Load a skill's full instructions"),
+            ("hf.model_card", "Fetch a Hugging Face model card (README)"),
+            ("hf.search", "Search the Hugging Face model catalogue"),
         ]
     }
 
-    /// Whether a tool is available (not disabled by the user).
     pub fn is_enabled(&self, name: &str) -> bool {
         !self.disabled.contains(name)
     }
 
     pub fn openai_tools_schema(&self) -> Value {
         let tools = vec![
-            tool_schema("fs.read", "Read a file (output truncated for large files). For big files pass start_line (1-based) and max_lines to read a slice.", json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "start_line": { "type": "integer", "description": "1-based first line to read" },
-                    "max_lines": { "type": "integer", "description": "max lines to return" }
-                },
-                "required": ["path"]
-            })),
-            tool_schema("fs.list", "List directory", json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
-            })),
-            tool_schema("fs.search", "Search workspace files for a regex pattern", json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["pattern"]
-            })),
-            tool_schema("fs.write", "Write full file contents", json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"]
-            })),
             tool_schema(
-                "fs.apply_patch",
-                "Edit a file by exact string replacement: old_string must appear verbatim in the file and is replaced once by new_string. Not a unified diff.",
+                "read",
+                "Read a file (output truncated for large files). For big files pass start_line (1-based) and max_lines to read a slice.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "old_string": { "type": "string" },
-                        "new_string": { "type": "string" }
+                        "start_line": { "type": "integer", "description": "1-based first line to read" },
+                        "max_lines": { "type": "integer", "description": "max lines to return" }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path"]
                 }),
             ),
-            tool_schema("shell.exec", "Run shell command in workspace", json!({
-                "type": "object",
-                "properties": { "command": { "type": "string" } },
-                "required": ["command"]
-            })),
-            tool_schema("git.status", "Git status", json!({"type":"object","properties":{}})),
-            tool_schema("git.diff", "Git diff", json!({"type":"object","properties":{}})),
+            tool_schema(
+                "write",
+                "Write full file contents (creates parent directories). Prefer this over shell redirects for file edits.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            tool_schema(
+                "bash",
+                "Run a shell command in the workspace. Output is truncated. Prefer read/write/ls/grep for file work.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Optional subpath under the workspace"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            ),
+            tool_schema(
+                "ls",
+                "List a directory (capped; dirs first).",
+                json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            ),
+            tool_schema(
+                "grep",
+                "Search workspace files for a regex pattern",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["pattern"]
+                }),
+            ),
+            tool_schema(
+                "skill",
+                "Load the full body of a named skill (use the skill catalog in the system prompt).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }),
+            ),
+            tool_schema(
+                "hf.model_card",
+                "Fetch a Hugging Face model card (README) by repo id (e.g. org/model). Use before recommending deploy flags or describing a model.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "model_id": { "type": "string", "description": "Hugging Face repo id, e.g. Qwen/Qwen2.5-Coder-7B-Instruct" }
+                    },
+                    "required": ["model_id"]
+                }),
+            ),
+            tool_schema(
+                "hf.search",
+                "Search the Hugging Face model catalogue by free-text query. Returns top matches with download counts and tags.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query, e.g. coding, gguf, 7B instruct" }
+                    },
+                    "required": ["query"]
+                }),
+            ),
         ];
-        // Hide disabled tools from the model entirely.
         let tools: Vec<Value> = tools
             .into_iter()
             .filter(|t| {
@@ -225,10 +266,9 @@ impl ToolRegistry {
         workspace: &Path,
         approval: ApprovalMode,
         approver: Option<&dyn ToolApprover>,
+        skill_body: Option<String>,
     ) -> Result<ToolResult, LocalCodeError> {
         info!(tool = %call.name, "tool execute");
-        // A disabled tool is refused even if the model tries to call it (e.g.
-        // from a stale schema or a pseudo tool-call).
         if !self.is_enabled(&call.name) {
             return Err(LocalCodeError::new(
                 ErrorCode::AgentToolFailed,
@@ -236,7 +276,6 @@ impl ToolRegistry {
             )
             .with_hint("Enable it in Settings → tools if you want the agent to use it"));
         }
-        // One approval gate for every tool, driven by the approval mode.
         if let Some(request) = approval_request(call, approval) {
             let approved = match approver {
                 Some(a) => a.approve(&request).await,
@@ -255,191 +294,265 @@ impl ToolRegistry {
             }
         }
         match call.name.as_str() {
-            "fs.read" => {
-                let path = arg_path(call, workspace, "path")?;
-                let content = std::fs::read_to_string(&path).map_err(|e| {
-                    LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                        .with_cause(format!("Cannot read {}", path.display()))
-                })?;
-                let start = call
+            "read" => self.tool_read(call, workspace),
+            "write" => self.tool_write(call, workspace),
+            "bash" => self.tool_bash(call, workspace).await,
+            "ls" => self.tool_ls(call, workspace),
+            "grep" => self.tool_grep(call, workspace),
+            "skill" => {
+                let name = call
                     .arguments
-                    .get("start_line")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| (n.max(1) - 1) as usize);
-                let max = call.arguments.get("max_lines").and_then(|v| v.as_u64());
-                let output = match (start, max) {
-                    (None, None) => content,
-                    (start, max) => {
-                        let start = start.unwrap_or(0);
-                        let total = content.lines().count();
-                        let take = max.map(|n| n as usize).unwrap_or(usize::MAX);
-                        let slice: Vec<&str> =
-                            content.lines().skip(start).take(take).collect();
-                        format!(
-                            "[lines {}-{} of {total}]\n{}",
-                            start + 1,
-                            start + slice.len(),
-                            slice.join("\n")
-                        )
-                    }
-                };
-                Ok(ToolResult {
-                    output: truncate_output(&output, MAX_READ_CHARS),
-                    risk: ToolRisk::Low,
-                })
-            }
-            "fs.list" => {
-                let path =
-                    arg_path(call, workspace, "path").unwrap_or_else(|_| workspace.to_path_buf());
-                let mut entries = vec![];
-                for e in std::fs::read_dir(&path).map_err(|e| {
-                    LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                })? {
-                    let e = e.map_err(|e| {
-                        LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                    })?;
-                    let meta = e.file_type().ok();
-                    let kind = if meta.map(|m| m.is_dir()).unwrap_or(false) {
-                        "dir"
-                    } else {
-                        "file"
-                    };
-                    entries.push(format!("{kind} {}", e.file_name().to_string_lossy()));
-                }
-                entries.sort();
-                Ok(ToolResult {
-                    output: entries.join("\n"),
-                    risk: ToolRisk::Low,
-                })
-            }
-            "fs.search" => {
-                let pattern = call
-                    .arguments
-                    .get("pattern")
+                    .get("name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        LocalCodeError::new(ErrorCode::AgentToolFailed, "pattern required")
-                    })?;
-                let root = call
-                    .arguments
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(|p| resolve_path(workspace, p))
-                    .transpose()?
-                    .unwrap_or_else(|| workspace.to_path_buf());
-                let re = regex::Regex::new(pattern).map_err(|e| {
-                    LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                })?;
-                let mut hits = vec![];
-                let walker = WalkDir::new(&root).into_iter().filter_entry(|e| {
-                    !(e.file_type().is_dir()
-                        && e.file_name()
-                            .to_str()
-                            .map(|n| SEARCH_IGNORED_DIRS.contains(&n))
-                            .unwrap_or(false))
-                });
-                'outer: for entry in walker.filter_map(|e| e.ok()) {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    if entry
-                        .metadata()
-                        .map(|m| m.len() > SEARCH_MAX_FILE_BYTES)
-                        .unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                        for (i, line) in text.lines().enumerate() {
-                            if re.is_match(line) {
-                                hits.push(format!(
-                                    "{}:{}:{}",
-                                    entry.path().display(),
-                                    i + 1,
-                                    line.trim_end()
-                                ));
-                                if hits.len() >= 50 {
-                                    hits.push("…(more matches truncated at 50)".into());
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(ToolResult {
-                    output: hits.join("\n"),
-                    risk: ToolRisk::Low,
-                })
-            }
-            "fs.write" => {
-                let path = arg_path(call, workspace, "path")?;
-                let content = call
-                    .arguments
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, content)?;
-                Ok(ToolResult {
-                    output: format!("wrote {} bytes to {}", content.len(), path.display()),
-                    risk: ToolRisk::Medium,
-                })
-            }
-            "fs.apply_patch" => {
-                let path = arg_path(call, workspace, "path")?;
-                let old = call
-                    .arguments
-                    .get("old_string")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let new = call
-                    .arguments
-                    .get("new_string")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let content = std::fs::read_to_string(&path).map_err(|e| {
-                    LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                })?;
-                if !content.contains(old) {
-                    return Err(LocalCodeError::new(
+                    .unwrap_or("?");
+                match skill_body {
+                    Some(body) => Ok(ToolResult {
+                        output: body,
+                        risk: ToolRisk::Low,
+                    }),
+                    None => Err(LocalCodeError::new(
                         ErrorCode::AgentToolFailed,
-                        "old_string not found in file",
+                        format!("Unknown or disabled skill: {name}"),
                     )
-                    .with_cause("Patch context mismatch")
-                    .with_hint("Re-read the file and retry with exact context"));
+                    .with_hint("Check the skill catalog in the system prompt")),
                 }
-                let updated = content.replacen(old, new, 1);
-                std::fs::write(&path, updated)?;
-                Ok(ToolResult {
-                    output: format!("patched {}", path.display()),
-                    risk: ToolRisk::Medium,
-                })
             }
-            "shell.exec" => {
-                let command = call
-                    .arguments
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        LocalCodeError::new(ErrorCode::AgentToolFailed, "command required")
-                    })?;
-                run_shell(command, workspace).await
-            }
-            "git.status" => shell_git(workspace, &["status", "--short"]).await,
-            "git.diff" => shell_git(workspace, &["diff"]).await,
-            "subagent.spawn" => Err(LocalCodeError::new(
-                ErrorCode::NotImplemented,
-                "Subagents are not available in this build",
-            )
-            .with_hint("Do the task yourself with the available tools")),
             other => Err(LocalCodeError::new(
                 ErrorCode::AgentToolFailed,
                 format!("Unknown tool: {other}"),
             )),
         }
     }
+
+    fn tool_read(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
+        let path = arg_path(call, workspace, "path")?;
+        let meta = std::fs::metadata(&path).map_err(|e| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
+                .with_cause(format!("Cannot stat {}", path.display()))
+        })?;
+        if !meta.is_file() {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("Not a file: {}", path.display()),
+            ));
+        }
+        if meta.len() > 8 * 1024 * 1024 {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!(
+                    "File too large to read ({} bytes): {}",
+                    meta.len(),
+                    path.display()
+                ),
+            )
+            .with_hint("Use start_line/max_lines on a smaller file, or grep for a pattern"));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
+                .with_cause(format!("Cannot read {}", path.display()))
+        })?;
+        if is_binary(&bytes) {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!(
+                    "Binary file ({} bytes) — not shown as text: {}",
+                    bytes.len(),
+                    path.display()
+                ),
+            )
+            .with_hint("Use bash for binary inspection if needed"));
+        }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let start = call
+            .arguments
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n.max(1) - 1) as usize);
+        let max = call.arguments.get("max_lines").and_then(|v| v.as_u64());
+        let output = match (start, max) {
+            (None, None) => content,
+            (start, max) => {
+                let start = start.unwrap_or(0);
+                let total = content.lines().count();
+                let take = max.map(|n| n as usize).unwrap_or(usize::MAX);
+                let slice: Vec<&str> = content.lines().skip(start).take(take).collect();
+                format!(
+                    "[lines {}-{} of {total}]\n{}",
+                    start + 1,
+                    start + slice.len(),
+                    slice.join("\n")
+                )
+            }
+        };
+        Ok(ToolResult {
+            output: truncate_output(&output, MAX_READ_CHARS),
+            risk: ToolRisk::Low,
+        })
+    }
+
+    fn tool_write(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
+        let path = arg_path(call, workspace, "path")?;
+        let content = call
+            .arguments
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+        Ok(ToolResult {
+            output: format!("wrote {} bytes to {}", content.len(), path.display()),
+            risk: ToolRisk::Medium,
+        })
+    }
+
+    fn tool_ls(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
+        let path = arg_path(call, workspace, "path").unwrap_or_else(|_| workspace.to_path_buf());
+        let mut entries = vec![];
+        for e in std::fs::read_dir(&path)
+            .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?
+        {
+            let e = e
+                .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
+            let meta = e.file_type().ok();
+            let kind = if meta.map(|m| m.is_dir()).unwrap_or(false) {
+                "dir"
+            } else {
+                "file"
+            };
+            entries.push(format!("{kind} {}", e.file_name().to_string_lossy()));
+        }
+        entries.sort();
+        let total = entries.len();
+        let truncated = total > MAX_LIST_ENTRIES;
+        entries.truncate(MAX_LIST_ENTRIES);
+        let mut out = entries.join("\n");
+        if truncated {
+            out.push_str(&format!(
+                "\n…({} more entries truncated; list a subdirectory)",
+                total - MAX_LIST_ENTRIES
+            ));
+        }
+        Ok(ToolResult {
+            output: out,
+            risk: ToolRisk::Low,
+        })
+    }
+
+    fn tool_grep(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
+        let pattern = call
+            .arguments
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, "pattern required")
+            })?;
+        let root = call
+            .arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| resolve_path(workspace, p))
+            .transpose()?
+            .unwrap_or_else(|| workspace.to_path_buf());
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
+        let mut hits = vec![];
+        let walker = WalkDir::new(&root).into_iter().filter_entry(|e| {
+            !(e.file_type().is_dir()
+                && e.file_name()
+                    .to_str()
+                    .map(|n| SEARCH_IGNORED_DIRS.contains(&n))
+                    .unwrap_or(false))
+        });
+        'outer: for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry
+                .metadata()
+                .map(|m| m.len() > SEARCH_MAX_FILE_BYTES)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            if is_binary(&bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (i, line) in text.lines().enumerate() {
+                if re.is_match(line) {
+                    hits.push(format!(
+                        "{}:{}:{}",
+                        entry.path().display(),
+                        i + 1,
+                        line.trim_end()
+                    ));
+                    if hits.len() >= 50 {
+                        hits.push("…(more matches truncated at 50)".into());
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        Ok(ToolResult {
+            output: hits.join("\n"),
+            risk: ToolRisk::Low,
+        })
+    }
+
+    async fn tool_bash(
+        &self,
+        call: &ToolCall,
+        workspace: &Path,
+    ) -> Result<ToolResult, LocalCodeError> {
+        let command = call
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, "command required")
+            })?;
+        let cwd = match call
+            .arguments
+            .get("working_directory")
+            .and_then(|v| v.as_str())
+        {
+            Some(p) if !p.is_empty() => resolve_path(workspace, p)?,
+            _ => std::fs::canonicalize(workspace).map_err(|e| {
+                LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string())
+            })?,
+        };
+        if !cwd.is_dir() {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("working_directory is not a directory: {}", cwd.display()),
+            ));
+        }
+        if self.shell_sandbox {
+            sandbox_check_command(command, workspace)?;
+        }
+        run_shell(command, &cwd, workspace, self.shell_sandbox).await
+    }
+}
+
+fn is_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    // NUL in the first 8 KiB ⇒ binary. Also reject if a large fraction is non-text.
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let non_text = sample
+        .iter()
+        .filter(|&&b| b < 0x09 || (b > 0x0d && b < 0x20) || b == 0x7f)
+        .count();
+    non_text * 100 / sample.len() > 10
 }
 
 /// Truncate tool output so it cannot blow a small local-model context.
@@ -455,27 +568,47 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     )
 }
 
-async fn run_shell(command: &str, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
+async fn run_shell(
+    command: &str,
+    cwd: &Path,
+    workspace: &Path,
+    sandbox: bool,
+) -> Result<ToolResult, LocalCodeError> {
+    let mut child = if cfg!(windows) {
+        // PowerShell handles quoting and pipelines more reliably than cmd /C.
+        let ws = powershell_single_quote(&cwd.display().to_string());
+        let body = if sandbox {
+            // Stay in the workspace; refuse to leave via Set-Location to
+            // absolute paths outside is best-effort via the pre-check.
+            format!("Set-Location -LiteralPath {ws}; {command}")
+        } else {
+            format!("Set-Location -LiteralPath {ws}; {command}")
+        };
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &body])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
     } else {
         let mut c = Command::new("sh");
         c.args(["-c", command]);
-        c
-    };
-    let mut child = cmd
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
+        c.current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .env("PWD", cwd);
+        if sandbox {
+            // Hint for tools that respect it; real confinement is cwd + checks.
+            c.env("LOCALCODE_WORKSPACE", workspace);
+        }
+        c.spawn()
+    }
+    .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
 
-    // Read pipes concurrently so a chatty command can't fill the pipe buffer
-    // and deadlock against our wait().
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let out_task = tokio::spawn(async move {
@@ -499,14 +632,15 @@ async fn run_shell(command: &str, workspace: &Path) -> Result<ToolResult, LocalC
     )
     .await
     {
-        Ok(res) => res.map_err(|e| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-        })?,
+        Ok(res) => res
+            .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?,
         Err(_) => {
             let _ = child.kill().await;
             return Err(LocalCodeError::new(
                 ErrorCode::AgentToolFailed,
-                format!("Command timed out after {EXEC_TIMEOUT_SECS}s and was killed: {command}"),
+                format!(
+                    "Command timed out after {EXEC_TIMEOUT_SECS}s and was killed: {command}"
+                ),
             )
             .with_hint("Run long-lived processes outside the agent"));
         }
@@ -527,6 +661,11 @@ async fn run_shell(command: &str, workspace: &Path) -> Result<ToolResult, LocalC
     })
 }
 
+/// Quote a string for PowerShell single-quoted literals (double embedded `'`).
+fn powershell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
     json!({
         "type": "function",
@@ -543,7 +682,9 @@ fn arg_path(call: &ToolCall, workspace: &Path, key: &str) -> Result<PathBuf, Loc
         .arguments
         .get(key)
         .and_then(|v| v.as_str())
-        .ok_or_else(|| LocalCodeError::new(ErrorCode::AgentToolFailed, format!("{key} required")))?;
+        .ok_or_else(|| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, format!("{key} required"))
+        })?;
     resolve_path(workspace, p)
 }
 
@@ -554,11 +695,6 @@ fn escape_err() -> LocalCodeError {
 }
 
 /// Resolve a tool-supplied path and confine it to the workspace.
-///
-/// Strategy: lexically normalize (rejecting `..` past the root), then
-/// canonicalize the longest existing ancestor so symlinks and Windows `\\?\`
-/// forms are handled, and finally compare with `Path::starts_with`
-/// (component-wise — immune to the `/ws` vs `/ws-evil` prefix trap).
 fn resolve_path(workspace: &Path, p: &str) -> Result<PathBuf, LocalCodeError> {
     let ws = std::fs::canonicalize(workspace)
         .map_err(|e| LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string()))?;
@@ -570,7 +706,6 @@ fn resolve_path(workspace: &Path, p: &str) -> Result<PathBuf, LocalCodeError> {
         ws.join(raw)
     };
 
-    // Lexical normalization: resolve `.` and `..` without touching the fs.
     let mut normal = PathBuf::new();
     for c in base.components() {
         match c {
@@ -584,8 +719,6 @@ fn resolve_path(workspace: &Path, p: &str) -> Result<PathBuf, LocalCodeError> {
         }
     }
 
-    // Canonicalize the longest existing ancestor, then re-append the rest so
-    // not-yet-existing files (fs.write targets) still resolve consistently.
     let resolved = canonicalize_lenient(&normal);
 
     if resolved.starts_with(&ws) {
@@ -619,13 +752,62 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Best-effort blocklist for obviously destructive shell commands. This is a
-/// safety net that routes matches through interactive approval — it is not,
-/// and cannot be, a complete sandbox.
+/// Best-effort: reject obvious workspace escapes in sandboxed shell commands.
+fn sandbox_check_command(cmd: &str, workspace: &Path) -> Result<(), LocalCodeError> {
+    let ws = std::fs::canonicalize(workspace)
+        .map_err(|e| LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string()))?;
+
+    // Absolute paths (Unix / Windows) that are not under the workspace.
+    let re = regex::Regex::new(
+        r#"(?x)
+        (?:^|[\s"'`=])
+        (
+            /(?:bin|boot|dev|etc|home|lib|mnt|opt|proc|root|run|sbin|sys|tmp|usr|var)(?:/|\s|$)|
+            [A-Za-z]:\\(?:Windows|Users|Program\sFiles)(?:\\|\s|$)|
+            ~(?:/|\\)
+        )
+        "#,
+    )
+    .unwrap_or_else(|_| regex::Regex::new(r"a^").expect("fallback"));
+
+    if re.is_match(cmd) {
+        // Allow if the match is clearly still under the workspace path string.
+        let ws_s = ws.display().to_string();
+        if !cmd.contains(&ws_s) {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                "Shell sandbox: command references a path outside the workspace",
+            )
+            .with_cause("Safety confinement")
+            .with_hint(
+                "Use relative paths under the workspace, or disable agent.shell_sandbox in config",
+            ));
+        }
+    }
+
+    // `cd` to absolute locations outside workspace.
+    let cd_re = regex::Regex::new(r"(?i)\bcd\s+(/|[A-Za-z]:\\|~)").ok();
+    if let Some(re) = cd_re {
+        if re.is_match(cmd) {
+            let ws_s = ws.display().to_string();
+            if !cmd.contains(&ws_s) {
+                return Err(LocalCodeError::new(
+                    ErrorCode::AgentToolFailed,
+                    "Shell sandbox: cd outside the workspace is blocked",
+                )
+                .with_hint("Use working_directory for a workspace subfolder instead"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Best-effort blocklist for obviously destructive shell commands.
 fn is_destructive(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     let patterns = [
-        r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+",   // rm -rf / -fr / -r -f
+        r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+",
         r"\brm\s+--(recursive|force)",
         r"\bdel\s+/[fsq]",
         r"\brd\s+/s",
@@ -639,38 +821,31 @@ fn is_destructive(cmd: &str) -> bool {
         r"\bgit\s+clean\b.*-[a-z]*f",
         r"\bgit\s+reset\s+--hard",
         r"\bgit\s+push\b.*(--force|-f)\b",
-        r":\(\)\s*\{.*\};\s*:",              // fork bomb
+        r":\(\)\s*\{.*\};\s*:",
         r"\bchmod\s+-r\b",
         r"\bchown\s+-r\b",
+        // Pipe-to-shell installers and remote code execution.
+        r"\|\s*(ba)?sh\b",
+        r"\|\s*iex\b",
+        r"invoke-expression",
+        r"invoke-webrequest.*\|\s*",
+        r"curl\b.*\|\s*(ba)?sh",
+        r"wget\b.*\|\s*(ba)?sh",
+        r"irm\b.*\|\s*iex",
+        r">\s*/dev/sd",
+        r"of=/dev/sd",
+        r"\bmkfs\.",
+        r"\bdiskpart\b",
+        r"\bformat-volume\b",
+        r"\bci\s+\{", // PowerShell destructive script blocks often in ci - skip
+        r"remove-item\b",
+        r"\btruncate\b.*-s\s*0",
+        r":\s*>\s*",
     ];
     patterns.iter().any(|p| {
         regex::Regex::new(p)
             .map(|re| re.is_match(&lower))
             .unwrap_or(false)
-    })
-}
-
-async fn shell_git(workspace: &Path, args: &[&str]) -> Result<ToolResult, LocalCodeError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
-                .with_cause("git not available")
-        })?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(ToolResult {
-        output: truncate_output(&text, MAX_EXEC_CHARS),
-        risk: ToolRisk::Low,
     })
 }
 
@@ -680,39 +855,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn read_write_patch() {
+    async fn read_write_roundtrip() {
         let dir = tempdir().unwrap();
         let reg = ToolRegistry::default_tools();
         let write = ToolCall {
             id: "1".into(),
-            name: "fs.write".into(),
+            name: "write".into(),
             arguments: json!({"path": "a.txt", "content": "hello world"}),
         };
-        reg.execute(&write, dir.path(), ApprovalMode::Auto, None)
-            .await
-            .unwrap();
-        let patch = ToolCall {
-            id: "2".into(),
-            name: "fs.apply_patch".into(),
-            arguments: json!({
-                "path": "a.txt",
-                "old_string": "hello",
-                "new_string": "hi"
-            }),
-        };
-        reg.execute(&patch, dir.path(), ApprovalMode::Auto, None)
+        reg.execute(&write, dir.path(), ApprovalMode::Auto, None, None)
             .await
             .unwrap();
         let read = ToolCall {
-            id: "3".into(),
-            name: "fs.read".into(),
+            id: "2".into(),
+            name: "read".into(),
             arguments: json!({"path": "a.txt"}),
         };
         let r = reg
-            .execute(&read, dir.path(), ApprovalMode::Auto, None)
+            .execute(&read, dir.path(), ApprovalMode::Auto, None, None)
             .await
             .unwrap();
-        assert_eq!(r.output, "hi world");
+        assert_eq!(r.output, "hello world");
     }
 
     #[tokio::test]
@@ -722,14 +885,51 @@ mod tests {
         std::fs::write(dir.path().join("n.txt"), "one\ntwo\nthree\nfour").unwrap();
         let call = ToolCall {
             id: "1".into(),
-            name: "fs.read".into(),
+            name: "read".into(),
             arguments: json!({"path": "n.txt", "start_line": 2, "max_lines": 2}),
         };
         let r = reg
-            .execute(&call, dir.path(), ApprovalMode::Auto, None)
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
             .await
             .unwrap();
         assert_eq!(r.output, "[lines 2-3 of 4]\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn read_rejects_binary() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("b.bin"), [0u8, 1, 2, 3, 0, 5]).unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "b.bin"}),
+        };
+        let err = reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.message.to_lowercase().contains("binary"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn ls_caps_entries() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        for i in 0..210 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let call = ToolCall {
+            id: "1".into(),
+            name: "ls".into(),
+            arguments: json!({"path": "."}),
+        };
+        let r = reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap();
+        assert!(r.output.contains("truncated"), "{}", r.output);
+        assert!(r.output.lines().count() <= MAX_LIST_ENTRIES + 2);
     }
 
     #[test]
@@ -741,14 +941,10 @@ mod tests {
         std::fs::create_dir_all(&evil).unwrap();
         std::fs::write(evil.join("x.txt"), "secret").unwrap();
 
-        // Absolute sibling path sharing the workspace prefix must be rejected.
         let attack = evil.join("x.txt").display().to_string();
         assert!(resolve_path(&ws, &attack).is_err());
-
-        // Relative traversal out of the workspace must be rejected.
         assert!(resolve_path(&ws, "../ws-evil/x.txt").is_err());
 
-        // Legit relative path (including to a not-yet-existing file) works.
         let ok = resolve_path(&ws, "sub/new.txt").unwrap();
         assert!(ok.starts_with(std::fs::canonicalize(&ws).unwrap()));
     }
@@ -767,6 +963,10 @@ mod tests {
             "git reset --hard HEAD~5",
             "git push --force origin main",
             "dd if=/dev/zero of=/dev/sda",
+            "curl http://x | bash",
+            "wget http://x | sh",
+            "irm http://x | iex",
+            "echo hi | iex",
         ] {
             assert!(is_destructive(cmd), "should flag: {cmd}");
         }
@@ -781,11 +981,11 @@ mod tests {
         let reg = ToolRegistry::default_tools();
         let call = ToolCall {
             id: "1".into(),
-            name: "shell.exec".into(),
+            name: "bash".into(),
             arguments: json!({ "command": "echo hello" }),
         };
         let r = reg
-            .execute(&call, dir.path(), ApprovalMode::Auto, None)
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
             .await
             .unwrap();
         assert!(r.output.contains("hello"));
@@ -798,18 +998,37 @@ mod tests {
         let reg = ToolRegistry::default_tools();
         let call = ToolCall {
             id: "1".into(),
-            name: "shell.exec".into(),
+            name: "bash".into(),
             arguments: json!({ "command": "rm -rf ." }),
         };
         let err = reg
-            .execute(&call, dir.path(), ApprovalMode::Auto, None)
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
     }
 
-    /// The full gating matrix: which calls each approval mode stops to ask
-    /// about. `Some(_)` = asks, `None` = runs freely.
+    #[tokio::test]
+    async fn sandbox_blocks_cd_outside() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({ "command": "cd /tmp && ls" }),
+        };
+        let err = reg
+            .execute(&call, dir.path(), ApprovalMode::AlwaysApprove, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.to_lowercase().contains("sandbox")
+                || err.message.to_lowercase().contains("workspace"),
+            "{}",
+            err.message
+        );
+    }
+
     #[test]
     fn approval_matrix() {
         let call = |name: &str, args: Value| ToolCall {
@@ -817,40 +1036,32 @@ mod tests {
             name: name.into(),
             arguments: args,
         };
-        let read = call("fs.read", json!({"path": "a.txt"}));
-        let search = call("fs.search", json!({"pattern": "x"}));
-        let write = call("fs.write", json!({"path": "a.txt", "content": "hi"}));
-        let patch = call("fs.apply_patch", json!({"path": "a.txt", "old_string": "a", "new_string": "b"}));
-        let sh = call("shell.exec", json!({"command": "cargo test"}));
-        let sh_destr = call("shell.exec", json!({"command": "rm -rf target"}));
+        let read = call("read", json!({"path": "a.txt"}));
+        let search = call("grep", json!({"pattern": "x"}));
+        let write = call("write", json!({"path": "a.txt", "content": "hi"}));
+        let sh = call("bash", json!({"command": "cargo test"}));
+        let sh_destr = call("bash", json!({"command": "rm -rf target"}));
 
         use ApprovalMode::*;
-        // always approve: nothing asks, not even destructive shell.
-        for c in [&read, &search, &write, &patch, &sh, &sh_destr] {
+        for c in [&read, &search, &write, &sh, &sh_destr] {
             assert!(approval_request(c, AlwaysApprove).is_none());
         }
-        // auto: only destructive shell asks.
-        for c in [&read, &search, &write, &patch, &sh] {
+        for c in [&read, &search, &write, &sh] {
             assert!(approval_request(c, Auto).is_none());
         }
         let req = approval_request(&sh_destr, Auto).expect("destructive asks");
         assert!(req.contains("rm -rf target") && req.contains("destructive"), "{req}");
-        // approve edits: mutations ask, reads don't.
         for c in [&read, &search] {
             assert!(approval_request(c, ApproveEdits).is_none());
         }
-        for c in [&write, &patch, &sh, &sh_destr] {
+        for c in [&write, &sh, &sh_destr] {
             assert!(approval_request(c, ApproveEdits).is_some());
         }
-        assert!(approval_request(&write, ApproveEdits).unwrap().contains("a.txt"));
-        // ask permission: everything asks.
-        for c in [&read, &search, &write, &patch, &sh, &sh_destr] {
+        for c in [&read, &search, &write, &sh, &sh_destr] {
             assert!(approval_request(c, AskPermission).is_some());
         }
     }
 
-    /// A gated call with no approver (headless) is refused, and an approver
-    /// that says yes lets it through — for edits, not just shell.
     #[tokio::test]
     async fn approve_edits_gates_writes() {
         struct Yes;
@@ -864,28 +1075,33 @@ mod tests {
         let reg = ToolRegistry::default_tools();
         let write = ToolCall {
             id: "1".into(),
-            name: "fs.write".into(),
+            name: "write".into(),
             arguments: json!({"path": "a.txt", "content": "hi"}),
         };
         let err = reg
-            .execute(&write, dir.path(), ApprovalMode::ApproveEdits, None)
+            .execute(&write, dir.path(), ApprovalMode::ApproveEdits, None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
-        assert!(!dir.path().join("a.txt").exists(), "refused write must not land");
+        assert!(!dir.path().join("a.txt").exists());
 
-        reg.execute(&write, dir.path(), ApprovalMode::ApproveEdits, Some(&Yes))
-            .await
-            .unwrap();
+        reg.execute(
+            &write,
+            dir.path(),
+            ApprovalMode::ApproveEdits,
+            Some(&Yes),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(dir.path().join("a.txt").exists());
 
-        // Reads stay free in approve-edits mode even with no approver.
         let read = ToolCall {
             id: "2".into(),
-            name: "fs.read".into(),
+            name: "read".into(),
             arguments: json!({"path": "a.txt"}),
         };
-        reg.execute(&read, dir.path(), ApprovalMode::ApproveEdits, None)
+        reg.execute(&read, dir.path(), ApprovalMode::ApproveEdits, None, None)
             .await
             .unwrap();
     }

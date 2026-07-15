@@ -1,8 +1,9 @@
 //! View rendering.
 //!
 //! Three chrome-light zones (redesign spec §2): a bordered **status dashboard**
-//! (rounded frame, matching the omnibar), a single scrollable **working area**,
-//! and a bordered multi-line **omnibar** anchored at the bottom. No popups or
+//! (rounded frame, matching the omnibar — collapsed 3 content lines, expands
+//! to 10 on hover or click-to-pin), a single scrollable **working area**, and
+//! a bordered multi-line **omnibar** anchored at the bottom. No popups or
 //! overlays — every former panel renders inline in the working area, and
 //! confirms/errors are inline banners. The command palette ('/') and the file
 //! picker ('@') dock directly above the omnibar, where the eye already is. The
@@ -154,14 +155,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // The omnibar is a bordered multi-line composer: at least two text rows
     // (so it always reads as *the* input box), growing with the input up to
     // ui.composer_rows. The '/' command palette and the '@' file picker dock
-    // directly above it. The status dashboard is a matching bordered frame
-    // (3 rows: top border · metrics · bottom border).
+    // directly above it. The status dashboard is a matching bordered frame:
+    // collapsed = 2 metric lines + 1 latest-log line; hover/pin expands to
+    // 10 content lines (2 metrics + 8 logs). Outer height adds top/bottom border.
     let cap = app.config.ui.composer_rows.clamp(1, 10).max(2);
     let max_by_area = area.height.saturating_sub(8).max(1);
     let composer_h = (app.coding_input.split('\n').count().max(1) as u16)
         .max(2)
         .min(cap)
         .min(max_by_area);
+
+    let status_content: u16 = if app.status_expanded() { 10 } else { 3 };
+    // Leave room for omnibar (composer+2), a working min-1, and picker room.
+    let status_h = (status_content + 2).min(area.height.saturating_sub(composer_h + 3).max(3));
 
     // Bottom-docked picker band ('/' commands or '@' files), sized to its rows.
     let band_rows: u16 = if app.slash_active() {
@@ -171,15 +177,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let band_rows = band_rows.min(area.height.saturating_sub(composer_h + 6));
+    let band_rows = band_rows.min(area.height.saturating_sub(composer_h + status_h + 1));
 
-    // Status frame (3) · working area (min) · picker band · omnibar
-    // (composer + top/bottom border). The status frame's bottom border replaces
-    // the old thin rule under a single-line status bar.
+    // Status frame · working area (min) · picker band · omnibar
+    // (composer + top/bottom border).
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(status_h),
             Constraint::Min(1),
             Constraint::Length(band_rows),
             Constraint::Length(composer_h + 2),
@@ -234,10 +239,22 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &mut App) {
 
 // ---------------------------------------------------------------------------
 // Status dashboard (§5) — bordered frame matching the omnibar
+//
+// Collapsed: 3 content lines (2 metric rows + 1 latest log).
+// Expanded (hover or click-pinned): 10 content lines (2 metrics + 8 logs).
 // ---------------------------------------------------------------------------
 
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
+    // Remember the outer rect so next-frame hover expand works without re-layout.
+    app.status_bar_rect = area;
+
+    let pin_mark = if app.status_pinned { " pinned" } else { "" };
+    let title = if app.status_expanded() {
+        format!(" status{pin_mark} · click to collapse ")
+    } else {
+        format!(" status{pin_mark} · hover/click for logs ")
+    };
 
     // Full rounded pseudographic frame in the accent colour — same treatment as
     // the omnibar so the live metrics read as a fixed chrome dashboard, not a
@@ -246,110 +263,139 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::accent(&th))
-        .title(Span::styled(" status ", theme::muted(&th)));
+        .title(Span::styled(title, theme::muted(&th)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 8 || inner.height == 0 {
         return;
     }
+
+    // Whole dashboard is clickable to pin/unpin; finer controls (theme, approvals)
+    // register afterwards so they win the reverse hit-test.
+    click(app, area, ClickTarget::StatusToggle);
+
     // One-cell inset so content doesn't sit hard against the left border glyph.
-    let row = Rect {
+    let content = Rect {
         x: inner.x.saturating_add(1),
         y: inner.y,
         width: inner.width.saturating_sub(1),
+        height: inner.height,
+    };
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    // --- Line 0: model · GPU meters · power · tok/s ---
+    let row0 = Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width,
         height: 1,
     };
-
-    // Left cluster: select-mode chip · spinner · model · vram · temp · ctx.
-    let mut left: Vec<Span> = Vec::new();
+    let mut line0: Vec<Span> = Vec::new();
     if !app.mouse_capture {
         // The mouse is released for terminal-native copy; F2 is the way back.
-        left.push(Span::styled(
+        line0.push(Span::styled(
             "SELECT",
             theme::accent(&th).add_modifier(Modifier::BOLD),
         ));
-        left.push(Span::styled(" copy text · F2 to exit", theme::muted(&th)));
-        left.push(sep(&th));
+        line0.push(Span::styled(" copy text · F2 to exit", theme::muted(&th)));
+        line0.push(sep(&th));
     }
     match spinner_frame(app) {
-        Some(c) => left.push(Span::styled(format!("{c} "), theme::work(&th))),
-        None => left.push(Span::raw("  ")),
+        Some(c) => line0.push(Span::styled(format!("{c} "), theme::work(&th))),
+        None => line0.push(Span::raw("  ")),
     }
     match app.active_runtime() {
-        Some(rt) => left.push(Span::styled(rt.name.clone(), fg(&th))),
-        None => left.push(Span::styled("no runtime", theme::muted(&th))),
+        Some(rt) => line0.push(Span::styled(rt.name.clone(), fg(&th))),
+        None => line0.push(Span::styled("no runtime", theme::muted(&th))),
     }
     if !app.gpu.devices.is_empty() {
         let total = app.gpu.total_vram();
         let used = total.saturating_sub(app.gpu.free_vram());
-        left.push(sep(&th));
-        left.push(Span::styled("vram ", theme::muted(&th)));
-        left.push(Span::styled(
+        line0.push(sep(&th));
+        line0.push(Span::styled("vram ", theme::muted(&th)));
+        line0.push(Span::styled(
             format!("{:.1}/{:.0}G", gib_f(used), gib_f(total)),
             fg(&th),
         ));
-        left.push(Span::raw(" "));
-        left.extend(meter(&th, used as f64 / total.max(1) as f64, 6));
+        line0.push(Span::raw(" "));
+        line0.extend(meter(&th, used as f64 / total.max(1) as f64, 6));
+        if let Some(pwr) = app.gpu.total_power_draw_w() {
+            line0.push(sep(&th));
+            line0.push(Span::styled("energy ", theme::muted(&th)));
+            line0.push(Span::styled(format!("{pwr:.0}W"), fg(&th)));
+        }
         if let Some(temp) = app.gpu.max_temperature_c() {
-            left.push(sep(&th));
-            left.push(Span::styled("temp ", theme::muted(&th)));
-            left.push(Span::styled(format!("{temp}°C"), fg(&th)));
+            line0.push(sep(&th));
+            line0.push(Span::styled("temp ", theme::muted(&th)));
+            line0.push(Span::styled(format!("{temp}°C"), fg(&th)));
         }
         if let Some(util) = app.gpu.avg_utilization_pct() {
-            left.push(sep(&th));
-            left.push(Span::styled("gpu ", theme::muted(&th)));
-            left.push(Span::styled(format!("{util}%"), fg(&th)));
+            line0.push(sep(&th));
+            line0.push(Span::styled("gpu ", theme::muted(&th)));
+            line0.push(Span::styled(format!("{util}%"), fg(&th)));
         }
     }
+    if let Some(tps) = app.tokens_per_sec {
+        line0.push(sep(&th));
+        line0.push(Span::styled("tok/s ", theme::muted(&th)));
+        line0.push(Span::styled(format!("{tps:.0}"), fg(&th)));
+    }
+    f.render_widget(Paragraph::new(Line::from(line0)), row0);
+
+    // --- Line 1: ctx · approvals · status · (right: version · themes) ---
+    if content.height < 2 {
+        return;
+    }
+    let row1 = Rect {
+        x: content.x,
+        y: content.y + 1,
+        width: content.width,
+        height: 1,
+    };
+    let mut line1: Vec<Span> = Vec::new();
     // Context: used/max with a meter. Used is estimated from the session
-    // (chars÷4); max is the deploy context window. Previously only the max was
-    // shown, so the meter never moved and "ctx" looked broken mid-session.
+    // (chars÷4); max is the deploy context window.
     let ctx_max = app.deploy_ctx.max(1);
     let ctx_used = app.ctx_used_tokens.min(ctx_max.saturating_mul(2));
-    left.push(sep(&th));
-    left.push(Span::styled("ctx ", theme::muted(&th)));
-    left.push(Span::styled(
+    line1.push(Span::styled("ctx ", theme::muted(&th)));
+    line1.push(Span::styled(
         format!("{}/{}", human_ctx(ctx_used), human_ctx(ctx_max)),
         fg(&th),
     ));
-    left.push(Span::raw(" "));
-    left.extend(meter(&th, ctx_used as f64 / ctx_max as f64, 6));
-    // Agent approval mode — always visible (it decides what runs unprompted),
-    // clickable to cycle. The region is registered after the width is known.
-    left.push(sep(&th));
-    let approval_x = row.x + spans_width(&left);
+    line1.push(Span::raw(" "));
+    line1.extend(meter(&th, ctx_used as f64 / ctx_max as f64, 6));
+    // Agent approval mode — always visible (it decides what runs unprompted).
+    line1.push(sep(&th));
+    let approval_x = row1.x + spans_width(&line1);
     let approval_label = "approvals ";
     let approval_tag = app.config.agent.approval().tag();
-    left.push(Span::styled(approval_label, theme::muted(&th)));
-    left.push(Span::styled(approval_tag, fg(&th)));
+    line1.push(Span::styled(approval_label, theme::muted(&th)));
+    line1.push(Span::styled(approval_tag, fg(&th)));
     click(
         app,
         Rect {
             x: approval_x,
-            y: row.y,
+            y: row1.y,
             width: (approval_label.width() + approval_tag.width()) as u16,
             height: 1,
         },
         ClickTarget::ApprovalCycle,
     );
-    // Transient status / feedback (set_status, raise_error). The redesign
-    // dropped its dedicated row, orphaning `status_line` — so `/logs`, deploy
-    // progress, "unknown command", etc. set text that nothing drew. Render it
-    // here; the right cluster is drawn afterwards and clips a long message.
+    // Transient status / feedback (set_status, raise_error).
     if !app.status_line.is_empty() {
-        left.push(sep(&th));
+        line1.push(sep(&th));
         let style = if app.status_is_error {
             fg(&th).add_modifier(Modifier::BOLD)
         } else {
             theme::muted(&th)
         };
-        left.push(Span::styled(app.status_line.clone(), style));
+        line1.push(Span::styled(app.status_line.clone(), style));
     }
-    f.render_widget(Paragraph::new(Line::from(left)), row);
+    f.render_widget(Paragraph::new(Line::from(line1)), row1);
 
-    // Right cluster: version/update · theme swatches. Each theme is a dot in
-    // its own accent colour (the active one is ◉); hovering a dot reveals its
-    // name to the left, so the names never occupy the bar at rest.
+    // Right cluster on line 1: version/update · theme swatches.
     let (ver_text, ver_style, is_update) = if let Some(v) = &app.update_installed {
         (format!("v{v} — restart"), theme::muted(&th), false)
     } else if let Some(info) = &app.update_available {
@@ -357,8 +403,6 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         (format!("v{}", env!("CARGO_PKG_VERSION")), theme::muted(&th), false)
     };
-    // Fixed-width layout (label slot · version · sep · dots) so revealing a
-    // name on hover never shifts the dots under the cursor.
     let label_slot: u16 = 1 + ThemeMode::SWITCHER
         .iter()
         .map(|m| m.label().width() as u16)
@@ -367,12 +411,11 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let ver_w = ver_text.width() as u16;
     let dots_w = (ThemeMode::SWITCHER.len() as u16) * 2; // "◉ " per theme
     let rw = label_slot + ver_w + 3 + dots_w;
-    if row.width > rw + 8 {
-        let rx = row.x + row.width - rw;
+    if row1.width > rw + 8 {
+        let rx = row1.x + row1.width - rw;
         let dots_x = rx + label_slot + ver_w + 3;
-        // Which dot is the mouse over (if any)?
         let hovered: Option<ThemeMode> = app.hover.and_then(|(hc, hr)| {
-            if hr != row.y {
+            if hr != row1.y {
                 return None;
             }
             ThemeMode::SWITCHER
@@ -403,21 +446,73 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         }
         f.render_widget(
             Paragraph::new(Line::from(right)),
-            Rect { x: rx, y: row.y, width: rw, height: 1 },
+            Rect {
+                x: rx,
+                y: row1.y,
+                width: rw,
+                height: 1,
+            },
         );
-        // Click regions: version badge, then one per swatch dot.
         if is_update {
             click(
                 app,
-                Rect { x: rx + label_slot, y: row.y, width: ver_w, height: 1 },
+                Rect {
+                    x: rx + label_slot,
+                    y: row1.y,
+                    width: ver_w,
+                    height: 1,
+                },
                 ClickTarget::UpdateBadge,
             );
         }
         for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
             let x = dots_x + (i as u16) * 2;
-            click(app, Rect { x, y: row.y, width: 2, height: 1 }, ClickTarget::Theme(*m));
+            click(
+                app,
+                Rect {
+                    x,
+                    y: row1.y,
+                    width: 2,
+                    height: 1,
+                },
+                ClickTarget::Theme(*m),
+            );
         }
     }
+
+    // --- Lines 2..: latest log(s) ---
+    if content.height < 3 {
+        return;
+    }
+    let log_area = Rect {
+        x: content.x,
+        y: content.y + 2,
+        width: content.width,
+        height: content.height.saturating_sub(2),
+    };
+    let log_slots = log_area.height as usize;
+    let log_lines = status_log_lines(app, log_slots);
+    let mut rows: Vec<Line> = Vec::with_capacity(log_slots);
+    for i in 0..log_slots {
+        let text = log_lines.get(i).cloned().unwrap_or_default();
+        // Clip to width so long JSON-ish tails don't wrap the frame.
+        let clipped = clip(&text, log_area.width as usize);
+        rows.push(Line::from(Span::styled(clipped, theme::muted(&th))));
+    }
+    f.render_widget(Paragraph::new(rows), log_area);
+}
+
+/// Pick the last `n` compact status log lines (newest last). When empty, a
+/// single placeholder so the third row never looks broken.
+fn status_log_lines(app: &App, n: usize) -> Vec<String> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if app.status_logs.is_empty() {
+        return vec!["log · (no entries yet)".into()];
+    }
+    let start = app.status_logs.len().saturating_sub(n);
+    app.status_logs[start..].to_vec()
 }
 
 // ---------------------------------------------------------------------------

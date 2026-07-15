@@ -1,11 +1,9 @@
-//! Coding agent with tools, skills, and MCP configuration.
+//! Coding agent with tools, skills, and sessions.
 
-mod mcp;
 mod session_store;
 mod skills;
 mod tools;
 
-pub use mcp::{McpConfig, McpManager, McpServerStatus};
 pub use session_store::{
     list_sessions, sessions_root, LoadedSession, SessionMeta, SessionStore,
 };
@@ -17,10 +15,13 @@ pub use tools::{
 use futures::StreamExt;
 use localcode_core::config::AgentConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
+use localcode_core::paths::AppPaths;
 use localcode_core::runtime::ActiveRuntime;
+use localcode_hf::HfClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -141,6 +142,10 @@ pub struct ChatMessage {
     /// message that carries matching `tool_calls` ids).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
+    /// Model reasoning / chain-of-thought for this assistant message (stored
+    /// for the UI and compaction; not re-sent as a separate protocol field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl ChatMessage {
@@ -151,16 +156,22 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            thinking: None,
         }
     }
 
-    pub(crate) fn assistant(content: impl Into<String>, tool_calls: Option<Value>) -> Self {
+    pub(crate) fn assistant(
+        content: impl Into<String>,
+        tool_calls: Option<Value>,
+        thinking: Option<String>,
+    ) -> Self {
         Self {
             role: "assistant".into(),
             content: content.into(),
             tool_call_id: None,
             name: None,
             tool_calls,
+            thinking,
         }
     }
 
@@ -171,6 +182,7 @@ impl ChatMessage {
             tool_call_id: Some(call_id),
             name: Some(name),
             tool_calls: None,
+            thinking: None,
         }
     }
 }
@@ -181,7 +193,6 @@ pub struct AgentSession {
     pub title: String,
     pub messages: Vec<ChatMessage>,
     pub workspace_root: PathBuf,
-    pub subagents_enabled: bool,
     pub runtime_id: Option<String>,
     /// Compacted-view marker: when set, requests replace
     /// `messages[..first_kept_index]` with the summary. The full history stays
@@ -199,13 +210,12 @@ pub struct SessionCompaction {
 }
 
 impl AgentSession {
-    pub fn new(workspace: PathBuf, subagents_enabled: bool) -> Self {
+    pub fn new(workspace: PathBuf) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             title: "New session".into(),
             messages: vec![],
             workspace_root: workspace,
-            subagents_enabled,
             runtime_id: None,
             compaction: None,
         }
@@ -260,38 +270,37 @@ pub struct CodingAgent {
     pub config: AgentConfig,
     pub tools: ToolRegistry,
     pub skills: SkillLoader,
-    pub mcp: McpManager,
     http: reqwest::Client,
+    /// When set, `hf.model_card` / `hf.search` tools are available so the default
+    /// conversation can read the Hugging Face catalogue and model descriptions.
+    hf: Option<Arc<HfClient>>,
 }
 
 impl CodingAgent {
     pub fn new(config: AgentConfig) -> Self {
-        let skills_dir = config
-            .skills_dir
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".localcode/skills"));
-        let mcp_path = config
-            .mcp_config
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".localcode/mcp.json"));
-
-        // Connect timeout only: local generations can legitimately take
-        // minutes, so the total duration is unbounded and cancellation is the
-        // caller's job (the TUI aborts the task on Esc).
+        let skills_dir = resolve_skills_dir(&config);
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
 
         Self {
-            tools: ToolRegistry::new(config.disabled_tools.clone()),
+            tools: ToolRegistry::new(config.disabled_tools.clone(), config.shell_sandbox),
             skills: SkillLoader::new(skills_dir),
-            mcp: McpManager::new(mcp_path),
             config,
             http,
+            hf: None,
         }
+    }
+
+    /// Attach a Hugging Face client so the agent can search models and read cards.
+    pub fn with_hf(mut self, hf: Arc<HfClient>) -> Self {
+        self.hf = Some(hf);
+        self
+    }
+
+    pub fn set_hf(&mut self, hf: Option<Arc<HfClient>>) {
+        self.hf = hf;
     }
 
     pub fn reload_skills(&mut self) {
@@ -321,8 +330,6 @@ impl CodingAgent {
             .with_cause("No workspace root"));
         }
 
-        // Heal a history cut short by an aborted turn (dangling tool calls)
-        // before extending it — strict servers reject the broken shape.
         let healed = sanitize_history(&mut session.messages);
         if healed > 0 {
             debug!(healed, "dropped incomplete trailing tool exchange from history");
@@ -330,22 +337,22 @@ impl CodingAgent {
 
         session.messages.push(ChatMessage::user(user_text));
 
+        // Compact older history before this turn if over budget.
+        self.maybe_auto_compact(session, runtime, api_key).await;
+
         let system = self.build_system_prompt(session);
         let mut final_text = String::new();
-        // Loop breaker: local models sometimes re-issue the exact same call
-        // forever. Track the last signature; the third identical call in a row
-        // is not executed — the model gets an error nudging it to change tack.
-        let mut last_sig: Option<String> = None;
-        let mut repeats = 0u32;
+        // Loop breaker: track recent signatures; block exact repeats and
+        // short alternating loops so local models cannot thrash forever.
+        let mut recent_sigs: Vec<String> = Vec::new();
+        let mut blocked_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for round in 0..self.config.max_tool_rounds {
             info!(round, "agent tool round");
             let response = self
-                .chat_completion(runtime, api_key, &system, &session.messages, events)
+                .chat_completion(runtime, api_key, &system, session, events)
                 .await?;
 
-            // When the runtime didn't stream, surface the whole message as one
-            // delta so UIs render intermediate rounds the same way.
             if !response.streamed {
                 if let Some(t) = response.thinking.as_deref().filter(|c| !c.is_empty()) {
                     emit(events, AgentEvent::ThinkingDelta(t.to_string()));
@@ -357,12 +364,10 @@ impl CodingAgent {
             emit(events, AgentEvent::MessageComplete);
 
             if let Some(tool_calls) = response.tool_calls {
-                // One assistant message carrying the full tool_calls array,
-                // then one tool message per call — the shape the OpenAI
-                // protocol requires.
                 session.messages.push(ChatMessage::assistant(
                     response.content.unwrap_or_default(),
                     response.raw_tool_calls,
+                    response.thinking,
                 ));
 
                 for tc in tool_calls {
@@ -376,34 +381,40 @@ impl CodingAgent {
                     );
 
                     let sig = format!("{}|{}", tc.name, tc.arguments);
-                    if last_sig.as_deref() == Some(sig.as_str()) {
-                        repeats += 1;
-                    } else {
-                        last_sig = Some(sig);
-                        repeats = 0;
+                    let block = should_block_tool_sig(&sig, &recent_sigs, &blocked_sigs);
+                    if block {
+                        blocked_sigs.insert(sig.clone());
+                    }
+                    recent_sigs.push(sig.clone());
+                    if recent_sigs.len() > 12 {
+                        recent_sigs.remove(0);
                     }
 
-                    let result = if repeats >= 2 {
+                    let skill_body = if tc.name == "skill" {
+                        self.skill_body_for_call(&tc)
+                    } else {
+                        None
+                    };
+
+                    let result = if block {
                         Err(LocalCodeError::new(
                             ErrorCode::AgentToolFailed,
                             format!(
-                                "Identical call to {} repeated {} times in a row — not executed",
-                                tc.name,
-                                repeats + 1
+                                "Tool call loop detected for {} — not executed",
+                                tc.name
                             ),
                         )
                         .with_hint(
                             "Change the arguments or the approach, or give your final answer",
                         ))
                     } else {
-                        self.tools
-                            .execute(
-                                &tc,
-                                &session.workspace_root,
-                                self.config.approval(),
-                                approver,
-                            )
-                            .await
+                        self.execute_tool_call(
+                            &tc,
+                            &session.workspace_root,
+                            approver,
+                            skill_body,
+                        )
+                        .await
                     };
 
                     let content = match &result {
@@ -429,14 +440,40 @@ impl CodingAgent {
             }
 
             final_text = response.content.unwrap_or_default();
-            session
-                .messages
-                .push(ChatMessage::assistant(final_text.clone(), None));
+            session.messages.push(ChatMessage::assistant(
+                final_text.clone(),
+                None,
+                response.thinking,
+            ));
             break;
         }
 
         if final_text.is_empty() {
-            final_text = "(agent completed tool rounds without a final message)".into();
+            final_text =
+                "(agent completed tool rounds without a final message)".into();
+            // Persist the synthetic stop so history and UI agree (issue 9).
+            let last_is_tool = session
+                .messages
+                .last()
+                .map(|m| m.role == "tool")
+                .unwrap_or(false);
+            let last_is_assistant_with_tools = session
+                .messages
+                .last()
+                .map(|m| m.role == "assistant" && m.tool_calls.is_some())
+                .unwrap_or(false);
+            if last_is_tool || last_is_assistant_with_tools || session.messages.last().map(|m| m.role == "user").unwrap_or(false) {
+                // Only append if we didn't already push a final assistant text message.
+                let needs = match session.messages.last() {
+                    Some(m) if m.role == "assistant" && m.tool_calls.is_none() => false,
+                    _ => true,
+                };
+                if needs {
+                    session
+                        .messages
+                        .push(ChatMessage::assistant(final_text.clone(), None, None));
+                }
+            }
         }
 
         if session.title == "New session" {
@@ -446,58 +483,300 @@ impl CodingAgent {
         Ok(final_text)
     }
 
+    fn skill_body_for_call(&self, tc: &ToolCall) -> Option<String> {
+        let name = tc.arguments.get("name")?.as_str()?;
+        if self.config.disabled_skills.iter().any(|d| d == name) {
+            return None;
+        }
+        let skill = self.skills.get(name)?;
+        Some(format!(
+            "# Skill: {}\n\n{}\n\n{}",
+            skill.name, skill.description, skill.body
+        ))
+    }
+
+    /// Summarize older turns when over budget; fall back to leaving compaction
+    /// unset (trimmed_tail still applies).
+    async fn maybe_auto_compact(
+        &self,
+        session: &mut AgentSession,
+        runtime: &ActiveRuntime,
+        api_key: Option<&str>,
+    ) {
+        if !self.config.auto_compact || self.config.max_history_chars == 0 {
+            return;
+        }
+        let total: usize = session.messages.iter().map(approx_chars).sum();
+        if total <= self.config.max_history_chars {
+            return;
+        }
+        let keep = self.config.compact_keep_recent_chars.max(1);
+        let first_kept = first_kept_index(&session.messages, keep);
+        if first_kept == 0 {
+            return;
+        }
+        // Don't re-compact the same cut point.
+        if session
+            .compaction
+            .as_ref()
+            .is_some_and(|c| c.first_kept_index == first_kept)
+        {
+            return;
+        }
+        let to_sum = &session.messages[..first_kept];
+        let summary = match self.summarize_history(runtime, api_key, to_sum).await {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => fallback_summary(to_sum),
+        };
+        info!(
+            first_kept,
+            chars_before = total,
+            "auto-compacted session history"
+        );
+        session.compaction = Some(SessionCompaction {
+            first_kept_index: first_kept,
+            summary,
+            chars_before: total,
+        });
+    }
+
+    async fn summarize_history(
+        &self,
+        runtime: &ActiveRuntime,
+        api_key: Option<&str>,
+        messages: &[ChatMessage],
+    ) -> Result<String, LocalCodeError> {
+        let mut transcript = String::new();
+        for m in messages.iter().take(80) {
+            let role = &m.role;
+            let content = preview(&m.content, 400);
+            transcript.push_str(&format!("{role}: {content}\n"));
+            if let Some(t) = &m.thinking {
+                transcript.push_str(&format!("  (thinking: {})\n", preview(t, 200)));
+            }
+        }
+        let system = "Summarize the earlier coding-agent conversation for continuity. \
+Keep goals, decisions, file paths touched, and unfinished work. Be concise (under 600 words). \
+No tools — reply with the summary only.";
+        let body_msgs = vec![
+            json!({"role": "system", "content": system}),
+            json!({
+                "role": "user",
+                "content": format!("Conversation to summarize:\n\n{transcript}")
+            }),
+        ];
+        let text = self
+            .simple_completion(runtime, api_key, body_msgs, false)
+            .await?;
+        Ok(text)
+    }
+
+    /// Non-tool chat completion used for compaction summaries.
+    async fn simple_completion(
+        &self,
+        runtime: &ActiveRuntime,
+        api_key: Option<&str>,
+        messages: Vec<Value>,
+        stream: bool,
+    ) -> Result<String, LocalCodeError> {
+        let base = runtime.base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        };
+        let model = runtime
+            .model_id
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+        });
+        if stream {
+            body["stream"] = json!(true);
+        }
+        let mut req = self.http.post(&url).json(&body);
+        let key = api_key.or(runtime.api_key.as_deref());
+        if let Some(k) = key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req.send().await.map_err(|e| {
+            LocalCodeError::new(ErrorCode::BackendNotReady, e.to_string())
+                .with_cause("Summarization request failed")
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let t = resp.text().await.unwrap_or_default();
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendNotReady,
+                format!("Summarization failed {status}: {t}"),
+            ));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| LocalCodeError::new(ErrorCode::Internal, e.to_string()))?;
+        let parsed = parse_full_response(&v)?;
+        Ok(parsed.content.unwrap_or_default())
+    }
+
+    /// Run a single tool call: HF catalogue tools first, then the workspace registry.
+    async fn execute_tool_call(
+        &self,
+        call: &ToolCall,
+        workspace: &std::path::Path,
+        approver: Option<&dyn ToolApprover>,
+        skill_body: Option<String>,
+    ) -> Result<ToolResult, LocalCodeError> {
+        match call.name.as_str() {
+            "hf.model_card" => return self.tool_hf_model_card(call).await,
+            "hf.search" => return self.tool_hf_search(call).await,
+            _ => {}
+        }
+        self.tools
+            .execute(
+                call,
+                workspace,
+                self.config.approval(),
+                approver,
+                skill_body,
+            )
+            .await
+    }
+
+    async fn tool_hf_model_card(&self, call: &ToolCall) -> Result<ToolResult, LocalCodeError> {
+        let Some(hf) = &self.hf else {
+            return Err(LocalCodeError::new(
+                ErrorCode::HfUnreachable,
+                "Hugging Face client is not available",
+            )
+            .with_hint("Check registry endpoint / network in Settings"));
+        };
+        let model_id = call
+            .arguments
+            .get("model_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, "hf.model_card requires model_id")
+            })?;
+        let detail = hf.model_info(model_id).await?;
+        let card = detail
+            .card_markdown
+            .unwrap_or_else(|| "(no README on this model)".into());
+        let card = if card.chars().count() > 24_000 {
+            let mut out: String = card.chars().take(24_000).collect();
+            out.push('…');
+            out
+        } else {
+            card
+        };
+        Ok(ToolResult {
+            output: format!("# Model card: {model_id}\n\n{card}"),
+            risk: ToolRisk::Low,
+        })
+    }
+
+    async fn tool_hf_search(&self, call: &ToolCall) -> Result<ToolResult, LocalCodeError> {
+        let Some(hf) = &self.hf else {
+            return Err(LocalCodeError::new(
+                ErrorCode::HfUnreachable,
+                "Hugging Face client is not available",
+            )
+            .with_hint("Check registry endpoint / network in Settings"));
+        };
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("coding");
+        let results = hf.search(query, true, 8, "downloads").await?;
+        let lines: Vec<String> = results
+            .iter()
+            .map(|m| {
+                format!(
+                    "- {}  downloads={:?}  tags={}",
+                    m.id,
+                    m.downloads,
+                    m.tags.iter().take(5).cloned().collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect();
+        Ok(ToolResult {
+            output: if lines.is_empty() {
+                "No models found".into()
+            } else {
+                lines.join("\n")
+            },
+            risk: ToolRisk::Low,
+        })
+    }
+
     fn build_system_prompt(&self, session: &AgentSession) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // A custom system prompt (Settings) replaces the built-in preamble;
-        // otherwise the default identity/instructions are used. Either way the
-        // workspace path, skills and AGENTS.md are appended below.
         match self.config.system_prompt.as_deref().map(str::trim) {
             Some(custom) if !custom.is_empty() => parts.push(custom.to_string()),
             _ => {
-                // Kept deliberately short: local models run with small
-                // contexts, and every line here is paid on every request.
                 parts.push(
-                    "You are LocalCode, a coding agent working inside the user's workspace.".into(),
-                );
-                parts.push(
-                    "Work in a loop: gather context (fs.read, fs.list, fs.search), then act \
-                     (fs.apply_patch, fs.write, shell.exec). Prefer fs.apply_patch for edits — \
-                     it replaces an exact old_string once; re-read a file before patching it again."
+                    "You are LocalCode's default assistant — a local coding agent with full \
+access to the workspace and the Hugging Face model catalogue. You help users write code, \
+fix LocalCode itself (config, backends, deploys, GPU, logs), discover models, and launch them."
                         .into(),
                 );
                 parts.push(
-                    "Read only what you need (fs.read takes start_line/max_lines). Verify your \
-                     changes when possible, e.g. by building or running tests with shell.exec."
+                    "Tools: read, write, bash, ls, grep, skill, hf.model_card, hf.search. \
+Work in a loop: gather context (read/ls/grep/hf.*), then act (write/bash). Prefer write for \
+file edits over shell redirects."
                         .into(),
                 );
                 parts.push(
-                    "Some tool calls may need user approval; if one is refused, don't retry it — \
-                     adjust or ask. Never repeat an identical failing call.".into(),
+                    "For Hugging Face models: use hf.search to find candidates, then \
+hf.model_card to read descriptions and recommended server flags before suggesting a deploy. \
+Users deploy from the Models tab (/models) or with your guidance."
+                        .into(),
+                );
+                parts.push(
+                    "Read only what you need (read takes start_line/max_lines). Verify changes \
+when possible with bash (build/test)."
+                        .into(),
+                );
+                parts.push(
+                    "Some tool calls may need user approval; if refused, don't retry — adjust or ask. \
+Never repeat an identical failing call or alternate between two failing calls."
+                        .into(),
                 );
                 parts.push("Be concise. When tools fail, explain causes and next steps.".into());
-                parts.push("Subagents are not available in this build; do the work yourself.".into());
             }
         }
 
         parts.push(format!("Workspace: {}", session.workspace_root.display()));
+        if self.config.shell_sandbox {
+            parts.push("Shell sandbox is on: bash runs in the workspace only.".into());
+        }
 
-        // Available skills, minus any the user disabled in Settings.
-        for skill in self.skills.list() {
-            let disabled = self.config.disabled_skills.iter().any(|d| d == &skill.name);
-            if skill.enabled && !disabled {
-                parts.push(format!(
-                    "Skill available: {} — {}",
-                    skill.name, skill.description
-                ));
+        let enabled_skills: Vec<&Skill> = self
+            .skills
+            .list()
+            .iter()
+            .filter(|s| {
+                s.enabled && !self.config.disabled_skills.iter().any(|d| d == &s.name)
+            })
+            .collect();
+        if !enabled_skills.is_empty() {
+            parts.push("Skills (call tool skill with name=… to load full instructions):".into());
+            for skill in enabled_skills {
+                parts.push(format!("- {} — {}", skill.name, skill.description));
             }
         }
 
-        // Project-specific instructions from an AGENTS.md at the workspace root.
         if self.config.use_agents_md {
             if let Some(agents) = read_agents_md(&session.workspace_root) {
                 parts.push(String::new());
-                parts.push("Project instructions from AGENTS.md (follow these for this repo):".into());
+                parts.push(
+                    "Project instructions from AGENTS.md (follow these for this repo):".into(),
+                );
                 parts.push(agents);
             }
         }
@@ -510,7 +789,7 @@ impl CodingAgent {
         runtime: &ActiveRuntime,
         api_key: Option<&str>,
         system: &str,
-        messages: &[ChatMessage],
+        session: &AgentSession,
         events: Option<&mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<LlmResponse, LocalCodeError> {
         let base = runtime.base_url.trim_end_matches('/');
@@ -520,16 +799,8 @@ impl CodingAgent {
             format!("{base}/v1/chat/completions")
         };
 
-        // Long sessions outgrow small local contexts: send only the newest
-        // turns that fit the budget. The session itself keeps everything.
-        let full_len = messages.len();
-        let messages = trimmed_tail(messages, self.config.max_history_chars);
-        let system_content = if messages.len() < full_len {
-            debug!(kept = messages.len(), of = full_len, "history trimmed for context budget");
-            format!("{system}\n\n(Older turns were dropped from this request to fit the model's context window.)")
-        } else {
-            system.to_string()
-        };
+        let (messages, system_content) =
+            build_request_view(session, system, self.config.max_history_chars);
 
         let mut api_messages = vec![json!({
             "role": "system",
@@ -560,10 +831,24 @@ impl CodingAgent {
             .unwrap_or_else(|| "default".into());
 
         let stream = self.config.stream;
+        let mut tools = self.tools.openai_tools_schema();
+        // Hide HF tools from the model when no client is wired (avoids dead-end calls).
+        if self.hf.is_none() {
+            if let Some(arr) = tools.as_array_mut() {
+                arr.retain(|t| {
+                    !matches!(
+                        t.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str()),
+                        Some("hf.model_card" | "hf.search")
+                    )
+                });
+            }
+        }
         let mut body = json!({
             "model": model,
             "messages": api_messages,
-            "tools": self.tools.openai_tools_schema(),
+            "tools": tools,
             "temperature": 0.2,
         });
         if stream {
@@ -619,20 +904,27 @@ impl CodingAgent {
             parse_full_response(&v)?
         };
 
-        // Fallback for models without native tool-call support: a line of the
-        // form `tool:fs.read {"path": "..."}`.
+        // Fallback for models without native tool-call support: lines of the
+        // form `tool:read {"path": "..."}` (all matching lines).
         if response.tool_calls.is_none() {
             if let Some(ref c) = response.content {
-                if let Some(tc) = parse_pseudo_tool(c) {
-                    response.raw_tool_calls = Some(json!([{
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": tc.arguments.to_string(),
-                        }
-                    }]));
-                    response.tool_calls = Some(vec![tc]);
+                let tcs = parse_pseudo_tools(c);
+                if !tcs.is_empty() {
+                    let raw: Vec<Value> = tcs
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect();
+                    response.raw_tool_calls = Some(Value::Array(raw));
+                    response.tool_calls = Some(tcs);
                 }
             }
         }
@@ -1126,13 +1418,48 @@ fn approx_chars(m: &ChatMessage) -> usize {
             .as_ref()
             .map(|v| v.to_string().chars().count())
             .unwrap_or(0)
+        + m.thinking.as_ref().map(|t| t.chars().count()).unwrap_or(0)
 }
 
-/// The newest suffix of `messages` that fits `budget` chars, cut only at a
-/// `user` message so an assistant `tool_calls` message is never separated from
-/// its tool replies (strict servers reject that). Always keeps at least the
-/// last user turn, even if that turn alone exceeds the budget. `budget = 0`
-/// disables trimming.
+/// Build the message list for a request: optional compaction summary + kept
+/// tail, then char-budget trim at user boundaries.
+fn build_request_view(
+    session: &AgentSession,
+    system: &str,
+    budget: usize,
+) -> (Vec<ChatMessage>, String) {
+    let mut system_content = system.to_string();
+    let mut view: Vec<ChatMessage> = Vec::new();
+
+    if let Some(c) = &session.compaction {
+        let idx = c.first_kept_index.min(session.messages.len());
+        view.push(ChatMessage::user(format!(
+            "[Summary of earlier conversation]\n{}",
+            c.summary
+        )));
+        view.extend(session.messages[idx..].iter().cloned());
+        system_content
+            .push_str("\n\n(Earlier turns were replaced by the summary message above.)");
+    } else {
+        view.extend(session.messages.iter().cloned());
+    }
+
+    let full_len = view.len();
+    let start = {
+        let trimmed = trimmed_tail(&view, budget);
+        full_len.saturating_sub(trimmed.len())
+    };
+    if start > 0 {
+        debug!(kept = full_len - start, of = full_len, "history trimmed for context budget");
+        system_content.push_str(
+            "\n\n(Older turns were dropped from this request to fit the model's context window.)",
+        );
+        view.drain(..start);
+    }
+    (view, system_content)
+}
+
+/// Newest suffix of `messages` that fits `budget` chars, cut only at a user message.
 fn trimmed_tail(messages: &[ChatMessage], budget: usize) -> &[ChatMessage] {
     if budget == 0 || messages.is_empty() {
         return messages;
@@ -1152,8 +1479,91 @@ fn trimmed_tail(messages: &[ChatMessage], budget: usize) -> &[ChatMessage] {
     &messages[start.unwrap_or(0)..]
 }
 
-/// Read a project `AGENTS.md` from the workspace root (or `.localcode/AGENTS.md`),
-/// truncated so a huge file can't blow a small local model's context window.
+/// Index of the first message to keep verbatim so the recent tail is ~`keep` chars.
+fn first_kept_index(messages: &[ChatMessage], keep: usize) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let mut total = 0usize;
+    let mut start = 0usize;
+    for (i, m) in messages.iter().enumerate().rev() {
+        total += approx_chars(m);
+        if m.role == "user" {
+            start = i;
+        }
+        if total >= keep && m.role == "user" {
+            break;
+        }
+    }
+    start
+}
+
+fn fallback_summary(messages: &[ChatMessage]) -> String {
+    let mut lines = vec!["Earlier conversation (auto-summary fallback):".to_string()];
+    for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant").take(20) {
+        lines.push(format!("{}: {}", m.role, preview(&m.content, 160)));
+    }
+    lines.join("\n")
+}
+
+/// Block exact 3-in-a-row repeats and 2-signature alternating thrash.
+fn should_block_tool_sig(
+    sig: &str,
+    recent: &[String],
+    blocked: &std::collections::HashSet<String>,
+) -> bool {
+    if blocked.contains(sig) {
+        return true;
+    }
+    // Three identical in a row (including this one).
+    let n = recent.len();
+    if n >= 2 && recent[n - 1] == sig && recent[n - 2] == sig {
+        return true;
+    }
+    // Alternating A B A B A with this as the next A or B.
+    if n >= 4 {
+        let a = &recent[n - 2];
+        let b = &recent[n - 1];
+        if a != b
+            && recent[n - 4] == *a
+            && recent[n - 3] == *b
+            && ((sig == a.as_str() && b.as_str() != sig) || (sig == b.as_str() && a.as_str() != sig))
+        {
+            // Pattern A B A B + next is A or B again
+            if sig == a.as_str() || sig == b.as_str() {
+                return true;
+            }
+        }
+    }
+    // Count occurrences of this sig in recent window.
+    let count = recent.iter().filter(|s| s.as_str() == sig).count();
+    count >= 3
+}
+
+fn resolve_skills_dir(config: &AgentConfig) -> PathBuf {
+    if let Some(p) = config.skills_dir.as_deref() {
+        return expand_user_path(p);
+    }
+    AppPaths::resolve()
+        .map(|p| p.data_dir.join("skills"))
+        .unwrap_or_else(|_| PathBuf::from(".localcode/skills"))
+}
+
+fn expand_user_path(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if p == "~" {
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Read a project `AGENTS.md` from the workspace root (or `.localcode/AGENTS.md`).
 fn read_agents_md(workspace: &std::path::Path) -> Option<String> {
     const MAX: usize = 8_000;
     for path in [
@@ -1177,32 +1587,23 @@ fn read_agents_md(workspace: &std::path::Path) -> Option<String> {
     None
 }
 
-/// Parse a pseudo tool call. Anchored to a line start so a model merely
-/// *mentioning* `tool:foo {}` mid-sentence doesn't trigger execution.
-fn parse_pseudo_tool(text: &str) -> Option<ToolCall> {
-    let re = regex::Regex::new(r"(?m)^\s*tool:([\w.]+)\s+(\{.*\})\s*$").ok()?;
-    let caps = re.captures(text)?;
-    let arguments: Value = serde_json::from_str(&caps[2]).ok()?;
-    Some(ToolCall {
-        id: Uuid::new_v4().to_string(),
-        name: caps[1].to_string(),
-        arguments,
-    })
-}
-
-/// Headless agent run for CLI.
-pub async fn run_headless(
-    prompt: &str,
-    workspace: PathBuf,
-    runtime: &ActiveRuntime,
-    config: AgentConfig,
-    api_key: Option<&str>,
-) -> Result<String, LocalCodeError> {
-    let agent = CodingAgent::new(config);
-    let mut session = AgentSession::new(workspace, agent.config.subagents_enabled);
-    agent
-        .run_turn(&mut session, prompt, runtime, api_key, None, None)
-        .await
+/// Parse all pseudo tool-call lines: `tool:name {...}` at line start.
+fn parse_pseudo_tools(text: &str) -> Vec<ToolCall> {
+    let Ok(re) = regex::Regex::new(r"(?m)^\s*tool:([\w.]+)\s+(\{.*\})\s*$") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for caps in re.captures_iter(text) {
+        let Ok(arguments) = serde_json::from_str::<Value>(&caps[2]) else {
+            continue;
+        };
+        out.push(ToolCall {
+            id: Uuid::new_v4().to_string(),
+            name: caps[1].to_string(),
+            arguments,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1215,7 +1616,7 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "Always run cargo fmt before commits.")
             .unwrap();
         let agent = CodingAgent::new(AgentConfig::default());
-        let session = AgentSession::new(dir.path().to_path_buf(), false);
+        let session = AgentSession::new(dir.path().to_path_buf());
         let prompt = agent.build_system_prompt(&session);
         assert!(prompt.contains("Always run cargo fmt"), "{prompt}");
         assert!(prompt.contains("AGENTS.md"));
@@ -1236,7 +1637,7 @@ mod tests {
             system_prompt: Some("You are Grover, a terse assistant.".into()),
             ..AgentConfig::default()
         });
-        let session = AgentSession::new(dir.path().to_path_buf(), false);
+        let session = AgentSession::new(dir.path().to_path_buf());
         let prompt = agent.build_system_prompt(&session);
         assert!(prompt.contains("Grover"));
         assert!(!prompt.contains("LocalCode coding agent"));
@@ -1246,7 +1647,7 @@ mod tests {
     #[test]
     fn disabled_tools_are_hidden_from_schema() {
         let agent = CodingAgent::new(AgentConfig {
-            disabled_tools: vec!["shell.exec".into()],
+            disabled_tools: vec!["bash".into()],
             ..AgentConfig::default()
         });
         let schema = agent.tools.openai_tools_schema();
@@ -1256,26 +1657,29 @@ mod tests {
             .iter()
             .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
             .collect();
-        assert!(!names.iter().any(|n| n == "shell.exec"), "{names:?}");
-        assert!(names.iter().any(|n| n == "fs.read"));
+        assert!(!names.iter().any(|n| n == "bash"), "{names:?}");
+        assert!(names.iter().any(|n| n == "read"));
     }
 
     #[test]
-    fn pseudo_tool_requires_line_start() {
-        assert!(parse_pseudo_tool("tool:fs.read {\"path\": \"a.txt\"}").is_some());
-        assert!(parse_pseudo_tool("  tool:fs.list {}").is_some());
+    fn pseudo_tools_parse_all_line_start() {
+        let multi = "tool:read {\"path\": \"a.txt\"}\ntool:ls {\"path\": \".\"}\n";
+        let tcs = parse_pseudo_tools(multi);
+        assert_eq!(tcs.len(), 2);
+        assert_eq!(tcs[0].name, "read");
+        assert_eq!(tcs[1].name, "ls");
+        assert!(parse_pseudo_tools("  tool:ls {}").len() == 1);
         assert!(
-            parse_pseudo_tool("you could run tool:fs.read {\"path\": \"a\"} to do this").is_none()
+            parse_pseudo_tools("you could run tool:read {\"path\": \"a\"} to do this").is_empty()
         );
-        // Invalid JSON must not silently execute with empty args.
-        assert!(parse_pseudo_tool("tool:fs.read {not json}").is_none());
+        assert!(parse_pseudo_tools("tool:read {not json}").is_empty());
     }
 
     #[test]
     fn history_trimming_cuts_at_user_turns() {
         let user = |s: &str| ChatMessage::user(s);
-        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc);
-        let tool = |s: &str| ChatMessage::tool(s, "c1".into(), "fs.read".into());
+        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc, None);
+        let tool = |s: &str| ChatMessage::tool(s, "c1".into(), "read".into());
 
         // Two turns; the second fits the budget on its own.
         let msgs = vec![
@@ -1314,8 +1718,8 @@ mod tests {
     #[test]
     fn sanitize_history_truncates_at_first_violation() {
         let user = |s: &str| ChatMessage::user(s);
-        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc);
-        let tool = |s: &str, id: &str| ChatMessage::tool(s, id.into(), "fs.read".into());
+        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc, None);
+        let tool = |s: &str, id: &str| ChatMessage::tool(s, id.into(), "read".into());
         let calls = |ids: &[&str]| {
             let arr: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
             Some(json!(arr))
@@ -1355,10 +1759,10 @@ mod tests {
 
     #[test]
     fn tool_messages_serialize_protocol_fields() {
-        let m = ChatMessage::tool("ok", "call_1".into(), "fs.read".into());
+        let m = ChatMessage::tool("ok", "call_1".into(), "read".into());
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["tool_call_id"], "call_1");
-        let a = ChatMessage::assistant("", Some(json!([{"id": "call_1"}])));
+        let a = ChatMessage::assistant("", Some(json!([{"id": "call_1"}])), None);
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["tool_calls"][0]["id"], "call_1");
     }

@@ -7,7 +7,7 @@
 
 use crate::constants::{ASSISTANT_SYSTEM_PROMPT, BONSAI_TEMPERATURE};
 use crate::deploy_hints::{extract_deploy_hints, DeployHints};
-use localcode_agent::{approval_request, ToolApprover, ToolCall, ToolRegistry, ToolResult};
+use localcode_agent::{ToolApprover, ToolCall, ToolRegistry, ToolResult};
 use localcode_backends::BackendKind;
 use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -103,7 +103,10 @@ impl AssistantAgent {
 
         // Assistant is allowed shell + fs; keep approval mode from agent config
         // so destructive commands still gate when the user wants that.
-        let tools = ToolRegistry::new(cfg.agent.disabled_tools.clone());
+        let tools = ToolRegistry::new(
+            cfg.agent.disabled_tools.clone(),
+            cfg.agent.shell_sandbox,
+        );
         let context_blob = format_context_pack(context);
 
         Self {
@@ -204,7 +207,7 @@ impl AssistantAgent {
         call: &ToolCall,
         approver: Option<&dyn ToolApprover>,
     ) -> Result<ToolResult, LocalCodeError> {
-        // Extra tools not in the coding registry.
+        // Extra tools not in the coding registry (no approval gate).
         match call.name.as_str() {
             "hf.model_card" => return self.tool_hf_model_card(call).await,
             "hf.search" => return self.tool_hf_search(call).await,
@@ -217,29 +220,11 @@ impl AssistantAgent {
             _ => {}
         }
 
-        // Approval gate for built-in tools.
-        if let Some(request) = approval_request(call, self.approval) {
-            let approved = match approver {
-                Some(a) => a.approve(&request).await,
-                None => {
-                    // Background auto-repair: allow non-destructive; refuse shell
-                    // that would be gated under Auto when no UI approver exists.
-                    !matches!(
-                        self.approval,
-                        ApprovalMode::AskPermission | ApprovalMode::ApproveEdits
-                    ) && approval_request(call, ApprovalMode::Auto).is_none()
-                }
-            };
-            if !approved {
-                return Err(LocalCodeError::new(
-                    ErrorCode::Cancelled,
-                    format!("Tool call not approved: {}", call.name),
-                ));
-            }
-        }
-
+        // Single approval path via ToolRegistry (no double-gate).
+        // Background auto-repair passes `approver = None`: gated calls are
+        // refused by the registry instead of silently elevated.
         self.tools
-            .execute(call, &self.workspace, ApprovalMode::AlwaysApprove, None)
+            .execute(call, &self.workspace, self.approval, approver, None)
             .await
     }
 

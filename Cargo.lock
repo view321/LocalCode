@@ -1628,6 +1628,7 @@ dependencies = [
  "chrono",
  "futures",
  "localcode-core",
+ "localcode-hf",
  "regex",
  "reqwest",
  "serde",

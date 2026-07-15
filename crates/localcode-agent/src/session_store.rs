@@ -430,7 +430,6 @@ impl SessionStore {
             title,
             messages,
             workspace_root: PathBuf::from(&header.cwd),
-            subagents_enabled: false,
             runtime_id: None,
             compaction,
         };
@@ -592,6 +591,10 @@ fn fingerprint(m: &ChatMessage) -> u64 {
     if let Some(tc) = &m.tool_calls {
         buf.push_str(&tc.to_string());
     }
+    buf.push('\u{1}');
+    if let Some(t) = &m.thinking {
+        buf.push_str(t);
+    }
     fnv1a(buf.as_bytes())
 }
 
@@ -605,21 +608,21 @@ mod tests {
         ChatMessage::user(s)
     }
     fn asst(s: &str) -> ChatMessage {
-        ChatMessage::assistant(s, None)
+        ChatMessage::assistant(s, None, None)
     }
     fn asst_calls(ids: &[&str]) -> ChatMessage {
         let calls: Vec<_> = ids
             .iter()
-            .map(|id| json!({"id": id, "type": "function", "function": {"name": "fs.read", "arguments": "{}"}}))
+            .map(|id| json!({"id": id, "type": "function", "function": {"name": "read", "arguments": "{}"}}))
             .collect();
-        ChatMessage::assistant("", Some(json!(calls)))
+        ChatMessage::assistant("", Some(json!(calls)), None)
     }
     fn tool(s: &str, id: &str) -> ChatMessage {
-        ChatMessage::tool(s, id.into(), "fs.read".into())
+        ChatMessage::tool(s, id.into(), "read".into())
     }
 
     fn new_session(dir: &Path) -> AgentSession {
-        AgentSession::new(dir.to_path_buf(), false)
+        AgentSession::new(dir.to_path_buf())
     }
 
     #[test]

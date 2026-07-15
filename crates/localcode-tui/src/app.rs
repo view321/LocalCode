@@ -19,12 +19,15 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use localcode_agent::{AgentEvent, AgentSession, CodingAgent, Skill, SkillLoader, ToolApprover, ToolRegistry};
+use localcode_agent::{
+    list_sessions, sessions_root, AgentEvent, AgentSession, CodingAgent, SessionStore, Skill,
+    ToolApprover, ToolRegistry,
+};
 use localcode_api_client::ApiClient;
 use localcode_assistant::{
-    extract_deploy_hints, install_local_assistant, install_need, install_offer_body, is_installed,
-    quant_compatibility_note, should_offer_install, startup_greeting, Assistant, AssistantContext,
-    ASSISTANT_DISPLAY_NAME, InstallNeed,
+    ensure_running, extract_deploy_hints, install_local_assistant, install_need, install_offer_body,
+    is_installed, quant_compatibility_note, should_offer_install, startup_greeting, Assistant,
+    AssistantContext, LocalAssistantRuntime, ASSISTANT_DISPLAY_NAME, BONSAI_HF_REF, InstallNeed,
 };
 use localcode_backends::{
     can_elevate_noninteractively, diagnose, resolve_install_plan, resolve_repair, run_install,
@@ -170,6 +173,8 @@ pub enum ClickTarget {
     /// The `approvals <tag>` cluster — click to cycle the agent approval mode.
     ApprovalCycle,
     UpdateBadge,
+    /// Click the status dashboard body to pin/unpin the expanded log view.
+    StatusToggle,
     // Command list (shown while the omnibar starts with '/')
     CommandItem(usize),
     // '@' file-picker rows (shown while the caret is in an '@' token)
@@ -217,7 +222,6 @@ pub enum ClickTarget {
 pub enum SettingField {
     SystemPrompt,
     SkillsDir,
-    McpPath,
     Workspace,
 }
 
@@ -266,6 +270,9 @@ pub enum SettingAction {
     ToggleCloudFallback,
     ToggleAgentsMd,
     ToggleCheckUpdates,
+    ToggleShellSandbox,
+    ToggleSessions,
+    ToggleAutoCompact,
     ToggleTool(usize),
     ToggleSkill(usize),
     ReloadSkills,
@@ -427,6 +434,8 @@ pub enum BgMsg {
     /// Local Bonsai assistant install progress / completion.
     AssistantInstallProgress(String),
     AssistantInstallDone(Result<Option<Repoint>, LocalCodeError>),
+    /// Background warm-start of the local assistant server finished.
+    AssistantRuntimeReady(Result<LocalAssistantRuntime, LocalCodeError>),
     DoctorDone(String),
     DetectDone(Vec<DetectReport>),
     ApiHealth(bool),
@@ -524,6 +533,21 @@ pub struct App {
     /// Last known mouse position (col, row) — drives hover affordances like
     /// the theme-switcher name reveal. `None` until the mouse first moves.
     pub hover: Option<(u16, u16)>,
+    /// Previous-frame status dashboard rect (including borders). Used so hover
+    /// expand can grow/shrink without a layout chicken-egg.
+    pub status_bar_rect: Rect,
+    /// When true the status dashboard stays expanded (10 lines) until clicked
+    /// again; when false it expands only while the mouse hovers it.
+    pub status_pinned: bool,
+    /// Compacted recent log lines for the status dashboard tail (newest last).
+    pub status_logs: Vec<String>,
+    /// Live decode rate (approx. tokens/s from streamed chars÷4). `None` when
+    /// no recent stream sample is available.
+    pub tokens_per_sec: Option<f64>,
+    /// Streaming window start for the tok/s estimate.
+    tok_rate_started: Option<Instant>,
+    /// Characters received in the current tok/s window.
+    tok_rate_chars: usize,
     /// Highlighted index in the '@' file picker.
     pub at_selected: usize,
     /// The '@' token the picker was dismissed for (Esc). Typing changes the
@@ -599,6 +623,9 @@ pub struct App {
     pub deploy_progress: u8,
     /// Local Bonsai weights + llama-server are present.
     pub local_assistant_ready: bool,
+    /// Live handle for the local Bonsai assistant (`llama-server -hf …`).
+    /// Kept so the default conversation can use it without `/assistant`.
+    local_assistant: Option<std::sync::Arc<LocalAssistantRuntime>>,
     /// Install of the local assistant in progress.
     pub assistant_install_busy: Option<Busy>,
     pub assistant_install_progress: String,
@@ -616,11 +643,8 @@ pub struct App {
     pub coding_view_height: u16,
     pub coding_total_lines: usize,
     pub skill_count: usize,
-    pub mcp_status_summary: String,
     /// Skills discovered from the skills dir, for the Settings view.
     pub skills: Vec<Skill>,
-    /// `name → target` for each configured MCP server, for the Settings view.
-    pub mcp_servers: Vec<String>,
     // Settings view: selection over actionable rows, scroll, and inline editor.
     pub settings_sel: usize,
     pub settings_scroll: u16,
@@ -635,6 +659,8 @@ pub struct App {
     registry: Arc<BackendRegistry>,
     hf: Option<HfClient>,
     session: Arc<AsyncMutex<AgentSession>>,
+    /// Append-only JSONL store when sessions_enabled; None if persistence off.
+    session_store: Arc<AsyncMutex<Option<SessionStore>>>,
     bg_tx: mpsc::UnboundedSender<BgMsg>,
     bg_rx: mpsc::UnboundedReceiver<BgMsg>,
     pub busy: Option<Busy>,
@@ -674,14 +700,7 @@ impl App {
 
         let agent_probe = CodingAgent::new(config.agent.clone());
         let skill_count = agent_probe.skills.list().len();
-        let mcp_count = agent_probe.mcp.configured_count();
-        let mcp_status_summary = if mcp_count == 0 {
-            "none configured".into()
-        } else {
-            format!("{mcp_count} configured (not connected)")
-        };
         let skills = agent_probe.skills.list().to_vec();
-        let mcp_servers = agent_probe.mcp.server_summaries();
 
         let workspace = config
             .agent
@@ -689,7 +708,8 @@ impl App {
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let session = Arc::new(AsyncMutex::new(AgentSession::new(workspace, false)));
+        let (session, session_store, resume_note) =
+            bootstrap_session(&config.agent, &paths, workspace);
 
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
@@ -712,6 +732,12 @@ impl App {
             pending_tool_confirm: None,
             palette_selected: 0,
             hover: None,
+            status_bar_rect: Rect::default(),
+            status_pinned: false,
+            status_logs: Vec::new(),
+            tokens_per_sec: None,
+            tok_rate_started: None,
+            tok_rate_chars: 0,
             at_selected: 0,
             at_dismissed: None,
             workspace_files: None,
@@ -764,6 +790,7 @@ impl App {
             deploy_field_edit: String::new(),
             deploy_progress: 0,
             local_assistant_ready,
+            local_assistant: None,
             assistant_install_busy: None,
             assistant_install_progress: String::new(),
             last_fit: None,
@@ -790,9 +817,7 @@ impl App {
             coding_view_height: 0,
             coding_total_lines: 0,
             skill_count,
-            mcp_status_summary,
             skills,
-            mcp_servers,
             settings_sel: 0,
             settings_scroll: 0,
             settings_view_height: 0,
@@ -804,6 +829,7 @@ impl App {
             registry,
             hf,
             session,
+            session_store,
             bg_tx,
             bg_rx,
             busy: None,
@@ -815,6 +841,48 @@ impl App {
             should_quit: false,
             config,
         };
+        if let Some(note) = resume_note {
+            app.coding_transcript
+                .push(TranscriptEntry::new(EntryKind::System, note));
+            // Rebuild visible history from the loaded session messages.
+            if let Ok(sess) = app.session.try_lock() {
+                for m in &sess.messages {
+                    match m.role.as_str() {
+                        "user" => app
+                            .coding_transcript
+                            .push(TranscriptEntry::new(EntryKind::You, m.content.clone())),
+                        "assistant" => {
+                            if let Some(t) = m.thinking.as_ref().filter(|s| !s.is_empty()) {
+                                app.coding_transcript.push(TranscriptEntry {
+                                    kind: EntryKind::Thinking,
+                                    text: t.clone(),
+                                    live: false,
+                                    detail: None,
+                                    expanded: false,
+                                });
+                            }
+                            if !m.content.trim().is_empty() {
+                                app.coding_transcript.push(TranscriptEntry::new(
+                                    EntryKind::Agent,
+                                    m.content.clone(),
+                                ));
+                            }
+                        }
+                        "tool" => {
+                            let name = m.name.as_deref().unwrap_or("tool");
+                            app.coding_transcript.push(TranscriptEntry {
+                                kind: EntryKind::Tool,
+                                text: format!("✓ {name}"),
+                                live: false,
+                                detail: Some(m.content.clone()),
+                                expanded: false,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // Seed cached popular models if available
         if let Some(hf) = &app.hf {
@@ -843,23 +911,58 @@ impl App {
             }
         }
 
+        // Warm-start the local Bonsai assistant so the default conversation can
+        // use it without the user hunting for /assistant.
+        if app.local_assistant_ready && app.config.assistant.prefer_local {
+            app.warm_start_local_assistant();
+        }
+
         app
     }
 
-    /// All runtimes the agent can use: locally-managed (from the registry) plus
-    /// remote runtimes tunneled over SSH.
-    pub fn all_runtimes(&self) -> Vec<&ActiveRuntime> {
-        self.runtimes
-            .iter()
-            .chain(self.remote_sessions.iter().map(|s| &s.runtime))
-            .collect()
+    /// Kick off `llama-server -hf …` in the background when the assistant is installed.
+    fn warm_start_local_assistant(&mut self) {
+        if self.local_assistant.is_some() {
+            return;
+        }
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = ensure_running(&config, &paths).await;
+            let _ = tx.send(BgMsg::AssistantRuntimeReady(result));
+        });
+        self.set_status(
+            format!("Starting local {ASSISTANT_DISPLAY_NAME} ({BONSAI_HF_REF})…"),
+            false,
+        );
+    }
+
+    /// Snapshot of the local assistant as an ActiveRuntime, when healthy.
+    fn local_assistant_runtime_snapshot(&self) -> Option<ActiveRuntime> {
+        self.local_assistant
+            .as_ref()
+            .map(|rt| rt.as_active_runtime())
+    }
+
+    /// All runtimes the agent can use: local assistant (default), registry
+    /// deploys, and remote runtimes tunneled over SSH.
+    pub fn all_runtimes(&self) -> Vec<ActiveRuntime> {
+        let mut out = Vec::new();
+        // Prefer the local Bonsai assistant first so it is the default conversation.
+        if let Some(rt) = self.local_assistant_runtime_snapshot() {
+            out.push(rt);
+        }
+        out.extend(self.runtimes.iter().cloned());
+        out.extend(self.remote_sessions.iter().map(|s| s.runtime.clone()));
+        out
     }
 
     pub fn active_runtime(&self) -> Option<ActiveRuntime> {
         let all = self.all_runtimes();
         all.get(self.runtime_selected)
-            .or_else(|| all.first())
-            .map(|r| (*r).clone())
+            .cloned()
+            .or_else(|| all.into_iter().next())
     }
 
     pub fn active_runtime_name(&self) -> Option<String> {
@@ -992,6 +1095,7 @@ impl App {
     fn apply_agent_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::ThinkingDelta(text) => {
+                self.note_stream_chars(&text);
                 // Seal prior agent text if any; thinking usually precedes the answer.
                 if let Some(e) = self.coding_transcript.last_mut() {
                     if e.kind == EntryKind::Agent && e.live {
@@ -1012,6 +1116,7 @@ impl App {
                 self.coding_follow = true;
             }
             AgentEvent::Delta(text) => {
+                self.note_stream_chars(&text);
                 if let Some(e) = self.coding_transcript.last_mut() {
                     if e.kind == EntryKind::Thinking && e.live {
                         e.live = false;
@@ -1237,6 +1342,80 @@ impl App {
             .map(|e| e.text.chars().count())
             .sum();
         self.ctx_used_tokens = (chars / 4) as u32;
+    }
+
+    /// Whether the status dashboard should render expanded (10 content lines).
+    /// Pinned by click, or temporarily while the mouse hovers the bar.
+    pub fn status_expanded(&self) -> bool {
+        self.status_pinned || self.hover_over_status()
+    }
+
+    /// True when the last known mouse position falls inside the previous-frame
+    /// status dashboard rect.
+    pub fn hover_over_status(&self) -> bool {
+        let Some((c, r)) = self.hover else {
+            return false;
+        };
+        let a = self.status_bar_rect;
+        if a.width == 0 || a.height == 0 {
+            return false;
+        }
+        c >= a.x
+            && c < a.x.saturating_add(a.width)
+            && r >= a.y
+            && r < a.y.saturating_add(a.height)
+    }
+
+    /// Toggle pinned expansion of the status dashboard (click to hold open).
+    pub fn toggle_status_pin(&mut self) {
+        self.status_pinned = !self.status_pinned;
+    }
+
+    /// Refresh the compact log tail shown under the status metrics.
+    pub fn refresh_status_logs(&mut self) {
+        let redact = self.config.logging.redact_secrets;
+        let lines = localcode_log::read_recent_logs(&self.paths.log_dir, 8, None, redact)
+            .ok()
+            .map(|s| {
+                s.lines()
+                    .map(compact_log_line)
+                    .filter(|l| !l.trim().is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.status_logs = lines;
+    }
+
+    /// Feed streamed text into the live tokens/s estimate (chars÷4 / elapsed).
+    fn note_stream_chars(&mut self, text: &str) {
+        let n = text.chars().count();
+        if n == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if self.tok_rate_started.is_none() {
+            self.tok_rate_started = Some(now);
+            self.tok_rate_chars = 0;
+        }
+        self.tok_rate_chars = self.tok_rate_chars.saturating_add(n);
+        if let Some(start) = self.tok_rate_started {
+            let elapsed = now.duration_since(start).as_secs_f64();
+            if elapsed >= 0.2 {
+                let tokens = self.tok_rate_chars as f64 / 4.0;
+                self.tokens_per_sec = Some(tokens / elapsed);
+            }
+            // Slide the window so a long idle stretch mid-turn doesn't freeze the rate.
+            if elapsed >= 2.0 {
+                self.tok_rate_started = Some(now);
+                self.tok_rate_chars = 0;
+            }
+        }
+    }
+
+    /// Clear the streaming window at end-of-turn; keep the last rate on screen.
+    fn end_stream_rate_window(&mut self) {
+        self.tok_rate_started = None;
+        self.tok_rate_chars = 0;
     }
 
     pub fn start_detect(&mut self) {
@@ -1944,39 +2123,38 @@ impl App {
             return;
         }
 
-        let runtime = match self.active_runtime() {
-            Some(r) => r,
-            None => {
-                // Local-first: never silently route the workspace to a cloud
-                // provider. Users opt in via agent.allow_cloud_fallback.
-                if self.config.agent.allow_cloud_fallback && self.assistant_configured {
-                    let mut r = ActiveRuntime::new(
-                        "assistant-provider",
-                        localcode_core::runtime::RuntimeKind::OpenAiCompatible,
-                        self.config.assistant.base_url.clone(),
-                    );
-                    r.model_id = if self.config.assistant.model.is_empty() {
-                        Some("openai/gpt-4o-mini".into())
-                    } else {
-                        Some(self.config.assistant.model.clone())
-                    };
-                    r.api_key = self.config.assistant_api_key();
-                    self.coding_transcript.push(TranscriptEntry::new(
-                        EntryKind::System,
-                        "no local runtime — using the cloud assistant provider (agent.allow_cloud_fallback=true)",
-                    ));
-                    r
-                } else {
-                    self.coding_transcript.push(TranscriptEntry::new(
-                        EntryKind::System,
-                        "no runtime. Deploy one from the Models tab — or set agent.allow_cloud_fallback=true to use the cloud assistant provider.",
-                    ));
-                    self.coding_follow = true;
-                    self.set_status("No runtime — deploy a model first (Models tab)", true);
-                    return;
-                }
+        // Prefer an already-selected/deployed runtime; otherwise the local Bonsai
+        // assistant is the default conversation model (no /assistant needed).
+        let existing = self.active_runtime();
+        let use_local_assistant = existing.is_none()
+            && self.local_assistant_ready
+            && self.config.assistant.prefer_local;
+        let use_cloud_fallback = existing.is_none()
+            && !use_local_assistant
+            && self.config.agent.allow_cloud_fallback
+            && self.assistant_configured;
+
+        if existing.is_none() && !use_local_assistant && !use_cloud_fallback {
+            let hint = if self.config.assistant.local_preference
+                == LocalAssistantPreference::Declined
+            {
+                "no runtime. Deploy a model from the Models tab, or run /assistant install for the local Bonsai assistant."
+            } else if !self.local_assistant_ready {
+                "no runtime. Accept the local Bonsai install offer, deploy a model from Models, or set agent.allow_cloud_fallback=true."
+            } else {
+                "no runtime. Starting the local assistant — try again in a moment, or deploy a model from Models."
+            };
+            self.coding_transcript
+                .push(TranscriptEntry::new(EntryKind::System, hint));
+            self.coding_follow = true;
+            if self.local_assistant_ready {
+                self.warm_start_local_assistant();
+                self.set_status("Starting local assistant…", false);
+            } else {
+                self.set_status("No runtime — install the assistant or deploy a model", true);
             }
-        };
+            return;
+        }
 
         self.coding_history.push(input.clone());
         if self.coding_history.len() > MAX_INPUT_HISTORY {
@@ -2012,10 +2190,52 @@ impl App {
 
         let agent_cfg = self.config.agent.clone();
         let session = self.session.clone();
+        let session_store = self.session_store.clone();
         let tx = self.bg_tx.clone();
         let approver_tx = self.bg_tx.clone();
+        let hf_arc = self.hf.clone().map(std::sync::Arc::new);
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let cloud_base = self.config.assistant.base_url.clone();
+        let cloud_model = self.config.assistant.model.clone();
+        let cloud_key = self.config.assistant_api_key();
         let handle = tokio::spawn(async move {
-            let agent = CodingAgent::new(agent_cfg);
+            // Resolve runtime inside the task so we can ensure_running the local assistant.
+            let runtime = if let Some(r) = existing {
+                r
+            } else if use_local_assistant {
+                match ensure_running(&config, &paths).await {
+                    Ok(rt) => {
+                        // Publish handle back to the UI for subsequent turns.
+                        let snap = rt.as_active_runtime();
+                        let _ = tx.send(BgMsg::AssistantRuntimeReady(Ok(rt)));
+                        snap
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::CodingDone(Err(e)));
+                        return;
+                    }
+                }
+            } else {
+                // Hosted fallback (opt-in).
+                let mut r = ActiveRuntime::new(
+                    "assistant-provider",
+                    localcode_core::runtime::RuntimeKind::OpenAiCompatible,
+                    cloud_base,
+                );
+                r.model_id = if cloud_model.is_empty() {
+                    Some("openai/gpt-4o-mini".into())
+                } else {
+                    Some(cloud_model)
+                };
+                r.api_key = cloud_key.clone();
+                r
+            };
+
+            let mut agent = CodingAgent::new(agent_cfg);
+            if let Some(hf) = hf_arc {
+                agent = agent.with_hf(hf);
+            }
             let approver = ChannelApprover { tx: approver_tx };
             let mut session = session.lock().await;
             let api_key = runtime.api_key.clone();
@@ -2029,6 +2249,11 @@ impl App {
                     Some(&ev_tx),
                 )
                 .await;
+            if let Some(store) = session_store.lock().await.as_mut() {
+                if let Err(e) = store.sync(&session) {
+                    tracing::warn!(error = %e, "failed to persist coding session");
+                }
+            }
             drop(session);
             let _ = tx.send(BgMsg::CodingDone(result));
         });
@@ -2040,10 +2265,22 @@ impl App {
             self.set_status("Agent is busy — Esc to cancel first", false);
             return;
         }
-        self.session = Arc::new(AsyncMutex::new(AgentSession::new(
-            self.workspace_path(),
-            false,
-        )));
+        let workspace = self.workspace_path();
+        let session = AgentSession::new(workspace);
+        let store = if self.config.agent.sessions_enabled {
+            let root = sessions_root(&self.config.agent, &self.paths);
+            match SessionStore::create(&root, &session) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.set_status(format!("Session file not created: {}", e.message), true);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.session = Arc::new(AsyncMutex::new(session));
+        self.session_store = Arc::new(AsyncMutex::new(store));
         // Re-walk the workspace next time '@' is used — files likely changed.
         self.workspace_files = None;
         self.coding_transcript = vec![TranscriptEntry::new(
@@ -2057,34 +2294,62 @@ impl App {
     }
 
     fn start_stop_runtime(&mut self) {
-        // Selection indexes registry runtimes first, then remote sessions.
+        // Layout of all_runtimes(): [local assistant?] + registry + remotes.
+        let assistant_offset = usize::from(self.local_assistant.is_some());
         let reg_len = self.runtimes.len();
-        if self.runtime_selected >= reg_len {
-            let remote_idx = self.runtime_selected - reg_len;
-            if let Some(name) = self.remote_sessions.get(remote_idx).map(|s| s.server_name.clone()) {
-                match self.config.remote.servers.iter().position(|s| s.name == name) {
-                    Some(cfg_idx) => self.disconnect_remote(cfg_idx),
-                    None => {
-                        self.remote_sessions.remove(remote_idx);
-                        self.set_status(format!("Disconnected from {name}"), false);
-                    }
-                }
+        let idx = self.runtime_selected;
+
+        if assistant_offset == 1 && idx == 0 {
+            // Stop the managed local Bonsai assistant.
+            if let Some(rt) = self.local_assistant.take() {
+                let name = ASSISTANT_DISPLAY_NAME;
+                self.set_status(format!("Stopping {name}…"), false);
+                tokio::spawn(async move {
+                    rt.stop().await;
+                });
+                self.set_status(format!("{ASSISTANT_DISPLAY_NAME} stopped"), false);
             }
             return;
         }
-        let Some(rt) = self.runtimes.get(self.runtime_selected) else {
-            self.set_status("No runtime selected", false);
+
+        let reg_idx = idx.saturating_sub(assistant_offset);
+        if reg_idx < reg_len {
+            let Some(rt) = self.runtimes.get(reg_idx) else {
+                self.set_status("No runtime selected", false);
+                return;
+            };
+            let id = rt.id.to_string();
+            let name = rt.name.clone();
+            let registry = self.registry.clone();
+            let tx = self.bg_tx.clone();
+            self.set_status(format!("Stopping {name}…"), false);
+            tokio::spawn(async move {
+                let result = registry.stop_runtime(&id).await;
+                let _ = tx.send(BgMsg::RuntimeStopped { result });
+            });
             return;
-        };
-        let id = rt.id.to_string();
-        let name = rt.name.clone();
-        let registry = self.registry.clone();
-        let tx = self.bg_tx.clone();
-        self.set_status(format!("Stopping {name}…"), false);
-        tokio::spawn(async move {
-            let result = registry.stop_runtime(&id).await;
-            let _ = tx.send(BgMsg::RuntimeStopped { result });
-        });
+        }
+
+        let remote_idx = reg_idx - reg_len;
+        if let Some(name) = self
+            .remote_sessions
+            .get(remote_idx)
+            .map(|s| s.server_name.clone())
+        {
+            match self
+                .config
+                .remote
+                .servers
+                .iter()
+                .position(|s| s.name == name)
+            {
+                Some(cfg_idx) => self.disconnect_remote(cfg_idx),
+                None => {
+                    self.remote_sessions.remove(remote_idx);
+                    self.set_status(format!("Disconnected from {name}"), false);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2799,6 +3064,7 @@ impl App {
                         .filter(|b| b.kind == BusyKind::Coding)
                         .map(|b| b.started.elapsed());
                     self.finish_busy();
+                    self.end_stream_rate_window();
                     self.refresh_ctx_usage();
                     match result {
                         Ok(reply) => {
@@ -2970,11 +3236,15 @@ impl App {
                             self.modal = Some(ModalState::info(
                                 format!("{ASSISTANT_DISPLAY_NAME} ready"),
                                 format!(
-                                    "Local assistant is installed.\n\n{}\n\n{}",
-                                    quant_compatibility_note(),
-                                    "It will help with errors automatically and read model cards on deploy."
+                                    "Local assistant is installed and is your default conversation model.\n\n\
+                                     Launch: llama-server -hf {BONSAI_HF_REF}\n\n{}\n\n\
+                                     Just type in chat — no /assistant needed. It can search Hugging Face, \
+                                     read model cards, help deploy models, and fix LocalCode issues.",
+                                    quant_compatibility_note()
                                 ),
                             ));
+                            // Attach the already-running (or warm-start) server as the default runtime.
+                            self.warm_start_local_assistant();
                         }
                         Err(e) => {
                             self.last_failed_action =
@@ -2984,6 +3254,39 @@ impl App {
                             self.raise_error(e);
                             self.config.assistant.auto_handle_errors = prev;
                         }
+                    }
+                }
+                BgMsg::AssistantRuntimeReady(result) => match result {
+                    Ok(rt) => {
+                        // Keep the first handle that owns the child. Later
+                        // ensure_running probes reuse a healthy server with
+                        // child=None — replacing would Drop the owner and kill
+                        // llama-server mid-conversation.
+                        if self.local_assistant.is_none() {
+                            self.local_assistant = Some(std::sync::Arc::new(rt));
+                        }
+                        self.local_assistant_ready = true;
+                        self.assistant_configured = true;
+                        // Keep selection on the assistant (index 0) when nothing else was selected.
+                        if self.runtimes.is_empty() && self.remote_sessions.is_empty() {
+                            self.runtime_selected = 0;
+                        }
+                        self.set_status(
+                            format!(
+                                "{ASSISTANT_DISPLAY_NAME} ready — default chat uses -hf {BONSAI_HF_REF}"
+                            ),
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "local assistant warm-start failed");
+                        self.set_status(
+                            format!(
+                                "Local assistant start failed: {} — try /assistant install",
+                                e.message
+                            ),
+                            true,
+                        );
                     }
                 }
                 BgMsg::DoctorDone(report) => {
@@ -3009,6 +3312,7 @@ impl App {
                     // Same 1s cadence refreshes the context meter even when the
                     // GPU probe is a no-op (CPU-only host / failed smi).
                     self.refresh_ctx_usage();
+                    self.refresh_status_logs();
                 }
                 BgMsg::RuntimeStopped { result } => match result {
                     Ok(()) => self.set_status("Runtime stopped", false),
@@ -3258,7 +3562,7 @@ impl App {
             ("/new", "", "start a new conversation"),
             ("/deploy", "", "deploy the selected model"),
             ("/doctor", "", "run environment diagnostics"),
-            ("/assistant", "[install]", "ask the local Bonsai assistant (or install it)"),
+            ("/assistant", "[install]", "install/start local Bonsai (default chat when ready)"),
             ("/update", "", "install the available update"),
             ("/logs", "", "show the log directory path"),
             ("/help", "", "keyboard & mouse help"),
@@ -3739,6 +4043,21 @@ impl App {
             self.config.updates.check_on_startup,
             SettingAction::ToggleCheckUpdates,
         ));
+        r.push(toggle(
+            "shell sandbox",
+            self.config.agent.shell_sandbox,
+            SettingAction::ToggleShellSandbox,
+        ));
+        r.push(toggle(
+            "session persistence",
+            self.config.agent.sessions_enabled,
+            SettingAction::ToggleSessions,
+        ));
+        r.push(toggle(
+            "auto-compact",
+            self.config.agent.auto_compact,
+            SettingAction::ToggleAutoCompact,
+        ));
 
         // Agent: system prompt, AGENTS.md, workspace.
         r.push(SettingsRow::header("agent — prompt & project context"));
@@ -3787,7 +4106,7 @@ impl App {
             .agent
             .skills_dir
             .clone()
-            .unwrap_or_else(|| ".localcode/skills".into());
+            .unwrap_or_else(|| self.paths.data_dir.join("skills").display().to_string());
         r.push(text("skills dir", sd, SettingField::SkillsDir));
         r.push(SettingsRow {
             label: "reload skills".into(),
@@ -3803,23 +4122,6 @@ impl App {
                 kind: SettingsRowKind::Toggle(enabled),
                 action: Some(SettingAction::ToggleSkill(i)),
             });
-        }
-
-        // MCP servers.
-        r.push(SettingsRow::header("mcp servers"));
-        let mp = self
-            .config
-            .agent
-            .mcp_config
-            .clone()
-            .unwrap_or_else(|| ".localcode/mcp.json".into());
-        r.push(text("mcp config", mp, SettingField::McpPath));
-        if self.mcp_servers.is_empty() {
-            r.push(SettingsRow::info("", "no servers — add them to the mcp.json above"));
-        } else {
-            for s in &self.mcp_servers {
-                r.push(SettingsRow::info("server", s.clone()));
-            }
         }
 
         // Config file / env.
@@ -3921,6 +4223,15 @@ impl App {
             SettingAction::ToggleCheckUpdates => {
                 self.config.updates.check_on_startup = !self.config.updates.check_on_startup;
             }
+            SettingAction::ToggleShellSandbox => {
+                self.config.agent.shell_sandbox = !self.config.agent.shell_sandbox;
+            }
+            SettingAction::ToggleSessions => {
+                self.config.agent.sessions_enabled = !self.config.agent.sessions_enabled;
+            }
+            SettingAction::ToggleAutoCompact => {
+                self.config.agent.auto_compact = !self.config.agent.auto_compact;
+            }
             SettingAction::ToggleTool(i) => self.toggle_tool(i),
             SettingAction::ToggleSkill(i) => self.toggle_skill(i),
             SettingAction::ReloadSkills => {
@@ -3971,7 +4282,6 @@ impl App {
                 self.config.agent.system_prompt.clone().unwrap_or_default()
             }
             SettingField::SkillsDir => self.config.agent.skills_dir.clone().unwrap_or_default(),
-            SettingField::McpPath => self.config.agent.mcp_config.clone().unwrap_or_default(),
             SettingField::Workspace => self.config.agent.workspace_root.clone().unwrap_or_default(),
         };
         self.settings_editing = Some(field);
@@ -4006,7 +4316,6 @@ impl App {
                 self.config.agent.skills_dir = opt;
                 self.reload_skills_list();
             }
-            SettingField::McpPath => self.config.agent.mcp_config = opt,
             SettingField::Workspace => {
                 self.config.agent.workspace_root = opt;
                 // The '@' picker's file cache is rooted at the workspace.
@@ -4022,29 +4331,15 @@ impl App {
 
     /// Rebuild the discovered-skills list from the configured skills dir.
     fn reload_skills_list(&mut self) {
-        let dir = self
-            .config
-            .agent
-            .skills_dir
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".localcode/skills"));
-        self.skills = SkillLoader::new(dir).list().to_vec();
+        let probe = CodingAgent::new(self.config.agent.clone());
+        self.skills = probe.skills.list().to_vec();
         self.refresh_agent_summaries();
     }
 
-    /// Recompute the cached skill/MCP summaries from current config (after an
-    /// edit that changes skills dir, mcp path, or disabled lists).
+    /// Recompute the cached skill summary from current config.
     fn refresh_agent_summaries(&mut self) {
         let probe = CodingAgent::new(self.config.agent.clone());
         self.skills = probe.skills.list().to_vec();
-        self.mcp_servers = probe.mcp.server_summaries();
-        let mcp_count = probe.mcp.configured_count();
-        self.mcp_status_summary = if mcp_count == 0 {
-            "none configured".into()
-        } else {
-            format!("{mcp_count} configured (not connected)")
-        };
         self.skill_count = self
             .skills
             .iter()
@@ -4060,36 +4355,12 @@ impl App {
     /// redesign renders info as a banner, not a popup). Structured JSON lines
     /// are compacted to `HH:MM:SS LEVEL message` so the banner is skimmable.
     fn open_logs(&mut self) {
-        fn compact(line: &str) -> String {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                return line.to_string();
-            };
-            let time = v
-                .get("timestamp")
-                .and_then(|t| t.as_str())
-                .and_then(|ts| ts.split('T').nth(1))
-                .map(|s| s.split('.').next().unwrap_or(s))
-                .unwrap_or("");
-            let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("");
-            match v
-                .get("fields")
-                .and_then(|f| f.get("message"))
-                .and_then(|m| m.as_str())
-            {
-                Some(m) => format!("{time} {level:<5} {m}").trim().to_string(),
-                None => line.to_string(),
-            }
-        }
-
+        self.refresh_status_logs();
         let dir = self.paths.log_dir.display().to_string();
-        let redact = self.config.logging.redact_secrets;
-        let tail = localcode_log::read_recent_logs(&self.paths.log_dir, 8, None, redact)
-            .ok()
-            .map(|s| s.lines().map(compact).collect::<Vec<_>>().join("\n"))
-            .filter(|s| !s.trim().is_empty());
-        let body = match tail {
-            Some(t) => format!("{dir}\n\n{t}"),
-            None => format!("{dir}\n\n(no log entries yet)"),
+        let body = if self.status_logs.is_empty() {
+            format!("{dir}\n\n(no log entries yet)")
+        } else {
+            format!("{dir}\n\n{}", self.status_logs.join("\n"))
         };
         self.modal = Some(ModalState::info("Logs", body));
     }
@@ -4814,6 +5085,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
                     self.open_update_modal();
                 }
             }
+            ClickTarget::StatusToggle => self.toggle_status_pin(),
             ClickTarget::Transcript => {}
             ClickTarget::TranscriptEntry(i) => {
                 if let Some(e) = self.coding_transcript.get_mut(i) {
@@ -5033,6 +5305,58 @@ pub(crate) const BACKEND_ORDER: [BackendKind; 4] = [
     BackendKind::Sglang,
 ];
 
+/// Load the latest session for this workspace when persistence is on, or
+/// create a fresh one (and its store file).
+fn bootstrap_session(
+    agent_cfg: &localcode_core::config::AgentConfig,
+    paths: &localcode_core::paths::AppPaths,
+    workspace: PathBuf,
+) -> (
+    Arc<AsyncMutex<AgentSession>>,
+    Arc<AsyncMutex<Option<SessionStore>>>,
+    Option<String>,
+) {
+    if !agent_cfg.sessions_enabled {
+        let session = AgentSession::new(workspace);
+        return (
+            Arc::new(AsyncMutex::new(session)),
+            Arc::new(AsyncMutex::new(None)),
+            None,
+        );
+    }
+    let root = sessions_root(agent_cfg, paths);
+    if let Some(meta) = list_sessions(&root, &workspace).into_iter().next() {
+        match SessionStore::load(&meta.path) {
+            Ok(loaded) => {
+                let note = if loaded.warnings.is_empty() {
+                    format!("Resumed session “{}”", loaded.session.title)
+                } else {
+                    format!(
+                        "Resumed session “{}” ({} repair note(s))",
+                        loaded.session.title,
+                        loaded.warnings.len()
+                    )
+                };
+                return (
+                    Arc::new(AsyncMutex::new(loaded.session)),
+                    Arc::new(AsyncMutex::new(Some(loaded.store))),
+                    Some(note),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not load latest session; starting fresh");
+            }
+        }
+    }
+    let session = AgentSession::new(workspace);
+    let store = SessionStore::create(&root, &session).ok();
+    (
+        Arc::new(AsyncMutex::new(session)),
+        Arc::new(AsyncMutex::new(store)),
+        None,
+    )
+}
+
 /// Rough token estimate for the status-bar context meter: ~4 chars per token
 /// (latin code-heavy text). Not a tokenizer — just a live fill level.
 fn estimate_session_tokens(session: &AgentSession) -> u32 {
@@ -5045,9 +5369,33 @@ fn estimate_session_tokens(session: &AgentSession) -> u32 {
                     .as_ref()
                     .map(|v| v.to_string().chars().count())
                     .unwrap_or(0)
+                + m.thinking.as_ref().map(|t| t.chars().count()).unwrap_or(0)
         })
         .sum();
     (chars / 4) as u32
+}
+
+/// Compact a structured JSON log line to `HH:MM:SS LEVEL message` for the
+/// status dashboard and `/logs` banner. Non-JSON lines pass through as-is.
+fn compact_log_line(line: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    let time = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|ts| ts.split('T').nth(1))
+        .map(|s| s.split('.').next().unwrap_or(s))
+        .unwrap_or("");
+    let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("");
+    match v
+        .get("fields")
+        .and_then(|f| f.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        Some(m) => format!("{time} {level:<5} {m}").trim().to_string(),
+        None => line.to_string(),
+    }
 }
 
 /// Editable fields of a remote server, in display order.
@@ -5133,6 +5481,7 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
     let mut app = App::new(paths, config);
     app.start_detect();
     app.start_gpu_refresh();
+    app.refresh_status_logs();
     if app.config.updates.check_on_startup {
         app.start_update_check(false);
     }
@@ -5212,7 +5561,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_home(dir.path().to_path_buf());
         paths.ensure_dirs().unwrap();
-        App::new(paths, Config::default())
+        // Don't open the first-run assistant install modal (it captures keys
+        // and confirming it would tokio::spawn without a runtime in unit tests).
+        let mut cfg = Config::default();
+        cfg.assistant.local_preference = LocalAssistantPreference::Declined;
+        // Keep unit tests hermetic: no session files from prior runs, no skills I/O.
+        cfg.agent.sessions_enabled = false;
+        App::new(paths, cfg)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -5424,11 +5779,11 @@ mod tests {
         app.apply_agent_event(AgentEvent::Delta("answer".into()));
         app.apply_agent_event(AgentEvent::MessageComplete);
         app.apply_agent_event(AgentEvent::ToolStarted {
-            name: "fs.read".into(),
+            name: "read".into(),
             args_preview: "path=a.txt".into(),
         });
         app.apply_agent_event(AgentEvent::ToolFinished {
-            name: "fs.read".into(),
+            name: "read".into(),
             ok: true,
             summary: "hello  · 5 chars".into(),
             args: "path: a.txt".into(),
@@ -5450,7 +5805,7 @@ mod tests {
             .iter()
             .find(|e| e.kind == EntryKind::Tool)
             .expect("tool entry");
-        assert!(tool.text.contains("fs.read"));
+        assert!(tool.text.contains("read"));
         assert!(tool.text.contains('▸'));
         assert!(!tool.expanded);
         assert!(tool.detail.as_ref().unwrap().contains("hello"));
@@ -5480,7 +5835,7 @@ mod tests {
             "collapsed thinking summary should render: {screen}"
         );
         assert!(
-            screen.contains("fs.read") && screen.contains("output"),
+            screen.contains("read") && screen.contains("output"),
             "expanded tool detail should render: {screen}"
         );
     }
@@ -5769,19 +6124,19 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Settings);
 
-        // Toggle the shell.exec tool off via its row action.
+        // Toggle the bash tool off via its row action.
         let toggle = app
             .settings_rows()
             .into_iter()
             .find_map(|r| match r.action {
-                Some(SettingAction::ToggleTool(i)) if r.label == "shell.exec" => {
+                Some(SettingAction::ToggleTool(i)) if r.label == "bash" => {
                     Some(SettingAction::ToggleTool(i))
                 }
                 _ => None,
             })
-            .expect("a shell.exec tool row");
+            .expect("a bash tool row");
         app.activate_setting(toggle);
-        assert!(app.config.agent.disabled_tools.iter().any(|t| t == "shell.exec"));
+        assert!(app.config.agent.disabled_tools.iter().any(|t| t == "bash"));
 
         // Edit the system prompt inline: begin, type, commit.
         app.activate_setting(SettingAction::Edit(SettingField::SystemPrompt));
@@ -5829,12 +6184,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_expose_skills_agents_md_mcp_and_prompt() {
+    fn settings_expose_skills_agents_md_and_prompt() {
         let mut app = test_app();
         app.mode = Mode::Settings;
         let rows = app.settings_rows();
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-        for expected in ["system prompt", "use AGENTS.md", "skills dir", "mcp config"] {
+        for expected in ["system prompt", "use AGENTS.md", "skills dir", "shell sandbox"] {
             assert!(labels.contains(&expected), "missing settings row: {expected}");
         }
         // The bundled sample skill shows up as an enable/disable toggle.
@@ -5844,7 +6199,7 @@ mod tests {
         // Every built-in tool is listed as a toggle.
         assert!(rows
             .iter()
-            .any(|r| matches!(r.kind, SettingsRowKind::Toggle(_)) && r.label == "fs.read"));
+            .any(|r| matches!(r.kind, SettingsRowKind::Toggle(_)) && r.label == "read"));
     }
 
     #[test]
@@ -6026,5 +6381,72 @@ mod tests {
         app.hover = Some((region.rect.x, region.rect.y));
         let screen = render_to_string(&mut app, 120, 40);
         assert!(screen.contains("neon"), "hovering a dot reveals its name");
+    }
+
+    #[test]
+    fn status_dashboard_expands_on_hover_and_pins_on_click() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_app();
+        app.status_logs = (1..=8).map(|i| format!("log-line-{i}")).collect();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // Collapsed: 3 content rows → outer height 5 (borders included).
+        assert_eq!(app.status_bar_rect.height, 5, "collapsed dashboard is 3 content lines");
+        assert!(!app.status_expanded());
+        let collapsed_h = app.status_bar_rect.height;
+
+        // Hover over the bar expands it.
+        app.hover = Some((app.status_bar_rect.x + 2, app.status_bar_rect.y + 1));
+        assert!(app.status_expanded());
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            app.status_bar_rect.height, 12,
+            "expanded dashboard is 10 content lines"
+        );
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(screen.contains("log-line-8"), "expanded view shows latest logs");
+        assert!(screen.contains("log-line-1"), "expanded view shows older log lines");
+
+        // Click pins so it stays open after the mouse leaves.
+        let toggle = app
+            .click_regions
+            .iter()
+            .find(|r| r.target == ClickTarget::StatusToggle)
+            .copied()
+            .expect("status bar registers StatusToggle");
+        app.handle_left_click(toggle.rect.x + 1, toggle.rect.y + 1);
+        assert!(app.status_pinned);
+        app.hover = None;
+        assert!(app.status_expanded(), "pinned stays expanded without hover");
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.status_bar_rect.height, 12);
+
+        // Second click collapses.
+        app.handle_left_click(toggle.rect.x + 1, toggle.rect.y + 1);
+        assert!(!app.status_pinned);
+        assert!(!app.status_expanded());
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.status_bar_rect.height, collapsed_h);
+
+        // Metrics lines include tok/s and energy when present.
+        app.tokens_per_sec = Some(48.0);
+        app.gpu.devices = vec![localcode_gpu::GpuDevice {
+            index: 0,
+            name: "Test".into(),
+            total_vram_bytes: 24 * 1024 * 1024 * 1024,
+            free_vram_bytes: 10 * 1024 * 1024 * 1024,
+            driver_version: None,
+            backend_affinity: vec!["cuda".into()],
+            temperature_c: Some(60),
+            utilization_pct: Some(20),
+            power_draw_w: Some(145.0),
+        }];
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(screen.contains("tok/s"), "dashboard shows tokens per second");
+        assert!(screen.contains("48"), "dashboard shows tok/s value");
+        assert!(screen.contains("energy"), "dashboard shows GPU energy");
+        assert!(screen.contains("145W"), "dashboard shows power draw");
     }
 }

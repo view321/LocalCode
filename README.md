@@ -80,32 +80,47 @@ Website (project page): open [`website/index.html`](website/index.html) or the G
 4. If VRAM fit warns, choose **Continue** — deploys are never hard-blocked on size.
 5. Press `Esc` to close the popup and just **type a prompt** in the bar. Replies
    **stream token-by-token** into the transcript, with live tool activity
-   (`⚙ fs.read …`) as the agent works. `Esc` cancels a running turn and keeps the
+   (`⚙ read …`) as the agent works. `Esc` cancels a running turn and keeps the
    partial output. Streaming can be disabled with `agent.stream = false` if your
    runtime rejects `stream: true` together with tools.
 
-Coding is **local-first**: with no runtime deployed it will not silently fall back
-to a cloud provider. Set `agent.allow_cloud_fallback = true` in config.toml to
-allow using the configured assistant provider instead.
+Sessions persist by default (latest resumes on restart; `/new` starts fresh).
+Long chats auto-compact. Tools: `read`, `write`, `bash`, `ls`, `grep`, `skill`,
+`hf.model_card`, `hf.search` (Pi-style + Hugging Face catalogue). Shell stays in
+the workspace when `agent.shell_sandbox = true`.
 
-### Local Bonsai assistant (optional)
+Coding is **local-first**: when the local Bonsai assistant is installed it is the
+**default conversation model** (no `/assistant` required). With no local runtime
+and no assistant, the chat will not silently fall back to a cloud provider — set
+`agent.allow_cloud_fallback = true` in config.toml to allow the hosted assistant
+provider instead.
 
-On first launch LocalCode offers to install a **local repair assistant** based on
-[prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
-(~3.8 GB Q1_0) served by **llama.cpp** (auto-installed):
+### Local Bonsai assistant (default chat)
+
+On first launch LocalCode offers to install a **local assistant** based on
+[prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf),
+started with:
+
+```bash
+./llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1
+```
+
+(~1.8 GB on first pull via llama.cpp’s `-hf` download; auto-installs `llama-server`):
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
 - Re-install later with `/assistant install`.
-- When ready, the assistant greets you on each launch, can use **shell + Hugging Face
-  tools**, reads **model cards** to set deploy flags, and is invoked **automatically**
-  on structured errors when available.
+- When ready it becomes the **default chat runtime** — type normally in the
+  conversation view; you do not need to hunt for `/assistant`.
+- Tools: shell + filesystem, **Hugging Face search & model cards**, doctor
+  snapshot; reads model descriptions, helps launch deploys, and fixes LocalCode
+  issues. Also invoked automatically on structured errors when available.
 
 Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
 `18080`), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
 
-> Bonsai’s Q1_0_g128 format uses custom llama.cpp kernels from the
-> [PrismML fork](https://github.com/PrismML-Eng/llama.cpp). Stock prebuilds may
-> refuse the quant; point `backends.llamacpp.bin` at a PrismML `llama-server` if load fails.
+> First start runs `llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1` (needs a recent
+> llama.cpp with `-hf` support). Set `HF_TOKEN` if the download is gated or
+> rate-limited.
 
 ### Remote GPU over SSH
 

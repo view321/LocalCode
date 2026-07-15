@@ -36,7 +36,6 @@ pub enum ErrorCode {
     // Agent
     AgentToolFailed,
     AgentWorkspaceMissing,
-    AgentMcpFailed,
     AgentSessionLoadFailed,
     AgentSessionSaveFailed,
     // Cloud
@@ -94,7 +93,6 @@ impl ErrorCode {
             Self::DeployUnsupportedFormat => "DEPLOY_UNSUPPORTED_FORMAT",
             Self::AgentToolFailed => "AGENT_TOOL_FAILED",
             Self::AgentWorkspaceMissing => "AGENT_WORKSPACE_MISSING",
-            Self::AgentMcpFailed => "AGENT_MCP_FAILED",
             Self::AgentSessionLoadFailed => "AGENT_SESSION_LOAD_FAILED",
             Self::AgentSessionSaveFailed => "AGENT_SESSION_SAVE_FAILED",
             Self::CloudKeyMissing => "CLOUD_KEY_MISSING",

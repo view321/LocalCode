@@ -1,7 +1,12 @@
 //! Dedicated llama-server process for the local Bonsai assistant.
+//!
+//! Launch shape (user-requested):
+//!   `./llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 …`
 
-use crate::constants::{ASSISTANT_MODEL_ID, BONSAI_TEMPERATURE, BONSAI_TOP_K, BONSAI_TOP_P};
-use crate::install::{model_installed, model_path, resolve_llama_bin};
+use crate::constants::{
+    ASSISTANT_MODEL_ID, BONSAI_HF_REF, BONSAI_TEMPERATURE, BONSAI_TOP_K, BONSAI_TOP_P,
+};
+use crate::install::{mark_ready, model_installed, resolve_llama_bin};
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
@@ -36,21 +41,19 @@ impl LocalAssistantRuntime {
             self.base_url.clone(),
         );
         r.model_id = Some(self.model_id.clone());
+        r.quantization = Some("Q4_1".into());
         r.status = RuntimeStatus::Healthy;
         r
     }
 
-    /// Probe `/v1/models` (or `/health`) — true when the server answers.
+    /// Probe `/health` or `/v1/models` — true when the server answers.
     pub async fn is_healthy(&self) -> bool {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(2))
             .timeout(std::time::Duration::from_secs(4))
             .build()
             .unwrap_or_default();
-        let health = format!(
-            "http://127.0.0.1:{}/health",
-            self.port
-        );
+        let health = format!("http://127.0.0.1:{}/health", self.port);
         if let Ok(resp) = client.get(&health).send().await {
             if resp.status().is_success() {
                 return true;
@@ -76,25 +79,23 @@ impl LocalAssistantRuntime {
 }
 
 /// Start (or reuse a healthy) assistant llama-server on `cfg.assistant.local_port`.
+///
+/// Command:
+/// ```text
+/// llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 --host 127.0.0.1 --port … -ngl …
+/// ```
 pub async fn ensure_running(
     cfg: &Config,
     paths: &AppPaths,
 ) -> Result<LocalAssistantRuntime, LocalCodeError> {
-    if !model_installed(paths) {
-        return Err(LocalCodeError::new(
-            ErrorCode::BackendNotReady,
-            "Local assistant model is not installed",
-        )
-        .with_hint("Accept the Bonsai install offer, or run /assistant install")
-        .with_cause(format!("Missing {}", model_path(paths).display())));
-    }
-
     let bin = resolve_llama_bin(cfg, paths).ok_or_else(|| {
         LocalCodeError::new(
             ErrorCode::BackendBinaryMissing,
             "llama-server not found for the local assistant",
         )
-        .with_hint("Install llama.cpp from the Backends panel or accept the assistant install offer")
+        .with_hint(
+            "Install llama.cpp from the Backends panel or accept the assistant install offer",
+        )
     })?;
 
     let port = cfg.assistant.local_port;
@@ -110,6 +111,7 @@ pub async fn ensure_running(
     };
     if probe.is_healthy().await {
         info!(port, "reusing healthy local assistant server");
+        mark_ready(paths);
         return Ok(probe);
     }
 
@@ -122,20 +124,20 @@ pub async fn ensure_running(
         .retryable(true));
     }
 
-    let model = model_path(paths);
     let ctx = cfg.assistant.local_context.max(2048);
     let ngl = cfg.assistant.local_gpu_layers;
 
     info!(
         bin = %bin.display(),
-        model = %model.display(),
+        hf = BONSAI_HF_REF,
         port,
-        "starting local assistant llama-server"
+        "starting local assistant llama-server (-hf)"
     );
 
     let mut args: Vec<String> = vec![
-        "-m".into(),
-        model.display().to_string(),
+        // User-requested launch: llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1
+        "-hf".into(),
+        BONSAI_HF_REF.into(),
         "--host".into(),
         host.into(),
         "--port".into(),
@@ -152,26 +154,30 @@ pub async fn ensure_running(
         "--top-k".into(),
         BONSAI_TOP_K.to_string(),
     ];
-    // Quiet chat UI; OpenAI API is enough.
+    // Quiet chat UI; OpenAI API + tool calling templates.
     args.push("--jinja".into());
 
-    let mut child = tokio::process::Command::new(&bin)
-        .args(&args)
+    // Pass HF token so gated / rate-limited downloads succeed.
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(&args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
-                .with_cause("Failed to spawn llama-server for the assistant")
-                .with_hint(
-                    "Bonsai Q1_0 needs llama.cpp with Q1_0_g128 kernels \
-                     (PrismML fork: https://github.com/PrismML-Eng/llama.cpp). \
-                     Stock builds may reject the quant.",
-                )
-                .retryable(true)
-        })?;
+        .stderr(std::process::Stdio::piped());
+    if let Some(token) = cfg.hf_token() {
+        cmd.env("HF_TOKEN", &token);
+        cmd.env("HUGGING_FACE_HUB_TOKEN", &token);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
+            .with_cause("Failed to spawn llama-server for the assistant")
+            .with_hint(format!(
+                "Tried: {} -hf {BONSAI_HF_REF} — ensure llama-server supports -hf (recent llama.cpp)",
+                bin.display()
+            ))
+            .retryable(true)
+    })?;
 
     drain_child_io("assistant-llama", &mut child);
 
@@ -182,11 +188,12 @@ pub async fn ensure_running(
         model_id: ASSISTANT_MODEL_ID.into(),
     };
 
-    // Wait for health (model load can take a bit on CPU).
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(180);
+    // Wait for health (HF download + model load can take a while).
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(600);
     loop {
         if runtime.is_healthy().await {
-            info!(port, "local assistant server ready");
+            mark_ready(paths);
+            info!(port, hf = BONSAI_HF_REF, "local assistant server ready");
             return Ok(runtime);
         }
         // Child died?
@@ -199,11 +206,12 @@ pub async fn ensure_running(
                         ErrorCode::BackendStartFailed,
                         format!("Assistant llama-server exited: {status}"),
                     )
-                    .with_cause(
-                        "The GGUF may need PrismML's llama.cpp fork (Q1_0_g128 hybrid-attention kernels)",
-                    )
-                    .with_hint("https://github.com/PrismML-Eng/llama.cpp")
+                    .with_cause(format!(
+                        "Command was: llama-server -hf {BONSAI_HF_REF}. \
+                         Check network, HF_TOKEN, and that the quant exists on the repo."
+                    ))
                     .with_hint("https://huggingface.co/prism-ml/Bonsai-27B-gguf")
+                    .with_hint("Set HF_TOKEN if the repo is gated or rate-limited")
                     .retryable(true));
                 }
             }
@@ -214,10 +222,13 @@ pub async fn ensure_running(
                 ErrorCode::BackendHealthTimeout,
                 "Assistant llama-server did not become healthy in time",
             )
-            .with_hint("Check free RAM/VRAM; Bonsai needs ~5+ GB peak at short context")
+            .with_hint(format!(
+                "First start downloads {BONSAI_HF_REF} via -hf; check free disk space and network"
+            ))
+            .with_hint("Check free RAM/VRAM; Bonsai needs several GB peak at short context")
             .retryable(true));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -248,15 +259,16 @@ fn drain_child_io(tag: &str, child: &mut Child) {
 }
 
 /// Soft check used by the TUI without starting the server.
+/// Ready when llama-server is present and the model has been pulled (or is
+/// already marked ready from a previous successful start).
 pub fn is_installed(cfg: &Config, paths: &AppPaths) -> bool {
-    model_installed(paths) && resolve_llama_bin(cfg, paths).is_some()
+    resolve_llama_bin(cfg, paths).is_some() && model_installed(paths)
 }
 
-/// Drop-in warning when stock llama.cpp may not load Q1_0.
+/// Note about the -hf launch path.
 pub fn quant_compatibility_note() -> &'static str {
-    "Note: Bonsai Q1_0_g128 uses custom llama.cpp kernels from PrismML \
-     (https://github.com/PrismML-Eng/llama.cpp). If load fails, build that fork \
-     and set backends.llamacpp.bin to its llama-server."
+    "The assistant starts with: llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 \
+     (llama.cpp downloads the quant on first launch). Set HF_TOKEN if download fails."
 }
 
 impl Drop for LocalAssistantRuntime {

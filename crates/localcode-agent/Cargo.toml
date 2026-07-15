@@ -3,10 +3,11 @@ name = "localcode-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Coding agent: tools, skills, MCP, subagents"
+description = "Coding agent: tools, skills, sessions"
 
 [dependencies]
 localcode-core = { workspace = true }
+localcode-hf = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }

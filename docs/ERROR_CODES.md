@@ -29,7 +29,6 @@ Note: a failing backend's captured process output (the tail of stdout/stderr) is
 | `DEPLOY_UNSUPPORTED_FORMAT` | Model format the backend can't load (e.g. GGUF on vLLM/SGLang) | Use llama.cpp/Ollama for GGUF, or a safetensors model for vLLM |
 | `AGENT_TOOL_FAILED` | Tool or LLM call failed | Check workspace, runtime, policy |
 | `AGENT_WORKSPACE_MISSING` | Workspace root missing | Set in Settings |
-| `AGENT_MCP_FAILED` | MCP config/connect issue | Fix `mcp.json`; degrade OK |
 | `CLOUD_KEY_MISSING` | Provider API key missing | Setup → cloud keys |
 | `CLOUD_PROVISION_FAILED` | Provider rejected deploy | Causes in error; rotate region/GPU |
 | `CLOUD_QUOTA_EXCEEDED` | Credits/quota | Add provider credits |

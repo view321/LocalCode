@@ -6,11 +6,9 @@ use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::EventBus;
 use localcode_core::paths::AppPaths;
-use localcode_core::runtime::{ActiveRuntime, RuntimeKind};
 use localcode_gpu::discover;
 use localcode_hf::HfClient;
 use localcode_tui::{run_doctor, run_tui};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
@@ -75,11 +73,6 @@ enum Commands {
         #[command(subcommand)]
         cmd: BenchCmd,
     },
-    /// Headless coding agent
-    Agent {
-        #[command(subcommand)]
-        cmd: AgentCmd,
-    },
     /// Check for a new version and install it (git pull + rebuild + swap)
     Update {
         /// Only check and report; do not install
@@ -114,24 +107,6 @@ enum BenchCmd {
         endpoint: Option<String>,
         #[arg(long)]
         model: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum AgentCmd {
-    Run {
-        prompt: String,
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-        #[arg(long)]
-        endpoint: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Approval mode for this run: always, auto, edits or ask. Headless
-        /// runs have no interactive prompt, so gated calls are refused —
-        /// `--approvals always` runs everything unattended.
-        #[arg(long)]
-        approvals: Option<String>,
     },
 }
 
@@ -345,52 +320,6 @@ async fn real_main() -> Result<(), LocalCodeError> {
                     .run(&suite_obj, subject, &endpoint, None, &model)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
-                Ok(())
-            }
-        },
-        Commands::Agent { cmd } => match cmd {
-            AgentCmd::Run {
-                prompt,
-                workspace,
-                endpoint,
-                model,
-                approvals,
-            } => {
-                let workspace = workspace.unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                });
-                // Local-first default: talk to the local Ollama OpenAI
-                // endpoint unless the user passes --endpoint explicitly.
-                let endpoint = endpoint
-                    .unwrap_or_else(|| format!("{}/v1", config.backends.ollama.base_url));
-                let mut runtime = ActiveRuntime::new(
-                    "cli",
-                    RuntimeKind::OpenAiCompatible,
-                    endpoint,
-                );
-                runtime.model_id = model;
-                let mut agent_cfg = config.agent.clone();
-                if let Some(raw) = approvals.as_deref() {
-                    let mode = localcode_core::config::ApprovalMode::parse(raw).ok_or_else(|| {
-                        LocalCodeError::new(
-                            ErrorCode::ConfigParseFailed,
-                            format!("Unknown approval mode: {raw}"),
-                        )
-                        .with_hint("Use one of: always, auto, edits, ask")
-                    })?;
-                    agent_cfg.approval_mode = mode;
-                    // An explicit choice overrides the legacy off-switch too.
-                    agent_cfg.confirm_destructive_tools = true;
-                }
-                let out = localcode_agent::run_headless(
-                    &prompt,
-                    workspace,
-                    &runtime,
-                    agent_cfg,
-                    None,
-                )
-                .await?;
-                println!("{out}");
                 Ok(())
             }
         },

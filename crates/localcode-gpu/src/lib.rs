@@ -19,6 +19,9 @@ pub struct GpuDevice {
     /// GPU SM utilization percent 0–100 when reported (`None` if unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utilization_pct: Option<u32>,
+    /// Instantaneous power draw in watts when reported (`None` if unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_draw_w: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +55,16 @@ impl GpuInventory {
         }
     }
 
+    /// Sum of instantaneous power draw (W) across devices that report it.
+    pub fn total_power_draw_w(&self) -> Option<f32> {
+        let vals: Vec<f32> = self.devices.iter().filter_map(|d| d.power_draw_w).collect();
+        if vals.is_empty() {
+            None
+        } else {
+            Some(vals.iter().sum())
+        }
+    }
+
     pub fn summary(&self) -> String {
         if self.devices.is_empty() {
             return "No GPU detected".into();
@@ -70,6 +83,9 @@ impl GpuInventory {
                 }
                 if let Some(u) = d.utilization_pct {
                     s.push_str(&format!(" · {u}%"));
+                }
+                if let Some(p) = d.power_draw_w {
+                    s.push_str(&format!(" · {p:.0}W"));
                 }
                 s
             })
@@ -130,10 +146,10 @@ fn discover_nvidia_smi() -> Result<GpuInventory, LocalCodeError> {
 /// discovery (running nvidia-smi over SSH) produces identically-parseable CSV.
 ///
 /// Columns: index, name, memory.total (MiB), memory.free (MiB), driver_version,
-/// temperature.gpu (°C), utilization.gpu (%). Older 4–5-column CSVs still parse
-/// (temp/util become `None`).
+/// temperature.gpu (°C), utilization.gpu (%), power.draw (W). Older 4–7-column
+/// CSVs still parse (missing sensors become `None`).
 pub const NVIDIA_SMI_QUERY_ARGS: [&str; 2] = [
-    "--query-gpu=index,name,memory.total,memory.free,driver_version,temperature.gpu,utilization.gpu",
+    "--query-gpu=index,name,memory.total,memory.free,driver_version,temperature.gpu,utilization.gpu,power.draw",
     "--format=csv,noheader,nounits",
 ];
 
@@ -150,6 +166,20 @@ fn parse_smi_opt_u32(s: &str) -> Option<u32> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+/// Parse a floating nvidia-smi CSV field (e.g. power.draw watts).
+fn parse_smi_opt_f32(s: &str) -> Option<f32> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("[N/A]") || t.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    // Accept leading float; strip trailing unit junk if present.
+    let num: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    num.parse().ok()
 }
 
 /// Parse `nvidia-smi --format=csv,noheader,nounits` output (MiB values) into a
@@ -169,9 +199,9 @@ pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventor
         let name = parts[1].to_string();
         let total_mib: u64 = parts[2].parse().unwrap_or(0);
         let free_mib: u64 = parts[3].parse().unwrap_or(0);
-        // Column 4 is driver_version when present; columns 5/6 are temp / util.
-        // Legacy 4-column CSVs (no driver) leave all of these None.
-        let (driver, temperature_c, utilization_pct) = if parts.len() >= 5 {
+        // Column 4 is driver_version when present; 5/6/7 are temp / util / power.
+        // Legacy shorter CSVs leave the missing sensors as None.
+        let (driver, temperature_c, utilization_pct, power_draw_w) = if parts.len() >= 5 {
             let driver = {
                 let d = parts[4];
                 if d.is_empty() || d.eq_ignore_ascii_case("[N/A]") {
@@ -182,9 +212,10 @@ pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventor
             };
             let temp = parts.get(5).and_then(|s| parse_smi_opt_u32(s));
             let util = parts.get(6).and_then(|s| parse_smi_opt_u32(s));
-            (driver, temp, util)
+            let power = parts.get(7).and_then(|s| parse_smi_opt_f32(s));
+            (driver, temp, util, power)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         devices.push(GpuDevice {
             index,
@@ -195,6 +226,7 @@ pub fn parse_nvidia_smi_csv(stdout: &str, detection_method: &str) -> GpuInventor
             backend_affinity: vec!["cuda".into()],
             temperature_c,
             utilization_pct,
+            power_draw_w,
         });
     }
 
@@ -366,6 +398,7 @@ mod tests {
                 backend_affinity: vec!["cuda".into()],
                 temperature_c: Some(62),
                 utilization_pct: Some(40),
+                power_draw_w: Some(120.0),
             }],
             detection_method: "test".into(),
             warnings: vec![],
@@ -407,7 +440,7 @@ mod tests {
 
     #[test]
     fn parses_nvidia_smi_csv() {
-        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104, 58, 12\n1, NVIDIA A100, 40960, 40000, 535.104, 42, 0\n";
+        let csv = "0, NVIDIA RTX 4090, 24576, 20480, 535.104, 58, 12, 145.50\n1, NVIDIA A100, 40960, 40000, 535.104, 42, 0, 80.0\n";
         let inv = parse_nvidia_smi_csv(csv, "nvidia-smi-remote");
         assert_eq!(inv.detection_method, "nvidia-smi-remote");
         assert_eq!(inv.devices.len(), 2);
@@ -417,8 +450,10 @@ mod tests {
         assert_eq!(inv.devices[0].driver_version.as_deref(), Some("535.104"));
         assert_eq!(inv.devices[0].temperature_c, Some(58));
         assert_eq!(inv.devices[0].utilization_pct, Some(12));
+        assert_eq!(inv.devices[0].power_draw_w, Some(145.5));
         assert_eq!(inv.max_temperature_c(), Some(58));
         assert_eq!(inv.avg_utilization_pct(), Some(6));
+        assert_eq!(inv.total_power_draw_w(), Some(225.5));
     }
 
     #[test]
@@ -428,6 +463,7 @@ mod tests {
         assert_eq!(inv.devices.len(), 1);
         assert_eq!(inv.devices[0].temperature_c, None);
         assert_eq!(inv.devices[0].utilization_pct, None);
+        assert_eq!(inv.devices[0].power_draw_w, None);
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! In-app repair assistant: local Bonsai 27B (llama.cpp) + hosted fallback.
+//! In-app repair assistant: local Bonsai 27B (llama.cpp -hf) + hosted fallback.
 //!
 //! ## Local assistant
-//! - Model: [`constants::BONSAI_REPO`] / [`constants::BONSAI_FILE`] (~3.8 GB Q1_0)
+//! - Model: [`constants::BONSAI_HF_REF`] via `llama-server -hf …`
 //! - Backend: managed `llama-server` (auto-installed)
 //! - Tools: shell, filesystem, git, Hugging Face model cards/search, doctor snapshot
 //! - Onboarding: user is prompted once; decline is remembered
+//! - Default conversation: TUI uses this runtime when no other model is deployed
 //!
 //! ## Hosted fallback
 //! OpenRouter / OpenAI-compatible when local is unavailable and a key is set.
@@ -21,12 +22,12 @@ pub use agent::{
 };
 pub use constants::{
     ASSISTANT_DISPLAY_NAME, ASSISTANT_MODEL_ID, ASSISTANT_SYSTEM_PROMPT, BONSAI_BYTES, BONSAI_FILE,
-    BONSAI_REPO,
+    BONSAI_HF_REF, BONSAI_QUANT, BONSAI_REPO,
 };
 pub use deploy_hints::{extract_deploy_hints, DeployHints};
 pub use install::{
-    install_local_assistant, install_need, install_offer_body, model_installed, model_path,
-    resolve_llama_bin, InstallNeed,
+    install_local_assistant, install_need, install_offer_body, mark_ready, model_installed,
+    model_path, resolve_llama_bin, InstallNeed,
 };
 pub use runtime::{
     ensure_running, is_installed, quant_compatibility_note, LocalAssistantRuntime,
@@ -69,7 +70,12 @@ impl Assistant {
     }
 
     /// True when *some* assistant path can answer (local installed or hosted).
-    pub fn is_configured(&self, api_key: Option<&str>, paths: Option<&AppPaths>, full: Option<&Config>) -> bool {
+    pub fn is_configured(
+        &self,
+        api_key: Option<&str>,
+        paths: Option<&AppPaths>,
+        full: Option<&Config>,
+    ) -> bool {
         if let (Some(paths), Some(full)) = (paths, full) {
             if self.cfg.prefer_local && is_installed(full, paths) {
                 return true;
@@ -288,14 +294,15 @@ pub fn should_offer_install(cfg: &Config) -> bool {
 pub fn startup_greeting(ready: bool) -> String {
     if ready {
         format!(
-            "Local assistant ({ASSISTANT_DISPLAY_NAME}) is ready. I can fix backend errors, \
-             read model cards for deploy flags, search Hugging Face, and run shell commands. \
-             Type a question or /assistant — I'll also step in automatically when something fails."
+            "Local assistant ({ASSISTANT_DISPLAY_NAME}) is ready and is the default conversation \
+             model. I can search Hugging Face, read model cards, help deploy models, fix LocalCode \
+             issues, and code in your workspace — just type a message (no /assistant needed)."
         )
     } else {
         format!(
-            "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant (~3.8 GB) for offline error \
-             repair and model-card-aware deploys. You'll be prompted once, or run /assistant install."
+            "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant \
+             (`llama-server -hf {BONSAI_HF_REF}`, ~1.8 GB) for offline repair, HF catalogue \
+             access, and a default local chat. You'll be prompted once, or run /assistant install."
         )
     }
 }
