@@ -231,7 +231,7 @@ impl Default for SglangConfig {
 }
 
 /// Whether the user has accepted, declined, or not yet been asked about the
-/// bundled local Bonsai assistant (`llama-server -m Bonsai-27B-dspark-Q4_1.gguf -ngl 99`).
+/// bundled local Bonsai assistant (`llama-server -m Bonsai-27B-Q1_0.gguf -ngl 99`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalAssistantPreference {
@@ -245,7 +245,7 @@ pub enum LocalAssistantPreference {
 }
 
 /// In-app / default-conversation assistant. Prefer the local Bonsai model
-/// (`llama-server -m Bonsai-27B-dspark-Q4_1.gguf -ngl 99`) when installed; fall back
+/// (`llama-server -m Bonsai-27B-Q1_0.gguf -ngl 99`) when installed; fall back
 /// to a hosted OpenAI-compatible provider when configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantConfig {

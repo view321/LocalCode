@@ -939,7 +939,7 @@ impl App {
         });
     }
 
-    /// Kick off `llama-server -m … Q4_1` in the background when the assistant is installed.
+    /// Kick off `llama-server -m … Q1_0` in the background when the assistant is installed.
     fn warm_start_local_assistant(&mut self) {
         if self.local_assistant.is_some() {
             return;

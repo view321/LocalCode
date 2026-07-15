@@ -1,13 +1,15 @@
-//! Install the local Bonsai assistant: PrismML llama.cpp + Q4_1 GGUF download.
+//! Install the local Bonsai assistant: PrismML llama.cpp + language GGUF.
 //!
-//! The model is served with (model-card server shape, Q4_1 quant):
+//! Launch (model card):
 //! ```text
-//! llama-server -m Bonsai-27B-dspark-Q4_1.gguf --host 127.0.0.1 --port … -ngl 99
+//! llama-server -m Bonsai-27B-Q1_0.gguf [--md Bonsai-27B-dspark-Q4_1.gguf] \
+//!     --host 127.0.0.1 --port … -ngl 99
 //! ```
-//! Runtime must be the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp).
+//! Q4_1 is the optional DSpark **drafter** only — never the sole `-m` weights.
 
 use crate::constants::{
-    ASSISTANT_DISPLAY_NAME, BONSAI_BYTES, BONSAI_FILE, BONSAI_HF_REF, BONSAI_REPO,
+    ASSISTANT_DISPLAY_NAME, BONSAI_BYTES, BONSAI_DRAFT_BYTES, BONSAI_DRAFT_FILE, BONSAI_FILE,
+    BONSAI_HF_REF, BONSAI_REPO,
 };
 use localcode_backends::{resolve_install_plan, InstallPlan, Repoint};
 use localcode_core::config::Config;
@@ -33,27 +35,29 @@ pub fn mark_ready(paths: &AppPaths) {
     );
 }
 
-/// True when the Q4_1 GGUF is present and looks complete.
+/// True when the **language model** Q1_0 GGUF is present and looks complete.
 pub fn model_installed(paths: &AppPaths) -> bool {
-    gguf_looks_complete(&model_path(paths))
+    gguf_looks_complete(&model_path(paths), BONSAI_BYTES)
 }
 
-fn gguf_looks_complete(path: &Path) -> bool {
+fn gguf_looks_complete(path: &Path, expected: u64) -> bool {
     match std::fs::metadata(path) {
-        // Require at least 90% of expected size so a partial .part rename
-        // does not count as installed.
-        Ok(m) => m.is_file() && m.len() >= BONSAI_BYTES * 9 / 10,
+        Ok(m) => m.is_file() && m.len() >= expected * 9 / 10,
         Err(_) => false,
     }
 }
 
-/// On-disk path for the Q4_1 GGUF under the assistant data dir.
+/// On-disk path for the language-model Q1_0 GGUF.
 pub fn model_path(paths: &AppPaths) -> PathBuf {
     paths.assistant_dir().join(BONSAI_FILE)
 }
 
-/// Resolve `llama-server` for Bonsai: prefer a managed **PrismML** build
-/// (custom kernels), then config path / PATH / any managed install.
+/// On-disk path for the optional DSpark Q4_1 drafter.
+pub fn draft_path(paths: &AppPaths) -> PathBuf {
+    paths.assistant_dir().join(BONSAI_DRAFT_FILE)
+}
+
+/// Resolve `llama-server` for Bonsai: prefer a managed **PrismML** build.
 pub fn resolve_llama_bin(cfg: &Config, paths: &AppPaths) -> Option<PathBuf> {
     if let Some(p) = localcode_backends::resolve_prism_llamacpp_bin(paths) {
         return Some(p);
@@ -64,18 +68,13 @@ pub fn resolve_llama_bin(cfg: &Config, paths: &AppPaths) -> Option<PathBuf> {
 /// What still needs to happen before the local assistant can start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallNeed {
-    /// PrismML llama-server + Q4_1 GGUF are present.
     Ready,
-    /// Need llama.cpp only.
     LlamaCppOnly,
-    /// Need Q4_1 GGUF download (llama already available).
     ModelOnly,
-    /// Need both.
     Both,
 }
 
 pub fn install_need(_cfg: &Config, paths: &AppPaths) -> InstallNeed {
-    // Bonsai requires the PrismML fork — a stock llama-server on PATH is not enough.
     let llama = localcode_backends::resolve_prism_llamacpp_bin(paths).is_some();
     let model = model_installed(paths);
     match (llama, model) {
@@ -97,27 +96,26 @@ pub fn install_offer_body(need: &InstallNeed) -> String {
             "Build/install PrismML llama.cpp (auto) so LocalCode can run the local \
              {ASSISTANT_DISPLAY_NAME} assistant. Stock llama.cpp cannot load this model — \
              the Bonsai card requires https://github.com/PrismML-Eng/llama.cpp. \
-             The Q4_1 GGUF is already on disk."
+             The Q1_0 language GGUF is already on disk."
         ),
         InstallNeed::ModelOnly => format!(
-            "Download {ASSISTANT_DISPLAY_NAME} Q4_1 (`{BONSAI_FILE}`, ~{size_gb:.1} GB), then start:\n\
-             `llama-server -m {BONSAI_FILE} -ngl 99`. PrismML llama.cpp is already available."
+            "Download {ASSISTANT_DISPLAY_NAME} language model `{BONSAI_FILE}` (~{size_gb:.1} GB), then:\n\
+             `llama-server -m {BONSAI_FILE} -ngl 99`\n\
+             (Optional: also downloads DSpark drafter `{BONSAI_DRAFT_FILE}` for `-md`.)\n\
+             Note: the Q4_1 file alone is a *drafter*, not a full model."
         ),
         InstallNeed::Both => format!(
             "Install the local {ASSISTANT_DISPLAY_NAME} assistant?\n\n\
              • Auto-build PrismML llama.cpp (git clone + cmake, as on the model card)\n\
-               — or download a Prism prebuilt if git/cmake are missing\n\
-             • Download `{BONSAI_FILE}` (~{size_gb:.1} GB)\n\
+             • Download language model `{BONSAI_FILE}` (~{size_gb:.1} GB)\n\
+             • Optional DSpark drafter `{BONSAI_DRAFT_FILE}` (~1.8 GB) for `-md`\n\
              • Launch: `llama-server -m {BONSAI_FILE} --host 127.0.0.1 -ngl 99`\n\n\
-             This becomes your default conversation model. It can search Hugging Face, \
-             read model cards, help deploy models, and fix LocalCode issues. \
-             You can decline and use a hosted provider later."
+             This becomes your default conversation model."
         ),
     }
 }
 
-/// Full install: PrismML llama.cpp (if needed) + Q4_1 GGUF download + smoke start.
-/// Returns optional [`Repoint`] when a managed llama-server was installed.
+/// Full install: PrismML llama.cpp + Q1_0 GGUF (+ optional Q4_1 draft) + smoke start.
 pub async fn install_local_assistant(
     cfg: &Config,
     paths: &AppPaths,
@@ -127,9 +125,6 @@ pub async fn install_local_assistant(
     let need = install_need(cfg, paths);
     let mut repoint = None;
 
-    // Bonsai always needs the PrismML fork — even if a stock llama-server is
-    // already on PATH. ensure_llamacpp_installed builds/fetches Prism when the
-    // managed tree has no .prism-ml marker.
     if matches!(need, InstallNeed::LlamaCppOnly | InstallNeed::Both)
         || localcode_backends::resolve_prism_llamacpp_bin(paths).is_none()
     {
@@ -186,22 +181,58 @@ pub async fn install_local_assistant(
         ));
     }
 
+    // Required language model.
     if !model_installed(paths) {
+        // Detect mistaken Q4_1-only install from earlier builds.
+        let draft_only = gguf_looks_complete(&draft_path(paths), BONSAI_DRAFT_BYTES)
+            && !model_installed(paths);
+        if draft_only {
+            let _ = progress.send(format!(
+                "Found {BONSAI_DRAFT_FILE} (DSpark drafter only). \
+                 Downloading language model {BONSAI_FILE} — Q4_1 alone cannot run."
+            ));
+        }
         let _ = progress.send(format!(
             "Downloading {BONSAI_FILE} (~{:.1} GB) from Hugging Face…",
             BONSAI_BYTES as f64 / 1_073_741_824.0
         ));
-        let _ = progress.send(format!("Repo: https://huggingface.co/{BONSAI_REPO}"));
-        download_bonsai_gguf(paths, cfg.hf_token().as_deref(), progress.clone()).await?;
+        download_gguf(
+            paths,
+            BONSAI_FILE,
+            BONSAI_BYTES,
+            cfg.hf_token().as_deref(),
+            progress.clone(),
+        )
+        .await?;
     } else {
         let _ = progress.send(format!(
-            "{ASSISTANT_DISPLAY_NAME} GGUF already present ({})",
+            "Language model already present ({})",
             model_path(paths).display()
         ));
     }
 
-    // Smoke-start with model-card command shape, then stop so the TUI owns the
-    // long-lived process.
+    // Optional drafter (best-effort; failure is non-fatal).
+    if !gguf_looks_complete(&draft_path(paths), BONSAI_DRAFT_BYTES) {
+        let _ = progress.send(format!(
+            "Downloading optional DSpark drafter {BONSAI_DRAFT_FILE} (~{:.1} GB)…",
+            BONSAI_DRAFT_BYTES as f64 / 1_073_741_824.0
+        ));
+        if let Err(e) = download_gguf(
+            paths,
+            BONSAI_DRAFT_FILE,
+            BONSAI_DRAFT_BYTES,
+            cfg.hf_token().as_deref(),
+            progress.clone(),
+        )
+        .await
+        {
+            let _ = progress.send(format!(
+                "Draft download skipped ({}); continuing without -md",
+                e.message
+            ));
+        }
+    }
+
     let _ = progress.send(format!(
         "Smoke-start: llama-server -m {BONSAI_FILE} -ngl {} …",
         cfg.assistant.local_gpu_layers
@@ -213,6 +244,10 @@ pub async fn install_local_assistant(
             cfg.assistant.local_port,
             cfg.assistant.local_gpu_layers
         ))
+        .with_hint(format!(
+            "If stderr is empty, check {}",
+            paths.assistant_dir().join("last-llama-server.log").display()
+        ))
     })?;
     rt.stop().await;
     mark_ready(paths);
@@ -223,50 +258,49 @@ pub async fn install_local_assistant(
     if !model_installed(paths) {
         return Err(LocalCodeError::new(
             ErrorCode::DeployDownloadFailed,
-            "Bonsai Q4_1 GGUF missing after install",
+            "Bonsai Q1_0 language GGUF missing after install",
         )
         .with_hint(format!("Expected file: {}", model_path(paths).display()))
         .retryable(true));
     }
 
-    info!(file = BONSAI_FILE, "local assistant model installed (Q4_1 -m)");
+    info!(file = BONSAI_FILE, "local assistant model installed (Q1_0 -m)");
     Ok(repoint)
 }
 
-/// Download `Bonsai-27B-dspark-Q4_1.gguf` into the assistant data dir.
-async fn download_bonsai_gguf(
+/// Download a named GGUF from the Bonsai repo into the assistant data dir.
+async fn download_gguf(
     paths: &AppPaths,
+    filename: &str,
+    expected_bytes: u64,
     hf_token: Option<&str>,
     progress: UnboundedSender<String>,
 ) -> Result<PathBuf, LocalCodeError> {
     use futures::StreamExt;
 
-    let dest = model_path(paths);
-    if gguf_looks_complete(&dest) {
+    let dest = paths.assistant_dir().join(filename);
+    if gguf_looks_complete(&dest, expected_bytes) {
         return Ok(dest);
     }
-    // Remove a truncated previous attempt.
     if dest.exists() {
         let _ = std::fs::remove_file(&dest);
     }
     let dir = paths.assistant_dir();
     std::fs::create_dir_all(&dir).map_err(LocalCodeError::from)?;
-    let part = dir.join(format!("{BONSAI_FILE}.part"));
+    let part = dir.join(format!("{filename}.part"));
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        // Large GGUF (~1.8 GB): allow a multi-hour stream timeout.
-        .timeout(std::time::Duration::from_secs(6 * 3600))
+        .timeout(std::time::Duration::from_secs(12 * 3600))
         .user_agent(format!("LocalCode/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| {
             LocalCodeError::new(ErrorCode::Internal, e.to_string()).with_source("assistant", "http")
         })?;
 
-    // Primary + canonical HF (mirrors can be added later via env if needed).
     let urls = [
-        format!("https://huggingface.co/{BONSAI_REPO}/resolve/main/{BONSAI_FILE}"),
-        format!("https://hf-mirror.com/{BONSAI_REPO}/resolve/main/{BONSAI_FILE}"),
+        format!("https://huggingface.co/{BONSAI_REPO}/resolve/main/{filename}"),
+        format!("https://hf-mirror.com/{BONSAI_REPO}/resolve/main/{filename}"),
     ];
 
     let mut last_err: Option<LocalCodeError> = None;
@@ -294,7 +328,7 @@ async fn download_bonsai_gguf(
             last_err = Some(
                 LocalCodeError::new(
                     ErrorCode::DeployDownloadFailed,
-                    format!("Download failed ({}): {BONSAI_FILE}", resp.status()),
+                    format!("Download failed ({}): {filename}", resp.status()),
                 )
                 .with_hint("Gated model? Set HF_TOKEN")
                 .retryable(true),
@@ -328,15 +362,15 @@ async fn download_bonsai_gguf(
             })?;
             if last_log.elapsed() > std::time::Duration::from_secs(2) {
                 last_log = std::time::Instant::now();
-                let pct = if BONSAI_BYTES > 0 {
-                    (written * 100 / BONSAI_BYTES).min(99)
+                let pct = if expected_bytes > 0 {
+                    (written * 100 / expected_bytes).min(99)
                 } else {
                     0
                 };
                 let _ = progress.send(format!(
-                    "Downloading {BONSAI_FILE}: {pct}% ({:.2} / {:.1} GiB)",
+                    "Downloading {filename}: {pct}% ({:.2} / {:.1} GiB)",
                     written as f64 / 1_073_741_824.0,
-                    BONSAI_BYTES as f64 / 1_073_741_824.0
+                    expected_bytes as f64 / 1_073_741_824.0
                 ));
             }
         }
@@ -351,31 +385,28 @@ async fn download_bonsai_gguf(
             LocalCodeError::new(ErrorCode::IoError, e.to_string())
                 .with_hint("Failed to finalize GGUF download")
         })?;
-        if !gguf_looks_complete(&dest) {
+        if !gguf_looks_complete(&dest, expected_bytes) {
             let got = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
             let _ = std::fs::remove_file(&dest);
             return Err(LocalCodeError::new(
                 ErrorCode::DeployDownloadFailed,
                 format!(
-                    "Downloaded {BONSAI_FILE} looks incomplete ({got} bytes, expected ~{BONSAI_BYTES})"
+                    "Downloaded {filename} looks incomplete ({got} bytes, expected ~{expected_bytes})"
                 ),
             )
             .retryable(true));
         }
-        let _ = progress.send(format!(
-            "Downloaded {BONSAI_FILE} → {}",
-            dest.display()
-        ));
+        let _ = progress.send(format!("Downloaded {filename} → {}", dest.display()));
         return Ok(dest);
     }
 
     Err(last_err.unwrap_or_else(|| {
         LocalCodeError::new(
             ErrorCode::DeployDownloadFailed,
-            format!("Could not download {BONSAI_FILE}"),
+            format!("Could not download {filename}"),
         )
         .with_hint(format!(
-            "Manual: hf download {BONSAI_REPO} {BONSAI_FILE} --local-dir {}",
+            "Manual: hf download {BONSAI_REPO} {filename} --local-dir {}",
             paths.assistant_dir().display()
         ))
         .retryable(true)
@@ -399,33 +430,37 @@ mod tests {
     }
 
     #[test]
-    fn offer_body_mentions_q4_1_and_dash_m() {
+    fn offer_body_mentions_q1_0_and_dash_m() {
         let body = install_offer_body(&InstallNeed::Both);
         assert!(body.contains("Bonsai"));
-        assert!(body.contains("Q4_1") || body.contains(BONSAI_FILE));
+        assert!(body.contains("Q1_0") || body.contains(BONSAI_FILE));
         assert!(body.contains("-m"));
         assert!(body.contains("GB"));
     }
 
     #[test]
-    fn model_installed_requires_full_size_gguf() {
+    fn model_installed_requires_q1_0_not_draft_only() {
         let dir = tempdir().unwrap();
         let paths = AppPaths::from_home(dir.path().to_path_buf());
         paths.ensure_dirs().unwrap();
+        // Q4_1 draft alone must NOT count as installed language model.
+        std::fs::write(draft_path(&paths), vec![0u8; 2_000_000]).unwrap();
         assert!(!model_installed(&paths));
-        // Tiny file must not count.
-        std::fs::write(model_path(&paths), b"not-a-real-gguf").unwrap();
-        assert!(!model_installed(&paths));
-        // Marker alone is not enough without a real GGUF.
-        mark_ready(&paths);
-        assert!(!model_installed(&paths));
+        // Full-size language model.
+        let mut big = vec![0u8; (BONSAI_BYTES * 9 / 10) as usize];
+        big[0] = 1;
+        std::fs::write(model_path(&paths), &big).unwrap();
+        assert!(model_installed(&paths));
     }
 
     #[test]
-    fn model_path_is_q4_1_file() {
+    fn model_path_is_q1_0_file() {
         let dir = tempdir().unwrap();
         let paths = AppPaths::from_home(dir.path().to_path_buf());
         let p = model_path(&paths);
-        assert!(p.ends_with(BONSAI_FILE) || p.to_string_lossy().ends_with(BONSAI_FILE));
+        assert!(
+            p.ends_with(BONSAI_FILE) || p.to_string_lossy().ends_with(BONSAI_FILE),
+            "{p:?}"
+        );
     }
 }

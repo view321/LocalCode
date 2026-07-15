@@ -107,13 +107,17 @@ provider instead.
 
 On first launch LocalCode offers to install a **local assistant** based on
 [prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
-**Q4_1** (`Bonsai-27B-dspark-Q4_1.gguf`, ~1.8 GB), started like the model card:
+**Q1_0** language model (`Bonsai-27B-Q1_0.gguf`, ~3.8 GB), started like the model card:
 
 ```bash
 ./build/bin/llama-server \
-    -m Bonsai-27B-dspark-Q4_1.gguf \
+    -m Bonsai-27B-Q1_0.gguf \
     --host 127.0.0.1 --port 18080 -ngl 99
 ```
+
+> The repo’s **Q4_1** file (`Bonsai-27B-dspark-Q4_1.gguf`) is a **DSpark drafter**
+> for speculative decoding (`-md`), not a standalone model. Loading it as `-m`
+> alone makes `llama-server` exit with code 1.
 
 Bonsai needs the **[PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)**
 (custom kernels) — stock ggml-org builds will not load it. LocalCode installs
@@ -125,7 +129,8 @@ that runtime automatically:
    `cmake --build build -j`.
 2. **Fallback:** download a matching prebuilt from
    [PrismML-Eng/llama.cpp releases](https://github.com/PrismML-Eng/llama.cpp/releases).
-3. **Weights:** download `Bonsai-27B-dspark-Q4_1.gguf` into the assistant data dir.
+3. **Weights:** download `Bonsai-27B-Q1_0.gguf` (+ optional DSpark Q4_1) into the
+   assistant data dir.
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
 - Accept later with **`/assistant`** (or `/assistant accept`), **`/assistant install`**,

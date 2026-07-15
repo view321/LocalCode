@@ -1,7 +1,8 @@
-//! In-app repair assistant: local Bonsai 27B (llama.cpp `-m` Q4_1) + hosted fallback.
+//! In-app repair assistant: local Bonsai 27B (llama.cpp `-m` Q1_0) + hosted fallback.
 //!
 //! ## Local assistant
-//! - Model: [`constants::BONSAI_FILE`] via `llama-server -m … -ngl 99`
+//! - Model: [`constants::BONSAI_FILE`] (`Q1_0`) via `llama-server -m … -ngl 99`
+//! - Optional draft: [`constants::BONSAI_DRAFT_FILE`] (`Q4_1`) via `-md`
 //! - Backend: managed PrismML `llama-server` (auto-built)
 //! - Tools: shell, filesystem, git, Hugging Face model cards/search, doctor snapshot
 //! - Onboarding: user is prompted once; decline is remembered
@@ -21,13 +22,14 @@ pub use agent::{
     AssistantReply, AssistantRequest, ProposedFix,
 };
 pub use constants::{
-    ASSISTANT_DISPLAY_NAME, ASSISTANT_MODEL_ID, ASSISTANT_SYSTEM_PROMPT, BONSAI_BYTES, BONSAI_FILE,
-    BONSAI_HF_REF, BONSAI_QUANT, BONSAI_REPO,
+    ASSISTANT_DISPLAY_NAME, ASSISTANT_MODEL_ID, ASSISTANT_SYSTEM_PROMPT, BONSAI_BYTES,
+    BONSAI_DRAFT_BYTES, BONSAI_DRAFT_FILE, BONSAI_DRAFT_QUANT, BONSAI_FILE, BONSAI_HF_REF,
+    BONSAI_QUANT, BONSAI_REPO,
 };
 pub use deploy_hints::{extract_deploy_hints, DeployHints};
 pub use install::{
-    install_local_assistant, install_need, install_offer_body, mark_ready, model_installed,
-    model_path, resolve_llama_bin, InstallNeed,
+    draft_path, install_local_assistant, install_need, install_offer_body, mark_ready,
+    model_installed, model_path, resolve_llama_bin, InstallNeed,
 };
 pub use runtime::{
     ensure_running, is_installed, quant_compatibility_note, LocalAssistantRuntime,
@@ -301,7 +303,7 @@ pub fn startup_greeting(ready: bool) -> String {
     } else {
         format!(
             "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant \
-             (`llama-server -m {BONSAI_FILE} -ngl 99`, ~1.8 GB Q4_1) for offline repair, HF catalogue \
+             (`llama-server -m {BONSAI_FILE} -ngl 99`, ~3.8 GB Q1_0) for offline repair, HF catalogue \
              access, and a default local chat. Accept with /assistant or Settings → Accept local assistant."
         )
     }

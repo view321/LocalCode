@@ -1,16 +1,29 @@
-//! Bundled local assistant identity (Bonsai 27B Q4_1 via llama-server -m).
+//! Bundled local assistant identity (Bonsai 27B via llama-server -m).
+//!
+//! Model card (https://huggingface.co/prism-ml/Bonsai-27B-gguf):
+//! - **Language model** = `Bonsai-27B-Q1_0.gguf` (~3.9 GB) — required `-m`
+//! - **DSpark drafter** = `Bonsai-27B-dspark-Q4_1.gguf` (~1.8 GB) — optional `-md`
+//!
+//! Loading only the Q4_1 pack makes llama-server exit immediately (it is not a
+//! standalone model).
 
 /// Hugging Face repo for the GGUF weights.
 pub const BONSAI_REPO: &str = "prism-ml/Bonsai-27B-gguf";
-/// Quant tag for the language pack we ship (model card: Q4_1 DSpark pack).
-pub const BONSAI_QUANT: &str = "Q4_1";
-/// Canonical GGUF filename on the repo (~1.79 GB).
-pub const BONSAI_FILE: &str = "Bonsai-27B-dspark-Q4_1.gguf";
-/// Approximate on-disk size of the Q4_1 pack (bytes). Used for progress UI and
-/// partial-download detection.
-pub const BONSAI_BYTES: u64 = 1_787_468_768;
-/// Hugging Face resolve path (repo + file) for docs / progress strings.
-pub const BONSAI_HF_REF: &str = "prism-ml/Bonsai-27B-gguf (Bonsai-27B-dspark-Q4_1.gguf)";
+
+/// Quant of the **language model** (what `-m` loads).
+pub const BONSAI_QUANT: &str = "Q1_0";
+/// Canonical language-model GGUF (~3.80 GB).
+pub const BONSAI_FILE: &str = "Bonsai-27B-Q1_0.gguf";
+/// Approximate on-disk size of the Q1_0 language pack (bytes).
+pub const BONSAI_BYTES: u64 = 3_803_452_480;
+
+/// Optional DSpark speculative-decoding drafter (Q4_1), passed as `-md` when present.
+pub const BONSAI_DRAFT_QUANT: &str = "Q4_1";
+pub const BONSAI_DRAFT_FILE: &str = "Bonsai-27B-dspark-Q4_1.gguf";
+pub const BONSAI_DRAFT_BYTES: u64 = 1_787_468_768;
+
+/// Hugging Face resolve path (repo + main file) for docs / progress strings.
+pub const BONSAI_HF_REF: &str = "prism-ml/Bonsai-27B-gguf (Bonsai-27B-Q1_0.gguf)";
 /// Friendly name shown in the UI.
 pub const ASSISTANT_DISPLAY_NAME: &str = "Bonsai 27B";
 /// Model id string advertised to the OpenAI-compatible client.
@@ -22,7 +35,7 @@ pub const BONSAI_TOP_P: f32 = 0.95;
 pub const BONSAI_TOP_K: i32 = 20;
 
 /// Default system prompt for the in-app repair / default-conversation assistant.
-pub const ASSISTANT_SYSTEM_PROMPT: &str = r#"You are the LocalCode default assistant — a local agent that helps users use and fix LocalCode itself (config, backends, deploys, GPU, cloud keys, coding in the workspace) and discover/run Hugging Face models. You run on-device via llama.cpp (`llama-server -m Bonsai-27B-dspark-Q4_1.gguf -ngl 99`).
+pub const ASSISTANT_SYSTEM_PROMPT: &str = r#"You are the LocalCode default assistant — a local agent that helps users use and fix LocalCode itself (config, backends, deploys, GPU, cloud keys, coding in the workspace) and discover/run Hugging Face models. You run on-device via llama.cpp (`llama-server -m Bonsai-27B-Q1_0.gguf -ngl 99`).
 
 You have tools:
 - bash — run shell commands in the workspace (sandboxed to the workspace when enabled)
