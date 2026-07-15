@@ -276,6 +276,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &mut App) {
         Mode::Models => draw_models(f, area, app),
         Mode::Runtimes => draw_runtimes(f, area, app),
         Mode::Dash => draw_dash(f, area, app),
+        Mode::Sessions => draw_sessions(f, area, app),
         Mode::Remote => draw_remote(f, area, app),
         Mode::Backends => draw_backends(f, area, app),
         Mode::Bench => draw_bench(f, area, app),
@@ -1694,6 +1695,156 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
     bspans.extend(button(&th, "use", card.is_active));
     click(app, Rect { x: bx, y: row5.y, width: use_w, height: 1 }, ClickTarget::DashUse(idx));
     f.render_widget(Paragraph::new(Line::from(bspans)), row5);
+}
+
+// ---------------------------------------------------------------------------
+// Sessions — past chats for this workspace (/sessions)
+//
+// One row per session file, newest first:
+//   2h ago  fix the deploy retry loop                        14 msgs  · current
+// ↑↓/wheel move the highlight, Enter or a click resumes that chat, and the
+// header carries a [ + new chat ] button (same as /new).
+// ---------------------------------------------------------------------------
+
+fn draw_sessions(f: &mut Frame, area: Rect, app: &mut App) {
+    let th = app.theme;
+    let inner = pad(area);
+    if inner.height < 3 || inner.width < 16 {
+        return;
+    }
+
+    // --- Header row: title · [ + new chat ] ---
+    let title = format!("past chats ({})", app.sessions.len());
+    let mut hspans = vec![Span::styled(
+        title.clone(),
+        theme::muted(&th).add_modifier(Modifier::BOLD),
+    )];
+    hspans.push(Span::raw("  "));
+    let new_label = "+ new chat";
+    let new_w = button_width(new_label);
+    hspans.extend(button(&th, new_label, false));
+    f.render_widget(
+        Paragraph::new(Line::from(hspans)),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+    );
+    let new_x = inner.x + (format!("{title}  ").width() as u16);
+    click(
+        app,
+        Rect { x: new_x, y: inner.y, width: new_w, height: 1 },
+        ClickTarget::SessionsNew,
+    );
+
+    let rows_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    };
+    if app.sessions.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "no saved chats for this workspace yet.",
+                    theme::muted(&th),
+                )),
+                Line::from(Span::styled(
+                    "chats save automatically as you talk — start another with [ + new chat ] \
+                     or /new and switch back here any time.",
+                    theme::faint(&th),
+                )),
+            ])
+            .wrap(Wrap { trim: false }),
+            rows_area,
+        );
+        return;
+    }
+
+    // --- Scroll so the selected row stays visible (rows are one line each) ---
+    let total = app.sessions.len();
+    let mut visible = rows_area.height as usize;
+    if total > visible && visible > 1 {
+        visible -= 1; // reserve the bottom line for the range hint
+    }
+    let visible = visible.max(1);
+    let sel = app.session_selected.min(total - 1);
+    app.session_selected = sel;
+    let max_scroll = total.saturating_sub(visible);
+    if app.sessions_scroll > max_scroll {
+        app.sessions_scroll = max_scroll;
+    }
+    if sel < app.sessions_scroll {
+        app.sessions_scroll = sel;
+    } else if sel >= app.sessions_scroll + visible {
+        app.sessions_scroll = sel + 1 - visible;
+    }
+    let start = app.sessions_scroll;
+    let shown = visible.min(total - start);
+
+    // Column budget: age + gap + title (flex) + gap + msgs + current tag.
+    const AGE_W: usize = 9;
+    const MSGS_W: usize = 9; // "1234 msgs"
+    const CUR_W: usize = 11; // "  · current" for the live chat's row
+    let title_w = (inner.width as usize).saturating_sub(AGE_W + 2 + MSGS_W + CUR_W + 2);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(shown);
+    for (row, m) in app.sessions.iter().enumerate().skip(start).take(shown) {
+        let selected = row == sel;
+        let is_current = m.id == app.current_session_id;
+        let name = clip(crate::app::display_title(&m.title), title_w);
+        let pad_n = title_w.saturating_sub(name.width());
+        let name_style = if selected {
+            theme::accent(&th).add_modifier(Modifier::BOLD)
+        } else {
+            fg(&th)
+        };
+        let mut spans = vec![
+            Span::styled(format!("{:>AGE_W$}  ", rel_age(m.updated_at)), theme::muted(&th)),
+            Span::styled(name, name_style),
+            Span::raw(" ".repeat(pad_n + 2)),
+            Span::styled(format!("{:>4} msgs", m.message_count), theme::muted(&th)),
+        ];
+        if is_current {
+            spans.push(Span::styled("  · current", theme::accent(&th)));
+        }
+        lines.push(sel_line(&th, spans, inner.width, selected));
+    }
+    // No wrap: rows stay one-per-line so the SessionList click math holds.
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect { x: rows_area.x, y: rows_area.y, width: rows_area.width, height: shown as u16 },
+    );
+    click(
+        app,
+        Rect { x: rows_area.x, y: rows_area.y, width: rows_area.width, height: shown as u16 },
+        ClickTarget::SessionList,
+    );
+
+    // Range hint when more rows exist off-screen.
+    if total > visible {
+        let hint = format!(
+            "  {}–{} of {} · scroll / PgUp-PgDn",
+            start + 1,
+            (start + visible).min(total),
+            total
+        );
+        let hy = rows_area.y + rows_area.height.saturating_sub(1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, theme::faint(&th)))),
+            Rect { x: rows_area.x, y: hy, width: rows_area.width, height: 1 },
+        );
+    }
+}
+
+/// Compact "how long ago" for a session row; future timestamps (clock skew)
+/// read as "just now".
+fn rel_age(t: std::time::SystemTime) -> String {
+    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
 }
 
 // ---------------------------------------------------------------------------

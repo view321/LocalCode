@@ -460,6 +460,20 @@ impl SessionStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Bump the file mtime. Resuming an old session must make it the newest
+    /// one, or the startup auto-resume (newest mtime wins) would reopen a
+    /// different chat after a quit with no new messages. Best-effort: a
+    /// failure only affects that ordering, never the data.
+    pub fn touch(&self) {
+        let bumped = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .and_then(|f| f.set_modified(SystemTime::now()));
+        if let Err(e) = bumped {
+            warn!(error = %e, path = %self.path.display(), "could not touch session file");
+        }
+    }
 }
 
 /// Sessions for `workspace` under `root`, newest first by file mtime. Reads

@@ -20,8 +20,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use localcode_agent::{
-    list_sessions, sessions_root, AgentEvent, AgentSession, CodingAgent, SessionStore, Skill,
-    ToolApprover, ToolRegistry,
+    list_sessions, sessions_root, AgentEvent, AgentSession, CodingAgent, SessionMeta,
+    SessionStore, Skill, ToolApprover, ToolRegistry,
 };
 use localcode_api_client::ApiClient;
 use localcode_assistant::{
@@ -72,6 +72,7 @@ pub enum Mode {
     Models,
     Runtimes,
     Dash,
+    Sessions,
     Remote,
     Backends,
     Bench,
@@ -87,6 +88,7 @@ impl Mode {
             Mode::Models => "models",
             Mode::Runtimes => "runtimes",
             Mode::Dash => "dash",
+            Mode::Sessions => "sessions",
             Mode::Remote => "remote",
             Mode::Backends => "backends",
             Mode::Bench => "bench",
@@ -101,6 +103,7 @@ impl Mode {
             Mode::Chat => "message the agent…    @ attaches a file · / for commands",
             Mode::Models => "search models — type to filter, Enter to run",
             Mode::Dash => "↑↓ pick a model for the next request · Enter to chat with it",
+            Mode::Sessions => "↑↓ pick a past chat · Enter to resume it",
             Mode::Settings => "↑↓ move · Enter toggle/edit · or type to chat",
             _ => "type to chat, or / for commands",
         }
@@ -213,6 +216,11 @@ pub enum ClickTarget {
     DashCopyErr(usize),
     /// Start a new model (opens the Models search/deploy view).
     DashStartNew,
+    // Sessions (past chats) — one region over the visible rows; the row index
+    // is derived from the click offset plus `sessions_scroll`.
+    SessionList,
+    /// Start a fresh chat (same as /new) from the sessions header button.
+    SessionsNew,
     // Backends — index into BACKEND_ORDER
     BackendInstall(usize),
     BackendSmoke(usize),
@@ -628,6 +636,13 @@ pub struct App {
     pub runtime_list_state: ListState,
     /// First visible card index in the `/dash` multi-model view.
     pub dash_scroll: usize,
+    // Sessions view (/sessions): past chats for this workspace, newest first.
+    pub sessions: Vec<SessionMeta>,
+    pub session_selected: usize,
+    /// First visible row; the draw clamps it and keeps the selection on screen.
+    pub sessions_scroll: usize,
+    /// Id of the live `session`, so the list can mark the current chat.
+    pub current_session_id: String,
     pub backend_reports: Vec<DetectReport>,
     pub detecting: bool,
     /// Keyboard selection in the Backends view (index into `BACKEND_ORDER`).
@@ -774,6 +789,11 @@ impl App {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let (session, session_store, resume_note) =
             bootstrap_session(&config.agent, &paths, workspace);
+        // Fresh Arc, no other holder yet — try_lock cannot fail here.
+        let current_session_id = session
+            .try_lock()
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
 
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
@@ -818,6 +838,10 @@ impl App {
             runtime_selected: 0,
             runtime_list_state: ListState::default(),
             dash_scroll: 0,
+            sessions: vec![],
+            session_selected: 0,
+            sessions_scroll: 0,
+            current_session_id,
             backend_reports: vec![],
             detecting: false,
             backend_sel: 0,
@@ -917,41 +941,7 @@ impl App {
                 .push(TranscriptEntry::new(EntryKind::System, note));
             // Rebuild visible history from the loaded session messages.
             if let Ok(sess) = app.session.try_lock() {
-                for m in &sess.messages {
-                    match m.role.as_str() {
-                        "user" => app
-                            .coding_transcript
-                            .push(TranscriptEntry::new(EntryKind::You, m.content.clone())),
-                        "assistant" => {
-                            if let Some(t) = m.thinking.as_ref().filter(|s| !s.is_empty()) {
-                                app.coding_transcript.push(TranscriptEntry {
-                                    kind: EntryKind::Thinking,
-                                    text: t.clone(),
-                                    live: false,
-                                    detail: None,
-                                    expanded: false,
-                                });
-                            }
-                            if !m.content.trim().is_empty() {
-                                app.coding_transcript.push(TranscriptEntry::new(
-                                    EntryKind::Agent,
-                                    m.content.clone(),
-                                ));
-                            }
-                        }
-                        "tool" => {
-                            let name = m.name.as_deref().unwrap_or("tool");
-                            app.coding_transcript.push(TranscriptEntry {
-                                kind: EntryKind::Tool,
-                                text: format!("✓ {name}"),
-                                live: false,
-                                detail: Some(m.content.clone()),
-                                expanded: false,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
+                app.coding_transcript.extend(transcript_from_session(&sess));
             }
         }
 
@@ -2592,6 +2582,7 @@ impl App {
         } else {
             None
         };
+        self.current_session_id = session.id.clone();
         self.session = Arc::new(AsyncMutex::new(session));
         self.session_store = Arc::new(AsyncMutex::new(store));
         // Re-walk the workspace next time '@' is used — files likely changed.
@@ -2604,6 +2595,91 @@ impl App {
         self.coding_follow = true;
         self.ctx_used_tokens = 0;
         self.set_status("New coding session", false);
+    }
+
+    // ------------------------------------------------------------------
+    // Sessions view (/sessions) — list past chats, resume one
+    // ------------------------------------------------------------------
+
+    /// Open the sessions view with a fresh listing for this workspace.
+    fn open_sessions(&mut self) {
+        if !self.config.agent.sessions_enabled {
+            self.set_status(
+                "Session persistence is off — enable agent.sessions_enabled to keep past chats",
+                true,
+            );
+            return;
+        }
+        let root = sessions_root(&self.config.agent, &self.paths);
+        self.sessions = list_sessions(&root, &self.workspace_path());
+        // Land on the newest chat that isn't the current one, so a bare Enter
+        // switches somewhere instead of re-opening the chat you came from.
+        self.session_selected = self
+            .sessions
+            .iter()
+            .position(|m| m.id != self.current_session_id)
+            .unwrap_or(0);
+        self.sessions_scroll = 0;
+        self.set_mode(Mode::Sessions);
+    }
+
+    /// Switch the live chat to the picked past session. The current session
+    /// is already on disk (synced after every turn), so this only loads the
+    /// other file and swaps the in-memory state.
+    fn resume_session(&mut self, idx: usize) {
+        if self.fg_busy() {
+            self.set_status("Agent is busy — Esc to cancel first", false);
+            return;
+        }
+        let Some(meta) = self.sessions.get(idx) else {
+            return;
+        };
+        if meta.id == self.current_session_id {
+            self.set_mode(Mode::Chat);
+            self.set_status("Already in this chat", false);
+            return;
+        }
+        let loaded = match SessionStore::load(&meta.path) {
+            Ok(l) => l,
+            Err(e) => {
+                self.set_status(format!("Could not open session: {}", e.message), true);
+                return;
+            }
+        };
+        // Newest mtime wins the startup auto-resume; make that this session.
+        loaded.store.touch();
+        let title = display_title(&loaded.session.title).to_string();
+        let note = if loaded.warnings.is_empty() {
+            format!("Resumed session “{title}”")
+        } else {
+            format!(
+                "Resumed session “{title}” ({} repair note(s))",
+                loaded.warnings.len()
+            )
+        };
+        let mut transcript = vec![TranscriptEntry::new(EntryKind::System, note)];
+        transcript.extend(transcript_from_session(&loaded.session));
+        self.ctx_used_tokens = estimate_session_tokens(&loaded.session);
+        self.current_session_id = loaded.session.id.clone();
+        self.session = Arc::new(AsyncMutex::new(loaded.session));
+        self.session_store = Arc::new(AsyncMutex::new(Some(loaded.store)));
+        self.workspace_files = None;
+        self.coding_transcript = transcript;
+        self.coding_scroll = 0;
+        self.coding_follow = true;
+        self.set_mode(Mode::Chat);
+        self.set_status(format!("Resumed “{title}”"), false);
+    }
+
+    /// Wheel over the sessions list moves the selection (rows are one line
+    /// each; the draw keeps the selection visible).
+    fn scroll_sessions(&mut self, delta: i64) {
+        let n = self.sessions.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.session_selected.min(n - 1) as i64;
+        self.session_selected = (cur + delta.signum()).clamp(0, n as i64 - 1) as usize;
     }
 
     fn start_stop_runtime(&mut self) {
@@ -3903,6 +3979,7 @@ impl App {
             ("/select", "", "release mouse to select & copy text (F2)"),
             ("/chat", "", "back to the conversation"),
             ("/new", "", "start a new conversation"),
+            ("/sessions", "", "switch to a past chat (resume)"),
             ("/deploy", "", "deploy the selected model"),
             ("/doctor", "", "run environment diagnostics"),
             ("/assistant", "[install|accept]", "accept/install local Bonsai (default chat when ready)"),
@@ -4238,6 +4315,7 @@ impl App {
                 self.set_mode(Mode::Chat);
                 self.new_coding_session();
             }
+            "sessions" | "resume" | "chats" => self.open_sessions(),
             "assistant" | "ask" => match args.first().map(|s| s.as_str()) {
                 // Force install after accept (skips re-prompt only if already accepted).
                 Some("install") => {
@@ -5282,6 +5360,27 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 KeyCode::PageUp => self.dash_scroll = self.dash_scroll.saturating_sub(1),
                 _ => {}
             },
+            // Sessions selection follows the same follow-the-highlight model
+            // as Dash: the draw scrolls to keep it visible.
+            Mode::Sessions => match code {
+                KeyCode::Down => {
+                    let n = self.sessions.len();
+                    if n > 0 {
+                        self.session_selected = (self.session_selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Up => self.session_selected = self.session_selected.saturating_sub(1),
+                KeyCode::PageDown => {
+                    let n = self.sessions.len();
+                    if n > 0 {
+                        self.session_selected = (self.session_selected + 10).min(n - 1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.session_selected = self.session_selected.saturating_sub(10);
+                }
+                _ => {}
+            },
             Mode::Backends => match code {
                 KeyCode::Down => self.backend_sel = (self.backend_sel + 1) % BACKEND_ORDER.len(),
                 KeyCode::Up => {
@@ -5364,6 +5463,7 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 self.dash_use(self.runtime_selected);
                 self.set_mode(Mode::Chat);
             }
+            Mode::Sessions => self.resume_session(self.session_selected),
             _ => {}
         }
     }
@@ -5617,6 +5717,18 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                     self.copy_to_clipboard(&err, "error");
                 }
             }
+            // Sessions: clicking a row resumes it (same as select + Enter).
+            ClickTarget::SessionList => {
+                let idx = self.sessions_scroll + rel_row;
+                if idx < self.sessions.len() {
+                    self.session_selected = idx;
+                    self.resume_session(idx);
+                }
+            }
+            ClickTarget::SessionsNew => {
+                self.new_coding_session();
+                self.set_mode(Mode::Chat);
+            }
             ClickTarget::DashStartNew => {
                 self.set_mode(Mode::Models);
                 if self.models.is_empty() && !self.fg_busy() {
@@ -5744,6 +5856,7 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             | Some(ClickTarget::DashUse(_))
             | Some(ClickTarget::DashCopyErr(_))
             | Some(ClickTarget::DashStartNew) => self.scroll_dash(delta),
+            Some(ClickTarget::SessionList) => self.scroll_sessions(delta),
             _ => self.wheel_scroll(delta),
         }
     }
@@ -5754,6 +5867,7 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             Mode::Chat => self.scroll_transcript(delta),
             Mode::Models => self.scroll_card(delta),
             Mode::Dash => self.scroll_dash(delta),
+            Mode::Sessions => self.scroll_sessions(delta),
             Mode::Setup => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
             }
@@ -5875,6 +5989,54 @@ fn bootstrap_session(
         Arc::new(AsyncMutex::new(store)),
         None,
     )
+}
+
+/// Listing/banner label for a session title; blank titles read as "untitled".
+pub(crate) fn display_title(title: &str) -> &str {
+    let t = title.trim();
+    if t.is_empty() {
+        "untitled"
+    } else {
+        t
+    }
+}
+
+/// Visible transcript rows for a session loaded from disk: one entry per
+/// user/assistant message, thinking collapsed, tool results as expandable
+/// `✓ name` rows — the same shapes a live turn leaves behind.
+fn transcript_from_session(session: &AgentSession) -> Vec<TranscriptEntry> {
+    let mut out = Vec::new();
+    for m in &session.messages {
+        match m.role.as_str() {
+            "user" => out.push(TranscriptEntry::new(EntryKind::You, m.content.clone())),
+            "assistant" => {
+                if let Some(t) = m.thinking.as_ref().filter(|s| !s.is_empty()) {
+                    out.push(TranscriptEntry {
+                        kind: EntryKind::Thinking,
+                        text: t.clone(),
+                        live: false,
+                        detail: None,
+                        expanded: false,
+                    });
+                }
+                if !m.content.trim().is_empty() {
+                    out.push(TranscriptEntry::new(EntryKind::Agent, m.content.clone()));
+                }
+            }
+            "tool" => {
+                let name = m.name.as_deref().unwrap_or("tool");
+                out.push(TranscriptEntry {
+                    kind: EntryKind::Tool,
+                    text: format!("✓ {name}"),
+                    live: false,
+                    detail: Some(m.content.clone()),
+                    expanded: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Rough token estimate for the status-bar context meter: ~4 chars per token
@@ -6250,6 +6412,154 @@ mod tests {
         assert!(app.dash_cards().is_empty());
     }
 
+    // ---- /sessions past-chat switcher --------------------------------------
+
+    fn chat_msg(role: &str, content: &str) -> localcode_agent::ChatMessage {
+        localcode_agent::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+            thinking: None,
+        }
+    }
+
+    /// Write a finished one-turn session file under `root` for `ws`, aged by
+    /// `age_secs` so listing order (newest mtime first) is deterministic.
+    fn seed_session(
+        root: &std::path::Path,
+        ws: &std::path::Path,
+        title: &str,
+        user_text: &str,
+        age_secs: u64,
+    ) -> String {
+        let mut s = AgentSession::new(ws.to_path_buf());
+        s.messages.push(chat_msg("user", user_text));
+        s.messages.push(chat_msg("assistant", "done"));
+        s.title = title.into();
+        let mut store = SessionStore::create(root, &s).unwrap();
+        store.sync(&s).unwrap();
+        let past = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path())
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        s.id
+    }
+
+    #[test]
+    fn sessions_command_reports_when_persistence_is_off() {
+        let mut app = test_app(); // sessions_enabled = false
+        typ(&mut app, "/sessions");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Chat, "stays in chat when nothing is saved");
+        assert!(app.status_is_error);
+        assert!(app.status_line.contains("sessions_enabled"), "{}", app.status_line);
+    }
+
+    #[test]
+    fn sessions_lists_past_chats_and_enter_switches_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let paths = AppPaths::from_home(home);
+        paths.ensure_dirs().unwrap();
+
+        let mut cfg = Config::default();
+        cfg.assistant.local_preference = LocalAssistantPreference::Declined;
+        cfg.agent.workspace_root = Some(ws.display().to_string());
+        // Seed two chats before the app starts; both aged so the resume touch
+        // below lands strictly newer even on coarse-mtime filesystems.
+        let root = sessions_root(&cfg.agent, &paths);
+        let old_id = seed_session(&root, &ws, "old chat", "old question", 600);
+        let new_id = seed_session(&root, &ws, "new chat", "new question", 300);
+
+        let mut app = App::new(paths, cfg);
+        assert_eq!(app.current_session_id, new_id, "startup resumes the newest chat");
+
+        typ(&mut app, "/sessions");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Sessions);
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(
+            app.sessions[app.session_selected].id, old_id,
+            "preselects the newest chat that isn't the current one"
+        );
+
+        // Enter resumes the highlighted chat: state, transcript and marker move.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Chat);
+        assert_eq!(app.current_session_id, old_id);
+        assert!(
+            app.coding_transcript
+                .iter()
+                .any(|e| e.kind == EntryKind::You && e.text == "old question"),
+            "resumed history is visible in the transcript"
+        );
+        assert_eq!(
+            app.session.try_lock().unwrap().messages.len(),
+            2,
+            "agent session now holds the resumed history"
+        );
+
+        // The resume touched the file: reopening lists it first, and the
+        // preselection points back at the chat we came from.
+        typ(&mut app, "/sessions");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.sessions[0].id, old_id, "resumed chat is now newest");
+        assert_eq!(app.sessions[app.session_selected].id, new_id);
+
+        // Resuming the row of the current chat is a no-op back to chat.
+        let cur_row = app
+            .sessions
+            .iter()
+            .position(|m| m.id == app.current_session_id)
+            .unwrap();
+        app.resume_session(cur_row);
+        assert_eq!(app.mode, Mode::Chat);
+        assert_eq!(app.current_session_id, old_id);
+    }
+
+    #[test]
+    fn sessions_view_renders_rows_with_current_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let paths = AppPaths::from_home(home);
+        paths.ensure_dirs().unwrap();
+        let mut cfg = Config::default();
+        cfg.assistant.local_preference = LocalAssistantPreference::Declined;
+        cfg.agent.workspace_root = Some(ws.display().to_string());
+        let root = sessions_root(&cfg.agent, &paths);
+        seed_session(&root, &ws, "old chat", "old question", 600);
+        seed_session(&root, &ws, "new chat", "new question", 300);
+
+        let mut app = App::new(paths, cfg);
+        app.open_sessions();
+        let s = render_to_string(&mut app, 100, 24);
+        assert!(s.contains("past chats (2)"), "{s}");
+        assert!(s.contains("new chat"), "{s}");
+        assert!(s.contains("old chat"), "{s}");
+        assert!(s.contains("· current"), "the live chat's row is marked: {s}");
+        assert!(s.contains("+ new chat"), "{s}");
+        // Rows and the header button register click regions.
+        assert!(app
+            .click_regions
+            .iter()
+            .any(|r| r.target == ClickTarget::SessionList));
+        assert!(app
+            .click_regions
+            .iter()
+            .any(|r| r.target == ClickTarget::SessionsNew));
+    }
+
     #[test]
     fn theme_command_cycles_theme() {
         let mut app = test_app();
@@ -6518,6 +6828,7 @@ mod tests {
             Mode::Chat,
             Mode::Models,
             Mode::Runtimes,
+            Mode::Sessions,
             Mode::Remote,
             Mode::Backends,
             Mode::Bench,
