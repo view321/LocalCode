@@ -101,14 +101,12 @@ pub fn install_offer_body(need: &InstallNeed) -> String {
         InstallNeed::ModelOnly => format!(
             "Download {ASSISTANT_DISPLAY_NAME} language model `{BONSAI_FILE}` (~{size_gb:.1} GB), then:\n\
              `llama-server -m {BONSAI_FILE} -ngl 99`\n\
-             (Optional: also downloads DSpark drafter `{BONSAI_DRAFT_FILE}` for `-md`.)\n\
-             Note: the Q4_1 file alone is a *drafter*, not a full model."
+             Q1_0 only — the Q4_1 DSpark drafter is not loaded."
         ),
         InstallNeed::Both => format!(
             "Install the local {ASSISTANT_DISPLAY_NAME} assistant?\n\n\
              • Auto-build PrismML llama.cpp (git clone + cmake, as on the model card)\n\
-             • Download language model `{BONSAI_FILE}` (~{size_gb:.1} GB)\n\
-             • Optional DSpark drafter `{BONSAI_DRAFT_FILE}` (~1.8 GB) for `-md`\n\
+             • Download language model `{BONSAI_FILE}` (~{size_gb:.1} GB), Q1_0 only\n\
              • Launch: `llama-server -m {BONSAI_FILE} --host 127.0.0.1 -ngl 99`\n\n\
              This becomes your default conversation model."
         ),
@@ -211,27 +209,8 @@ pub async fn install_local_assistant(
         ));
     }
 
-    // Optional drafter (best-effort; failure is non-fatal).
-    if !gguf_looks_complete(&draft_path(paths), BONSAI_DRAFT_BYTES) {
-        let _ = progress.send(format!(
-            "Downloading optional DSpark drafter {BONSAI_DRAFT_FILE} (~{:.1} GB)…",
-            BONSAI_DRAFT_BYTES as f64 / 1_073_741_824.0
-        ));
-        if let Err(e) = download_gguf(
-            paths,
-            BONSAI_DRAFT_FILE,
-            BONSAI_DRAFT_BYTES,
-            cfg.hf_token().as_deref(),
-            progress.clone(),
-        )
-        .await
-        {
-            let _ = progress.send(format!(
-                "Draft download skipped ({}); continuing without -md",
-                e.message
-            ));
-        }
-    }
+    // Q1-only: the Q4_1 DSpark drafter is deliberately not downloaded or loaded,
+    // so no Q4 weights ever reach memory. (The `-md` speculative path is off.)
 
     let _ = progress.send(format!(
         "Smoke-start: llama-server -m {BONSAI_FILE} -ngl {} …",

@@ -169,6 +169,8 @@ impl InferenceBackend for OllamaBackend {
         );
         runtime.model_id = Some(effective.clone());
         runtime.quantization = spec.quantization.clone();
+        // Report the served context window so the agent compacts before overflow.
+        runtime.context_tokens = (spec.context_length > 0).then_some(spec.context_length);
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
 
@@ -404,6 +406,8 @@ impl OllamaBackend {
         );
         runtime.model_id = Some(name.to_string());
         runtime.quantization = spec.quantization.clone();
+        // Report the served context window so the agent compacts before overflow.
+        runtime.context_tokens = (spec.context_length > 0).then_some(spec.context_length);
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
         Ok(RunningEndpoint { runtime })

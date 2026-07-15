@@ -147,6 +147,13 @@ impl TranscriptEntry {
         }
     }
 
+    /// A finished model response the user can click to select + auto-copy.
+    /// Restricted to the agent's answer text (not thinking/tool/system rows) and
+    /// only once it has content, so an empty streaming placeholder isn't copied.
+    pub fn is_model_response(&self) -> bool {
+        self.kind == EntryKind::Agent && !self.text.trim().is_empty()
+    }
+
     /// Entries the user can click to toggle verbose / collapsed body.
     pub fn can_toggle(&self) -> bool {
         match self.kind {
@@ -1006,6 +1013,10 @@ pub struct App {
     pub coding_history: Vec<String>,
     coding_hist_idx: Option<usize>,
     pub coding_transcript: Vec<TranscriptEntry>,
+    /// Index into `coding_transcript` of the model response the user clicked to
+    /// select. Selecting a response auto-copies it to the clipboard; the row is
+    /// painted with the selection highlight. Cleared on `/new` and session load.
+    pub coding_selected: Option<usize>,
     pub coding_scroll: usize,
     pub coding_follow: bool,
     /// Updated during draw so PgUp/PgDn know the scroll bounds.
@@ -1209,6 +1220,7 @@ impl App {
                 }
                 t
             },
+            coding_selected: None,
             coding_scroll: 0,
             coding_follow: true,
             coding_view_height: 0,
@@ -1383,10 +1395,13 @@ impl App {
             // Per-model live metrics: only the active model streams / holds the
             // singular coding session, so tok/s and ctx are attributed to it.
             let tok_per_sec = if is_active { self.tokens_per_sec } else { None };
-            let (ctx_used, ctx_max) = if is_active {
-                (Some(self.ctx_used_tokens), self.deploy_ctx.max(1))
+            // Each card shows its own model's context window when known (the
+            // assistant's 128k, a deploy's `-c`), else the deploy-form value.
+            let ctx_max = rt.context_tokens.unwrap_or(self.deploy_ctx).max(1);
+            let ctx_used = if is_active {
+                Some(self.ctx_used_tokens)
             } else {
-                (None, self.deploy_ctx.max(1))
+                None
             };
 
             let mut card = if assistant_offset == 1 && i == 0 {
@@ -2878,12 +2893,27 @@ impl App {
             );
             return;
         }
-        let urls: Vec<String> = self
-            .all_runtimes()
+        let urls = self.openwebui_desired_urls();
+        let n = urls.len();
+        self.spawn_openwebui_deploy(urls);
+        self.set_status(
+            format!("Deploying OpenWebUI (Docker) wired to {n} model endpoint(s)…"),
+            false,
+        );
+    }
+
+    /// The OpenAI-compatible endpoints OpenWebUI should be wired to: every model
+    /// LocalCode is hosting right now (local assistant + deploys + remote).
+    fn openwebui_desired_urls(&self) -> Vec<String> {
+        self.all_runtimes()
             .iter()
             .map(|r| r.base_url.clone())
-            .collect();
-        let n = urls.len();
+            .collect()
+    }
+
+    /// Spawn the (re)deploy of the OpenWebUI container wired to `urls`. The
+    /// container has a fixed name, so this replaces any previous instance.
+    fn spawn_openwebui_deploy(&mut self, urls: Vec<String>) {
         self.openwebui_busy = true;
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -2892,8 +2922,36 @@ impl App {
                 .map(Box::new);
             let _ = tx.send(BgMsg::OpenWebUiReady(result));
         });
+    }
+
+    /// Keep a running OpenWebUI wired to the current model set. When the runtimes
+    /// change — a deploy finishes, a model is stopped, the local assistant comes
+    /// online — re-launch the container so its model list matches what LocalCode
+    /// is hosting. No-op when nothing is running, a (re)deploy is already in
+    /// flight, or the endpoint set is unchanged.
+    fn maybe_resync_openwebui(&mut self) {
+        if self.openwebui_busy {
+            return;
+        }
+        // Owned copy so the immutable borrow of `self.openwebui` is released
+        // before the mutable (re)deploy call below.
+        let prev = match self.openwebui.as_ref() {
+            Some(h) => h.model_urls().to_vec(),
+            None => return,
+        };
+        let desired = self.openwebui_desired_urls();
+        let norm = |mut v: Vec<String>| {
+            v.sort();
+            v.dedup();
+            v
+        };
+        if norm(desired.clone()) == norm(prev) {
+            return;
+        }
+        let n = desired.len();
+        self.spawn_openwebui_deploy(desired);
         self.set_status(
-            format!("Deploying OpenWebUI (Docker) wired to {n} model endpoint(s)…"),
+            format!("Syncing OpenWebUI with {n} model endpoint(s)…"),
             false,
         );
     }
@@ -3288,6 +3346,7 @@ impl App {
             EntryKind::System,
             "new session started",
         )];
+        self.coding_selected = None;
         self.coding_scroll = 0;
         self.coding_follow = true;
         self.ctx_used_tokens = 0;
@@ -3415,6 +3474,7 @@ impl App {
                 self.session = chat.session;
                 self.session_store = chat.session_store;
                 self.coding_transcript = chat.transcript;
+                self.coding_selected = None;
                 self.ctx_used_tokens = chat.ctx_used;
                 self.workspace_files = None;
                 self.coding_scroll = 0;
@@ -3460,6 +3520,7 @@ impl App {
         self.session_store = Arc::new(AsyncMutex::new(Some(loaded.store)));
         self.workspace_files = None;
         self.coding_transcript = transcript;
+        self.coding_selected = None;
         self.coding_scroll = 0;
         self.coding_follow = true;
         self.set_mode(Mode::Chat);
@@ -4784,6 +4845,9 @@ impl App {
         if self.runtime_selected >= total {
             self.runtime_selected = total.saturating_sub(1);
         }
+        // Keep a running OpenWebUI wired to the current model set (fires only when
+        // the endpoint set actually changed).
+        self.maybe_resync_openwebui();
     }
 
     // ------------------------------------------------------------------
@@ -6533,7 +6597,16 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             ClickTarget::StatusToggle => self.toggle_status_pin(),
             ClickTarget::Transcript => {}
             ClickTarget::TranscriptEntry(i) => {
-                if let Some(e) = self.coding_transcript.get_mut(i) {
+                // A model response: select it and auto-copy to the clipboard.
+                if self
+                    .coding_transcript
+                    .get(i)
+                    .is_some_and(|e| e.is_model_response())
+                {
+                    self.coding_selected = Some(i);
+                    let text = self.coding_transcript[i].text.clone();
+                    self.copy_to_clipboard(&text, "model response");
+                } else if let Some(e) = self.coding_transcript.get_mut(i) {
                     if e.can_toggle() {
                         e.expanded = !e.expanded;
                         // Expanding often needs a re-scroll so the detail is visible.

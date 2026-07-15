@@ -4,11 +4,12 @@
 //! ```text
 //! ./build/bin/llama-server \
 //!     -m Bonsai-27B-Q1_0.gguf \
-//!     [--md Bonsai-27B-dspark-Q4_1.gguf] \
 //!     --host 127.0.0.1 --port … -ngl 99
 //! ```
 //!
-//! The Q4_1 file is a **DSpark drafter only** — never pass it as `-m` alone.
+//! The assistant loads the **Q1_0 language model only**. The repo's Q4_1 file is
+//! a DSpark speculative drafter, not a standalone model — we deliberately do not
+//! load it (Q1-only), so no Q4 weights are ever mapped into memory.
 
 use crate::constants::{
     ASSISTANT_MODEL_ID, BONSAI_DRAFT_FILE, BONSAI_FILE, BONSAI_QUANT, BONSAI_TEMPERATURE,
@@ -33,6 +34,9 @@ pub struct LocalAssistantRuntime {
     base_url: String,
     port: u16,
     model_id: String,
+    /// Context window (tokens) the server was started with (`-c`). Surfaced on
+    /// the `ActiveRuntime` so the agent compacts history before it overflows.
+    context: u32,
     /// The exact `llama-server …` command the server was launched with (for the
     /// `/dash` card's click-to-copy). A short note for a reused running server.
     command: String,
@@ -77,6 +81,7 @@ impl LocalAssistantRuntime {
         );
         r.model_id = Some(self.model_id.clone());
         r.quantization = Some(BONSAI_QUANT.into());
+        r.context_tokens = Some(self.context);
         r.status = RuntimeStatus::Healthy;
         r
     }
@@ -151,8 +156,7 @@ pub async fn ensure_running(
         .retryable(true));
     }
 
-    let draft = draft_path(paths);
-    let use_draft = gguf_looks_present(&draft);
+    let ctx = cfg.assistant.local_context.max(2048);
 
     let port = cfg.assistant.local_port;
     let host = "127.0.0.1";
@@ -164,6 +168,7 @@ pub async fn ensure_running(
         base_url: base_url.clone(),
         port,
         model_id: ASSISTANT_MODEL_ID.into(),
+        context: ctx,
         command: format!(
             "llama-server -m {} --host {host} --port {port} -ngl {} (reused running server)",
             gguf.display(),
@@ -187,10 +192,10 @@ pub async fn ensure_running(
     }
 
     let ngl = cfg.assistant.local_gpu_layers;
-    let ctx = cfg.assistant.local_context.max(2048);
 
     // Model card: llama-server -m Bonsai-27B-Q1_0.gguf --host … --port … -ngl 99
-    let mut args: Vec<String> = vec![
+    // Q1-only: the Q4_1 DSpark drafter is intentionally never passed as `-md`.
+    let args: Vec<String> = vec![
         "-m".into(),
         gguf.display().to_string(),
         "--host".into(),
@@ -209,10 +214,6 @@ pub async fn ensure_running(
         BONSAI_TOP_K.to_string(),
         "--jinja".into(),
     ];
-    if use_draft {
-        args.push("-md".into());
-        args.push(draft.display().to_string());
-    }
 
     let cmd_display = format!(
         "{} {}",
@@ -232,10 +233,10 @@ pub async fn ensure_running(
     info!(
         bin = %bin.display(),
         model = %gguf.display(),
-        draft = use_draft,
+        ctx,
         port,
         ngl,
-        "starting local assistant llama-server (-m Q1_0)"
+        "starting local assistant llama-server (-m Q1_0, no draft)"
     );
     // Persist the exact command so failures are diagnosable even if the UI
     // races the stderr drain.
@@ -273,6 +274,7 @@ pub async fn ensure_running(
         base_url: base_url.clone(),
         port,
         model_id: ASSISTANT_MODEL_ID.into(),
+        context: ctx,
         command: cmd_display.clone(),
         logs: io_tail.clone(),
     };
@@ -347,12 +349,6 @@ pub async fn ensure_running(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
-}
-
-fn gguf_looks_present(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.len() > 1_000_000)
-        .unwrap_or(false)
 }
 
 fn port_in_use(port: u16) -> bool {
@@ -473,8 +469,8 @@ pub fn is_installed(_cfg: &Config, paths: &AppPaths) -> bool {
 /// Note about the launch path and custom runtime.
 pub fn quant_compatibility_note() -> &'static str {
     "The assistant starts with: llama-server -m Bonsai-27B-Q1_0.gguf \
-     [--md Bonsai-27B-dspark-Q4_1.gguf] --host 127.0.0.1 -ngl 99 \
-     on the PrismML llama.cpp fork. Q4_1 alone is a DSpark drafter, not a full model."
+     --host 127.0.0.1 -ngl 99 on the PrismML llama.cpp fork. Q1_0 only — the \
+     Q4_1 DSpark drafter is never loaded."
 }
 
 impl Drop for LocalAssistantRuntime {

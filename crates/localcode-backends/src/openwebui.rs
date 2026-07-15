@@ -7,6 +7,12 @@
 //! (built in on Docker Desktop; added explicitly on Linux). We run the container
 //! detached and manage it by name, capturing `docker logs` for the `/dash` card
 //! and probing `/health` to flip the card to Running.
+//!
+//! The container is wired to whatever models LocalCode is hosting *now*: the
+//! endpoint list is passed via `OPENAI_API_BASE_URLS` with
+//! `ENABLE_PERSISTENT_CONFIG=False` so the env wins on every (re)start, and the
+//! TUI re-launches the container (same name/volume) whenever the runtime set
+//! changes — so new deploys and the local assistant appear automatically.
 
 use crate::ProcState;
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -143,6 +149,14 @@ impl OpenWebUi {
         args.push(format!("OPENAI_API_BASE_URLS={base_urls}"));
         args.push("-e".into());
         args.push(format!("OPENAI_API_KEYS={keys}"));
+        // Make the env authoritative on every (re)start. OpenWebUI treats
+        // OPENAI_API_BASE_URLS as a "PersistentConfig" value: by default it is
+        // seeded into the DB on first boot and the DB then wins, so re-launching
+        // with a different model set (a new deploy, the assistant coming online)
+        // would keep showing the stale list. Disabling persistent config makes
+        // the connections always reflect the models LocalCode is hosting now.
+        args.push("-e".into());
+        args.push("ENABLE_PERSISTENT_CONFIG=False".into());
         // Skip login for a local single-user tool.
         args.push("-e".into());
         args.push("WEBUI_AUTH=False".into());
@@ -320,6 +334,8 @@ mod tests {
         assert!(joined.contains("host.docker.internal:8080/v1"));
         assert!(joined.contains("host.docker.internal:8000/v1"));
         assert!(joined.contains(';'));
+        // Env must stay authoritative so a resync reflects the current models.
+        assert!(args.iter().any(|a| a == "ENABLE_PERSISTENT_CONFIG=False"));
         assert!(args.last().unwrap().contains("open-webui"));
     }
 

@@ -35,6 +35,13 @@ pub struct ActiveRuntime {
     pub quantization: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Model context window in tokens, when known (llama.cpp `-c` / vLLM
+    /// `--max-model-len` / Ollama `num_ctx` / the assistant's `local_context`).
+    /// Drives the agent's auto-compaction budget so history is summarized before
+    /// it overflows this model's context. `None` when the backend didn't report
+    /// a fixed window (the agent then falls back to `agent.max_history_chars`).
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
     pub status: RuntimeStatus,
     pub created_at: DateTime<Utc>,
     pub correlation_id: String,
@@ -54,6 +61,7 @@ impl ActiveRuntime {
             quantization: None,
             base_url: base_url.into(),
             api_key: None,
+            context_tokens: None,
             status: RuntimeStatus::Starting,
             created_at: Utc::now(),
             correlation_id: Uuid::new_v4().to_string(),

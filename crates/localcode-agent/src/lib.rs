@@ -537,13 +537,38 @@ impl CodingAgent {
     /// and each turn would pay a fresh summarization round-trip. Each pass folds
     /// the prior summary and only the newly-dropped slice, so nothing between an
     /// old cut and the new one silently vanishes.
+    /// Char budget for the request history sent to `runtime`. When the runtime
+    /// advertises its context window (`context_tokens`), the budget is derived
+    /// from it — ~70% of the window spent on history, the rest reserved for the
+    /// reply, tool schemas and the injected summary — so history is compacted or
+    /// trimmed to fit *this model's* context (auto-compaction on overflow, for
+    /// every model including the local assistant). Falls back to the configured
+    /// `agent.max_history_chars` when the window is unknown; `0` disables both
+    /// compaction and trimming, preserving the prior unbounded behavior.
+    fn effective_history_chars(&self, runtime: &ActiveRuntime) -> usize {
+        let configured = self.config.max_history_chars;
+        if configured == 0 {
+            return 0;
+        }
+        match runtime.context_tokens {
+            Some(ctx) if ctx > 0 => {
+                let history_tokens = (ctx as usize).saturating_mul(7) / 10;
+                history_tokens
+                    .saturating_mul(CHARS_PER_TOKEN)
+                    .max(MIN_HISTORY_CHARS)
+            }
+            _ => configured,
+        }
+    }
+
     async fn maybe_auto_compact(
         &self,
         session: &mut AgentSession,
         runtime: &ActiveRuntime,
         api_key: Option<&str>,
     ) {
-        if !self.config.auto_compact || self.config.max_history_chars == 0 {
+        let budget = self.effective_history_chars(runtime);
+        if !self.config.auto_compact || budget == 0 {
             return;
         }
         let prior = session.compaction.clone();
@@ -557,10 +582,18 @@ impl CodingAgent {
             .unwrap_or(0);
         let live: usize =
             summary_len + session.messages[base..].iter().map(approx_chars).sum::<usize>();
-        if live <= self.config.max_history_chars {
+        if live <= budget {
             return;
         }
-        let keep = self.config.compact_keep_recent_chars.max(1);
+        // Keep at most ~three-quarters of the budget verbatim so there is always
+        // room for the summary + trimming to bring the request under `budget`
+        // (matters for small-context models where the default keep would exceed
+        // the whole window).
+        let keep = self
+            .config
+            .compact_keep_recent_chars
+            .max(1)
+            .min((budget * 3 / 4).max(1));
         let first_kept = first_kept_index(&session.messages, keep);
         // Only compact when the cut actually advances past what's already
         // summarized (avoids re-summarizing the same span every turn).
@@ -899,7 +932,7 @@ Never repeat an identical failing call or alternate between two failing calls."
         };
 
         let (messages, system_content) =
-            build_request_view(session, system, self.config.max_history_chars);
+            build_request_view(session, system, self.effective_history_chars(runtime));
 
         let mut api_messages = vec![json!({
             "role": "system",
@@ -1497,6 +1530,15 @@ struct LlmResponse {
     streamed: bool,
 }
 
+/// Rough chars-per-token used to convert a model's token context window into a
+/// history char budget. Matches the `chars / 4` estimate the TUI context meter
+/// uses, so the two stay consistent.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Floor for a context-derived history budget so a mistakenly tiny reported
+/// window can never trim away the current turn (~1k tokens).
+const MIN_HISTORY_CHARS: usize = 4_000;
+
 /// Approximate size of a message as sent to the model.
 fn approx_chars(m: &ChatMessage) -> usize {
     m.content.chars().count()
@@ -1742,6 +1784,53 @@ mod tests {
         assert!(prompt.contains("Grover"));
         assert!(!prompt.contains("LocalCode coding agent"));
         assert!(prompt.contains("Workspace:"));
+    }
+
+    fn runtime_with_ctx(ctx: Option<u32>) -> ActiveRuntime {
+        let mut r = ActiveRuntime::new(
+            "t",
+            localcode_core::runtime::RuntimeKind::LlamaCpp,
+            "http://127.0.0.1:8080/v1",
+        );
+        r.context_tokens = ctx;
+        r
+    }
+
+    #[test]
+    fn history_budget_follows_the_model_context_window() {
+        // A large window (128k) is spent on history, well past the char default,
+        // so long chats stay in-window and only compact near real overflow.
+        let agent = CodingAgent::new(AgentConfig::default());
+        let big = agent.effective_history_chars(&runtime_with_ctx(Some(131_072)));
+        assert!(
+            big > AgentConfig::default().max_history_chars,
+            "128k window should give a bigger budget than the char default, got {big}"
+        );
+        // ~70% of 131072 tokens × 4 chars/token.
+        assert_eq!(big, 131_072 * 7 / 10 * 4);
+
+        // Unknown window → fall back to the configured char budget.
+        assert_eq!(
+            agent.effective_history_chars(&runtime_with_ctx(None)),
+            AgentConfig::default().max_history_chars
+        );
+
+        // A tiny window can never trim away the current turn (floor applies).
+        assert_eq!(
+            agent.effective_history_chars(&runtime_with_ctx(Some(128))),
+            MIN_HISTORY_CHARS
+        );
+    }
+
+    #[test]
+    fn history_budget_zero_config_disables_compaction() {
+        // `max_history_chars = 0` opts out entirely, even with a known window.
+        let agent = CodingAgent::new(AgentConfig {
+            max_history_chars: 0,
+            ..AgentConfig::default()
+        });
+        assert_eq!(agent.effective_history_chars(&runtime_with_ctx(Some(131_072))), 0);
+        assert_eq!(agent.effective_history_chars(&runtime_with_ctx(None)), 0);
     }
 
     #[test]

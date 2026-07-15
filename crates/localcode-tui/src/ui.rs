@@ -411,8 +411,13 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let mut line1: Vec<Span> = Vec::new();
     // Context: used/max with a meter. Used is estimated from the session
-    // (chars÷4); max is the deploy context window.
-    let ctx_max = app.deploy_ctx.max(1);
+    // (chars÷4); max is the active model's context window (the assistant's
+    // 128k, a deploy's `-c`, …), falling back to the deploy-form value.
+    let ctx_max = app
+        .active_runtime()
+        .and_then(|r| r.context_tokens)
+        .unwrap_or(app.deploy_ctx)
+        .max(1);
     let ctx_used = app.ctx_used_tokens.min(ctx_max.saturating_mul(2));
     line1.push(Span::styled("ctx ", theme::muted(&th)));
     line1.push(Span::styled(
@@ -853,6 +858,16 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             EntryKind::Tool => theme::muted(&th),
             _ => body_style,
         };
+        // A selected (clicked + copied) model response gets the selection
+        // highlight background, keeping its own foreground so it stays readable.
+        let (body_style, header_style) = if app.coding_selected == Some(idx) {
+            match theme::selected(&th).bg {
+                Some(bg) => (body_style.bg(bg), header_style.bg(bg)),
+                None => (body_style, header_style),
+            }
+        } else {
+            (body_style, header_style)
+        };
 
         // Build the visible text for this entry (collapsed header vs full body).
         let display = chat_entry_display(e);
@@ -893,8 +908,13 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
             lines.push(Line::from(spans));
-            // Header + expanded body rows are all clickable for toggleable entries.
-            line_entry.push(if e.can_toggle() { Some(idx) } else { None });
+            // Clickable rows: toggleable entries (thinking/tool) expand; a model
+            // response selects + auto-copies.
+            line_entry.push(if e.can_toggle() || e.is_model_response() {
+                Some(idx)
+            } else {
+                None
+            });
         }
 
         // Three live backend log lines under the user message while waiting —

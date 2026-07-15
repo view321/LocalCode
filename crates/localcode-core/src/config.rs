@@ -763,7 +763,10 @@ fn default_assistant_port() -> u16 {
     18080
 }
 fn default_assistant_ctx() -> u32 {
-    8192
+    // 128k context for the local Bonsai assistant. Long chats stay in-window and
+    // the agent auto-compacts older turns before this fills (see
+    // `AgentConfig::auto_compact` + `ActiveRuntime::context_tokens`).
+    131_072
 }
 fn default_assistant_ngl() -> i32 {
     // Offload as many layers as fit; llama.cpp clamps to model size.

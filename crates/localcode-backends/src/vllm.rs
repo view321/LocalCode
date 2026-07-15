@@ -238,6 +238,8 @@ impl InferenceBackend for VllmBackend {
         runtime.id = runtime_id;
         runtime.model_id = Some(spec.model_id);
         runtime.quantization = spec.quantization;
+        // Report the served context window so the agent compacts before overflow.
+        runtime.context_tokens = (spec.context_length > 0).then_some(spec.context_length);
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
 

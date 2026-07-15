@@ -93,7 +93,8 @@ Website (project page): open [`website/index.html`](website/index.html) or the G
    runtime rejects `stream: true` together with tools.
 
 Sessions persist by default (latest resumes on restart; `/new` starts fresh).
-Long chats auto-compact. Tools: `read`, `write`, `bash`, `ls`, `grep`, `skill`,
+Long chats auto-compact as they approach the model's context window — for every
+runtime, including the local assistant. Tools: `read`, `write`, `bash`, `ls`, `grep`, `skill`,
 `hf.model_card`, `hf.search` (Pi-style + Hugging Face catalogue). Shell stays in
 the workspace when `agent.shell_sandbox = true`.
 
@@ -115,9 +116,11 @@ On first launch LocalCode offers to install a **local assistant** based on
     --host 127.0.0.1 --port 18080 -ngl 99
 ```
 
-> The repo’s **Q4_1** file (`Bonsai-27B-dspark-Q4_1.gguf`) is a **DSpark drafter**
-> for speculative decoding (`-md`), not a standalone model. Loading it as `-m`
-> alone makes `llama-server` exit with code 1.
+> The assistant loads the **Q1_0 language model only** — no Q4 weights are ever
+> mapped into memory. The repo’s **Q4_1** file (`Bonsai-27B-dspark-Q4_1.gguf`) is
+> a **DSpark drafter** for speculative decoding (`-md`), not a standalone model
+> (loading it as `-m` alone makes `llama-server` exit with code 1), so LocalCode
+> deliberately does not download or pass it.
 
 Bonsai needs the **[PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)**
 (custom kernels) — stock ggml-org builds will not load it. LocalCode installs
@@ -129,7 +132,7 @@ that runtime automatically:
    `cmake --build build -j`.
 2. **Fallback:** download a matching prebuilt from
    [PrismML-Eng/llama.cpp releases](https://github.com/PrismML-Eng/llama.cpp/releases).
-3. **Weights:** download `Bonsai-27B-Q1_0.gguf` (+ optional DSpark Q4_1) into the
+3. **Weights:** download `Bonsai-27B-Q1_0.gguf` (Q1 only) into the
    assistant data dir.
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
@@ -142,7 +145,8 @@ that runtime automatically:
   issues. Also invoked automatically on structured errors when available.
 
 Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
-`18080`), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
+`18080`), `local_context` (default `131072` — 128k; long chats auto-compact
+before it fills), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
 
 > Set `HF_TOKEN` if the GGUF download is gated or rate-limited. For a CUDA build
 > you need the CUDA toolkit (`nvcc` on PATH) at install time.
