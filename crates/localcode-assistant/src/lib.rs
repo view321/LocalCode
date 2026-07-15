@@ -19,7 +19,7 @@ mod runtime;
 
 pub use agent::{
     assistant_workspace, ensure_workspace, hints_from_card, AssistantAgent, AssistantContext,
-    AssistantReply, AssistantRequest, ProposedFix,
+    AssistantReply, AssistantRequest, DeployToolArgs, ModelActions, ProposedFix,
 };
 pub use constants::{
     ASSISTANT_DISPLAY_NAME, ASSISTANT_MODEL_ID, ASSISTANT_SYSTEM_PROMPT, BONSAI_BYTES,
@@ -200,6 +200,7 @@ impl Assistant {
     }
 
     /// Tool-using ask with full LocalCode context (preferred by the TUI).
+    #[allow(clippy::too_many_arguments)]
     pub async fn ask_with_context(
         &self,
         full_cfg: &Config,
@@ -207,11 +208,12 @@ impl Assistant {
         ctx: AssistantContext,
         api_key: Option<&str>,
         hf: Option<Arc<HfClient>>,
+        model_ops: Option<Arc<dyn ModelActions>>,
         workspace: PathBuf,
         local_runtime: Option<&LocalAssistantRuntime>,
         approver: Option<&dyn localcode_agent::ToolApprover>,
     ) -> Result<AssistantReply, LocalCodeError> {
-        let agent = AssistantAgent::new(full_cfg, workspace, hf, &ctx);
+        let agent = AssistantAgent::new(full_cfg, workspace, hf, model_ops, &ctx);
         let user_text = if ctx.user_message.is_empty() {
             "Help me with LocalCode.".into()
         } else {

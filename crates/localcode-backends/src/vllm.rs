@@ -1,5 +1,5 @@
 use crate::{
-    capture_into_monitor, format_command, port_in_use, probe_client, spawn_exit_watch, BackendKind,
+    capture_into_monitor, port_in_use, probe_client, resolve_launch, spawn_exit_watch, BackendKind,
     DeployTuning, DetectReport, Health, InferenceBackend, ModelDeploySpec, ModelMonitors, ProcState,
     RunningEndpoint,
 };
@@ -115,12 +115,15 @@ impl InferenceBackend for VllmBackend {
             message: "Starting vLLM (model download may take a while)".into(),
         });
 
-        let args = serve_args(&model, &self.cfg.host, port, spec.context_length, &spec.tuning);
+        let built = serve_args(&model, &self.cfg.host, port, spec.context_length, &spec.tuning);
+        // Honor a full command override (from the deploy panel or assistant),
+        // else spawn the command we built. `command` is what the /dash card shows.
+        let (program, args, command) =
+            resolve_launch(&self.cfg.bin, built, spec.command_override.as_deref());
         // Pre-generate the runtime id so its `/dash` monitor captures startup
         // logs before the (potentially very long) health loop.
         let runtime_id = Uuid::new_v4();
-        let command = format_command(&self.cfg.bin, &args);
-        let mut child = tokio::process::Command::new(&self.cfg.bin)
+        let mut child = tokio::process::Command::new(&program)
             .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
@@ -326,6 +329,21 @@ fn serve_args(
         }
     }
     args
+}
+
+/// The `(program, args)` a vLLM deploy would spawn — used to seed the editable
+/// deploy-command field so "no edit" reproduces the built command exactly.
+pub(crate) fn plan_command(
+    cfg: &VllmConfig,
+    model: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> (String, Vec<String>) {
+    (
+        cfg.bin.clone(),
+        serve_args(model, &cfg.host, port, context_length, tuning),
+    )
 }
 
 /// Map vLLM's dying output to targeted hints via the shared diagnosis engine.

@@ -1,7 +1,7 @@
 use crate::{
-    capture_into_monitor, format_command, port_in_use, probe_client, resolve_llamacpp_bin,
-    spawn_exit_watch, BackendKind, DetectReport, Health, InferenceBackend, ModelDeploySpec,
-    ModelMonitors, ProcState, RunningEndpoint,
+    capture_into_monitor, port_in_use, probe_client, resolve_launch, resolve_llamacpp_bin,
+    spawn_exit_watch, BackendKind, DeployTuning, DetectReport, Health, InferenceBackend,
+    ModelDeploySpec, ModelMonitors, ProcState, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::LlamaCppConfig;
@@ -147,32 +147,18 @@ impl InferenceBackend for LlamaCppBackend {
             message: "Starting llama-server".into(),
         });
 
-        // Built as a Vec so the optional --n-gpu-layers flag can be appended.
-        let mut args: Vec<String> = vec![
-            "-m".into(),
-            model_path.clone(),
-            "--host".into(),
-            self.cfg.host.clone(),
-            "--port".into(),
-            port.to_string(),
-            "-c".into(),
-            spec.context_length.to_string(),
-        ];
-        if let Some(ngl) = spec.tuning.gpu_layers {
-            args.push("--n-gpu-layers".into());
-            args.push(ngl.to_string());
-        }
-        // Model-card / assistant recommended flags (already validated as tokens).
-        for a in &spec.tuning.extra_args {
-            if !a.is_empty() {
-                args.push(a.clone());
-            }
-        }
+        let built = build_args(&self.cfg.host, &model_path, port, spec.context_length, &spec.tuning);
+        // Honor a full command override (deploy panel / assistant), else the
+        // command we built. `command` is what the /dash card shows.
+        let (program, args, command) = resolve_launch(
+            &bin.display().to_string(),
+            built,
+            spec.command_override.as_deref(),
+        );
         // Pre-generate the runtime id so its `/dash` monitor exists (and captures
         // startup logs) before the health loop.
         let runtime_id = Uuid::new_v4();
-        let command = format_command(&bin.display().to_string(), &args);
-        let mut child = tokio::process::Command::new(&bin)
+        let mut child = tokio::process::Command::new(&program)
             .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
@@ -301,4 +287,53 @@ impl InferenceBackend for LlamaCppBackend {
             }),
         }
     }
+}
+
+/// Build the `llama-server …` argument list (without the binary).
+fn build_args(
+    host: &str,
+    model_path: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        model_path.to_string(),
+        "--host".into(),
+        host.to_string(),
+        "--port".into(),
+        port.to_string(),
+        "-c".into(),
+        context_length.to_string(),
+    ];
+    if let Some(ngl) = tuning.gpu_layers {
+        args.push("--n-gpu-layers".into());
+        args.push(ngl.to_string());
+    }
+    // Model-card / assistant recommended flags (already validated as tokens).
+    for a in &tuning.extra_args {
+        if !a.is_empty() {
+            args.push(a.clone());
+        }
+    }
+    args
+}
+
+/// The `(program, args)` a llama.cpp deploy would spawn — used to seed the
+/// editable deploy-command field. `model_path` is the local GGUF path (or the
+/// model id as a placeholder before download).
+pub(crate) fn plan_command(
+    cfg: &LlamaCppConfig,
+    model_path: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> (String, Vec<String>) {
+    let bin = AppPaths::resolve()
+        .ok()
+        .and_then(|p| resolve_llamacpp_bin(&cfg.bin, &p))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| cfg.bin.clone());
+    (bin, build_args(&cfg.host, model_path, port, context_length, tuning))
 }

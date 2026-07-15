@@ -66,6 +66,9 @@ pub enum ConfirmAction {
     ApplyRepair,
     /// Install the bundled local Bonsai assistant (PrismML llama.cpp + Q4_1 GGUF).
     InstallLocalAssistant,
+    /// Delete a downloaded model's weights from disk. The target model id is held
+    /// in `App::pending_delete_model` (kept out of here so the enum stays `Copy`).
+    DeleteModel,
 }
 
 #[derive(Debug, Clone)]

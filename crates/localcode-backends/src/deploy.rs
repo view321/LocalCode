@@ -27,6 +27,10 @@ pub struct DeployRequest {
     /// plus optional extra CLI flags from the model card / assistant).
     #[serde(default)]
     pub tuning: crate::DeployTuning,
+    /// Full launch command entered by the user (or assistant) that replaces the
+    /// backend-built one. `None` = build the command from the fields above.
+    #[serde(default)]
+    pub command_override: Option<String>,
     /// User acknowledged oversize warning.
     pub continue_despite_oversize: bool,
 }
@@ -186,6 +190,7 @@ impl DeployService {
             context_length: req.context_length,
             force_oversize: req.continue_despite_oversize,
             tuning: req.tuning.clone(),
+            command_override: req.command_override.clone(),
         };
 
         let endpoint = backend.deploy(spec, &self.events).await?;
@@ -237,6 +242,9 @@ impl DeployService {
 
         let dir = self.models_dir.join(sanitize_dir(&req.model_id));
         std::fs::create_dir_all(&dir).map_err(LocalCodeError::from)?;
+        // Record the exact HF id so the on-disk store can reverse the lossy
+        // directory-name sanitization when listing downloaded models later.
+        crate::models_store::write_marker(&dir, &req.model_id);
 
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -488,6 +496,37 @@ fn sanitize_dir(s: &str) -> String {
         .collect()
 }
 
+/// Preview the exact launch command a deploy would run, so the deploy panel (and
+/// the assistant) can show it as an editable field whose "no edit" value
+/// reproduces the built command byte-for-byte. Empty for Ollama, which has no
+/// spawned process to override. `model` is the local weight path when known,
+/// else the HF model id.
+pub fn preview_deploy_command(
+    cfg: &localcode_core::config::BackendsConfig,
+    backend: BackendKind,
+    model: &str,
+    port: Option<u16>,
+    context_length: u32,
+    tuning: &crate::DeployTuning,
+) -> String {
+    let (program, args) = match backend {
+        BackendKind::Vllm => {
+            let p = port.unwrap_or(cfg.vllm.port);
+            crate::vllm::plan_command(&cfg.vllm, model, p, context_length, tuning)
+        }
+        BackendKind::LlamaCpp => {
+            let p = port.unwrap_or(cfg.llamacpp.port);
+            crate::llamacpp::plan_command(&cfg.llamacpp, model, p, context_length, tuning)
+        }
+        BackendKind::Sglang => {
+            let p = port.unwrap_or(cfg.sglang.port);
+            crate::sglang::plan_command(&cfg.sglang, model, p, context_length, tuning)
+        }
+        BackendKind::Ollama => return String::new(),
+    };
+    crate::format_command(&program, &args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +576,7 @@ mod tests {
             port: None,
             context_length: 8192,
             tuning: crate::DeployTuning::default(),
+            command_override: None,
             continue_despite_oversize: false,
         }
     }

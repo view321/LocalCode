@@ -27,14 +27,16 @@ use localcode_api_client::ApiClient;
 use localcode_assistant::{
     ensure_running, extract_deploy_hints, install_local_assistant, install_need, install_offer_body,
     is_installed, quant_compatibility_note, should_offer_install, startup_greeting, Assistant,
-    AssistantContext, LocalAssistantRuntime, ASSISTANT_DISPLAY_NAME, BONSAI_FILE, InstallNeed,
+    AssistantContext, DeployToolArgs, LocalAssistantRuntime, ModelActions, ASSISTANT_DISPLAY_NAME,
+    BONSAI_FILE, InstallNeed,
 };
 use localcode_backends::{
-    can_elevate_noninteractively, diagnose, ensure_llamacpp_installed, resolve_install_plan,
-    resolve_llamacpp_bin, resolve_repair, run_install, run_repair, smoke_test, BackendKind,
-    BackendRegistry, DashSnapshot, DeployRequest, DeployService, DeployTuning, DetectReport,
-    Diagnosis, InstallPlan, ProcState, RepairPlan, Repoint, SmokeReport, DASH_LOG_CAP,
-    DEFAULT_DEPLOY_CTX,
+    can_elevate_noninteractively, delete_downloaded, diagnose, ensure_llamacpp_installed,
+    human_size, list_downloaded, preview_deploy_command, resolve_install_plan,
+    resolve_llamacpp_bin, resolve_repair, run_install, run_repair, sanitize_model_dir, smoke_test,
+    BackendKind, BackendRegistry, DashSnapshot, DeployRequest, DeployService, DeployTuning,
+    DetectReport, Diagnosis, DownloadedModel, InstallPlan, OpenWebUi, OpenWebUiHandle, ProcState,
+    RepairPlan, Repoint, SmokeReport, DASH_LOG_CAP, DEFAULT_DEPLOY_CTX, OPENWEBUI_DEFAULT_PORT,
 };
 use localcode_core::config::LocalAssistantPreference;
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
@@ -214,6 +216,12 @@ pub enum ClickTarget {
     DashUse(usize),
     /// Copy the captured error of a model that exited non-zero.
     DashCopyErr(usize),
+    /// Deploy this downloaded (not-running) model.
+    DashDeploy(usize),
+    /// Delete this downloaded model's weights from disk.
+    DashDelete(usize),
+    /// Toggle this model's favourite state.
+    DashFavorite(usize),
     /// Start a new model (opens the Models search/deploy view).
     DashStartNew,
     // Sessions (past chats) — one region over the visible rows; the row index
@@ -269,6 +277,9 @@ pub enum DeployField {
     TensorParallel,
     /// Layers to offload to GPU. llama.cpp `--n-gpu-layers`, Ollama `num_gpu`.
     GpuLayers,
+    /// Full launch command, editable directly. Blank = build it from the fields
+    /// above; anything else is spawned verbatim (shell-split by the backend).
+    Command,
 }
 
 impl DeployField {
@@ -280,6 +291,7 @@ impl DeployField {
             DeployField::GpuMemFraction => "gpu mem",
             DeployField::TensorParallel => "tensor par",
             DeployField::GpuLayers => "gpu layers",
+            DeployField::Command => "command",
         }
     }
 }
@@ -393,6 +405,54 @@ pub struct DashCard {
     /// Whether a Stop button applies (false for a reused/external server we
     /// still surface but manage elsewhere).
     pub can_stop: bool,
+    /// This running card's index into `all_runtimes()` (drives use/stop, which
+    /// address runtimes positionally). `None` for downloaded-only / OpenWebUI.
+    pub runtime_index: Option<usize>,
+    /// The HF model id, when this card corresponds to a model (drives the
+    /// favourite / delete / deploy buttons). `None` for the OpenWebUI card.
+    pub model_id: Option<String>,
+    /// Whether the model is starred (favourites render first).
+    pub is_favorite: bool,
+    /// Size of the model's weights on disk, when downloaded.
+    pub disk_bytes: Option<u64>,
+    /// This model has weights on disk but isn't running — offer Deploy.
+    pub can_deploy: bool,
+    /// Weights on disk and not currently running — offer Delete.
+    pub can_delete: bool,
+    /// The OpenWebUI infrastructure card (rendered specially, no fav/delete).
+    pub is_openwebui: bool,
+    /// A browser/endpoint URL to surface (OpenWebUI page, or runtime base_url).
+    pub url: Option<String>,
+}
+
+impl DashCard {
+    /// A neutral card with only the common fields set; builders fill the rest.
+    fn base(name: String, backend_label: String) -> Self {
+        DashCard {
+            name,
+            backend_label,
+            status_label: String::new(),
+            status_is_error: false,
+            glyph: "○",
+            command: String::new(),
+            logs: Vec::new(),
+            vram_bytes: None,
+            tok_per_sec: None,
+            ctx_used: None,
+            ctx_max: 1,
+            error_text: None,
+            is_active: false,
+            can_stop: false,
+            runtime_index: None,
+            model_id: None,
+            is_favorite: false,
+            disk_bytes: None,
+            can_deploy: false,
+            can_delete: false,
+            is_openwebui: false,
+            url: None,
+        }
+    }
 }
 
 /// Kinds of foreground background-work (one at a time; Esc cancels).
@@ -414,6 +474,27 @@ pub struct Busy {
     pub label: String,
     pub started: Instant,
     handle: JoinHandle<()>,
+}
+
+/// A coding turn that is still running for a session the user has switched away
+/// from. Its task keeps running (detached) and persists to that session's store
+/// on its own `Arc` clones, so switching sessions never loses progress. We
+/// retain the transcript snapshot taken at switch time so returning to the
+/// session restores its view, and the handle so we can abort it on quit.
+struct BgChat {
+    handle: JoinHandle<()>,
+    started: Instant,
+    /// The session + store `Arc`s the detached task shares. Held so returning to
+    /// the session re-attaches the very same in-memory state the turn is mutating.
+    session: Arc<AsyncMutex<AgentSession>>,
+    session_store: Arc<AsyncMutex<Option<SessionStore>>>,
+    /// Transcript as it looked when the user switched away (includes the
+    /// in-flight user message). The final reply is appended when the turn ends.
+    transcript: Vec<TranscriptEntry>,
+    ctx_used: u32,
+    /// True once the turn has completed (result persisted); kept so a returning
+    /// user still sees the "finished" transcript without a disk reload race.
+    done: bool,
 }
 
 /// The last failed operation, so the error modal's Retry button can actually
@@ -485,9 +566,17 @@ pub enum BgMsg {
     SearchDone(Result<Vec<ModelSummary>, LocalCodeError>),
     DetailDone(Result<ModelDetail, LocalCodeError>),
     DeployEnded(DeployOutcome),
-    /// Live progress from a running coding turn (streamed tokens, tools).
-    CodingEvent(AgentEvent),
-    CodingDone(Result<String, LocalCodeError>),
+    /// Live progress from a running coding turn (streamed tokens, tools). Tagged
+    /// with the session it belongs to so background turns don't corrupt whichever
+    /// session is in the foreground.
+    CodingEvent {
+        session_id: String,
+        ev: AgentEvent,
+    },
+    CodingDone {
+        session_id: String,
+        result: Result<String, LocalCodeError>,
+    },
     ToolConfirm {
         description: String,
         respond: oneshot::Sender<bool>,
@@ -541,6 +630,11 @@ pub enum BgMsg {
         server_idx: usize,
         result: Result<Box<RemoteSession>, LocalCodeError>,
     },
+    /// Deployed/downloaded model set changed (deploy/stop/delete via a tool):
+    /// refresh the runtime list and the on-disk downloaded models.
+    ModelsChanged,
+    /// An OpenWebUI deploy (`/ui` or the assistant tool) finished.
+    OpenWebUiReady(Result<Box<OpenWebUiHandle>, LocalCodeError>),
 }
 
 /// Bridges the agent's destructive-command approval to a TUI modal.
@@ -563,6 +657,190 @@ impl ToolApprover for ChannelApprover {
             return false;
         }
         rx.await.unwrap_or(false)
+    }
+}
+
+/// Backend-management capability handed to the assistant so it can deploy, stop,
+/// delete, and list models on the user's behalf (feature: "assistant deploys the
+/// models themselves"). Holds cheap clones/`Arc`s so it can move into the
+/// assistant's background task and reach the same live registry the UI uses — a
+/// model the assistant deploys therefore appears on `/dash` exactly like a
+/// manual deploy. UI-visible changes are signalled back via [`BgMsg`].
+struct ModelOps {
+    registry: Arc<BackendRegistry>,
+    events: EventBus,
+    gpu: GpuInventory,
+    paths: AppPaths,
+    config: Config,
+    tx: mpsc::UnboundedSender<BgMsg>,
+}
+
+#[async_trait]
+impl ModelActions for ModelOps {
+    async fn deploy(&self, args: DeployToolArgs) -> Result<String, LocalCodeError> {
+        let backend = args
+            .backend
+            .as_deref()
+            .and_then(BackendKind::parse)
+            .unwrap_or_else(|| self.registry.default_kind(&self.config));
+        let model_id = args.model_id.clone();
+
+        // Enrich with quant metadata (weights / urls / size) exactly like the
+        // CLI and deploy panel, so fit prediction and llama.cpp downloads work.
+        let mut quantization = args.quant.clone();
+        let mut weight_bytes = 0u64;
+        let mut weight_files: Vec<String> = vec![];
+        let mut download_urls: Vec<String> = vec![];
+        if model_id.contains('/') {
+            if let Ok(hf) = HfClient::new(
+                &self.config.registry,
+                self.config.hf_token(),
+                self.paths.models_cache.clone(),
+            ) {
+                if let Ok(detail) = hf.model_info(&model_id).await {
+                    let group = match &quantization {
+                        Some(q) => detail.quants.iter().find(|g| g.label.eq_ignore_ascii_case(q)),
+                        None => detail.quants.first(),
+                    };
+                    if let Some(g) = group {
+                        quantization = Some(g.label.clone());
+                        weight_bytes = g.total_size;
+                        weight_files = g.files.iter().map(|f| f.filename.clone()).collect();
+                        download_urls =
+                            weight_files.iter().map(|f| hf.download_url(&model_id, f)).collect();
+                    }
+                }
+            }
+        }
+
+        let req = DeployRequest {
+            model_id: model_id.clone(),
+            quantization,
+            weight_bytes,
+            weight_files,
+            download_urls,
+            local_path: None,
+            backend,
+            port: args.port,
+            context_length: args.context.unwrap_or(DEFAULT_DEPLOY_CTX),
+            tuning: DeployTuning::default(),
+            command_override: args.command.clone(),
+            // Tool-driven deploy: proceed past the VRAM soft-gate (it may spill
+            // to RAM/CPU or fail loudly rather than silently blocking).
+            continue_despite_oversize: true,
+        };
+        let svc = DeployService::new(
+            self.registry.clone(),
+            self.events.clone(),
+            self.gpu.clone(),
+            self.paths.models_cache.clone(),
+            self.config.hf_token(),
+            self.config.hf_mirror_hosts(),
+        );
+        svc.deploy(req).await?;
+        let _ = self.tx.send(BgMsg::ModelsChanged);
+        Ok(format!(
+            "Deployed {model_id} on {}. It is on /dash and selectable for chat.",
+            backend.as_str()
+        ))
+    }
+
+    async fn stop(&self, target: &str) -> Result<String, LocalCodeError> {
+        let t = target.trim();
+        if t.eq_ignore_ascii_case("ui")
+            || t.eq_ignore_ascii_case("openwebui")
+            || t.contains("open-webui")
+        {
+            OpenWebUi::stop_by_name().await;
+            let _ = self.tx.send(BgMsg::ModelsChanged);
+            return Ok("Stopped OpenWebUI.".into());
+        }
+        let runtimes = self.registry.list_runtimes().await;
+        let found = runtimes.iter().find(|r| {
+            r.id.to_string() == t
+                || r.name == t
+                || r.name.contains(t)
+                || r.model_id.as_deref() == Some(t)
+        });
+        let Some(rt) = found else {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendNotFound,
+                format!("No running runtime matching '{t}'"),
+            )
+            .with_hint("Use list_deployments to see names/ids"));
+        };
+        let id = rt.id.to_string();
+        let name = rt.name.clone();
+        self.registry.stop_runtime(&id).await?;
+        let _ = self.tx.send(BgMsg::ModelsChanged);
+        Ok(format!("Stopped {name} and freed its VRAM."))
+    }
+
+    async fn list_deployments(&self) -> Result<String, LocalCodeError> {
+        let runtimes = self.registry.list_runtimes().await;
+        if runtimes.is_empty() {
+            return Ok("No models are currently running. Use deploy_model to start one.".into());
+        }
+        let lines: Vec<String> = runtimes
+            .iter()
+            .map(|r| {
+                format!(
+                    "- {} ({:?}) status={:?} url={}",
+                    r.name, r.kind, r.status, r.base_url
+                )
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    async fn list_downloaded(&self) -> Result<String, LocalCodeError> {
+        let models = list_downloaded(&self.paths.models_cache);
+        if models.is_empty() {
+            return Ok("No models are downloaded on disk yet.".into());
+        }
+        let lines: Vec<String> = models
+            .iter()
+            .map(|m| {
+                let quants = if m.quants.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", m.quants.join(", "))
+                };
+                format!("- {} — {}{}", m.model_id, human_size(m.total_bytes), quants)
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    async fn delete_model(&self, model_id: &str) -> Result<String, LocalCodeError> {
+        // Refuse to delete weights that a running runtime is serving.
+        let runtimes = self.registry.list_runtimes().await;
+        if runtimes.iter().any(|r| r.model_id.as_deref() == Some(model_id)) {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("{model_id} is currently running — stop it before deleting"),
+            )
+            .with_hint("Use stop_model first"));
+        }
+        let freed = delete_downloaded(&self.paths.models_cache, model_id)?;
+        let _ = self.tx.send(BgMsg::ModelsChanged);
+        Ok(format!("Deleted {model_id} — freed {}.", human_size(freed)))
+    }
+
+    async fn deploy_ui(&self) -> Result<String, LocalCodeError> {
+        let urls: Vec<String> = self
+            .registry
+            .list_runtimes()
+            .await
+            .iter()
+            .map(|r| r.base_url.clone())
+            .collect();
+        let handle = OpenWebUi::deploy(OPENWEBUI_DEFAULT_PORT, urls).await?;
+        let url = handle.url().to_string();
+        let _ = self.tx.send(BgMsg::OpenWebUiReady(Ok(Box::new(handle))));
+        Ok(format!(
+            "OpenWebUI is starting at {url} (ready in ~30s), wired to your deployed models."
+        ))
     }
 }
 
@@ -696,7 +974,22 @@ pub struct App {
     /// Which deploy parameter is being edited inline (Models view), if any.
     deploy_editing: Option<DeployField>,
     deploy_field_edit: String,
+    /// Full launch-command override from the deploy panel's command field.
+    /// `None` = build the command from the fields; `Some` = spawn this verbatim.
+    deploy_command_override: Option<String>,
     pub deploy_progress: u8,
+    /// Models with weights on disk (cached; refreshed on enter/deploy/delete).
+    /// Backs the `/models` "downloaded" tag and the `/dash` downloaded section.
+    pub downloaded_models: Vec<DownloadedModel>,
+    /// Running OpenWebUI container (from `/ui` or the assistant tool), if any.
+    pub openwebui: Option<OpenWebUiHandle>,
+    /// A `/ui` deploy is in flight (Docker pull/run).
+    pub openwebui_busy: bool,
+    /// Model id awaiting a delete confirmation (paired with `ConfirmAction::DeleteModel`).
+    pending_delete_model: Option<String>,
+    /// Coding turns running for sessions the user has switched away from, keyed
+    /// by session id. Backs "switch /sessions without losing progress".
+    bg_chats: std::collections::HashMap<String, BgChat>,
     /// Local Bonsai weights + llama-server are present.
     pub local_assistant_ready: bool,
     /// Live handle for the local Bonsai assistant (`llama-server -m … Q4_1`).
@@ -802,6 +1095,10 @@ impl App {
             .build()
             .unwrap_or_default();
 
+        // Enumerate models already on disk once at startup (refreshed later on
+        // deploy/delete and when entering /models or /dash).
+        let downloaded_models = list_downloaded(&paths.models_cache);
+
         let mut app = Self {
             theme: Theme::new(config.ui.theme),
             mouse_capture: config.ui.mouse,
@@ -882,7 +1179,13 @@ impl App {
             deploy_hints_notes: Vec::new(),
             deploy_editing: None,
             deploy_field_edit: String::new(),
+            deploy_command_override: None,
             deploy_progress: 0,
+            downloaded_models,
+            openwebui: None,
+            openwebui_busy: false,
+            pending_delete_model: None,
+            bg_chats: std::collections::HashMap::new(),
             local_assistant_ready,
             local_assistant: None,
             assistant_install_busy: None,
@@ -1072,7 +1375,9 @@ impl App {
             .map(|s| (s.runtime_id.clone(), s))
             .collect();
 
-        let mut cards = Vec::with_capacity(runtimes.len());
+        // 1) Running-runtime cards. Each carries its all_runtimes() index so the
+        // use/stop actions still address runtimes positionally after we reorder.
+        let mut running = Vec::with_capacity(runtimes.len());
         for (i, rt) in runtimes.iter().enumerate() {
             let is_active = i == active;
             // Per-model live metrics: only the active model streams / holds the
@@ -1084,16 +1389,88 @@ impl App {
                 (None, self.deploy_ctx.max(1))
             };
 
-            let card = if assistant_offset == 1 && i == 0 {
+            let mut card = if assistant_offset == 1 && i == 0 {
                 self.dash_card_assistant(rt, is_active, tok_per_sec, ctx_used, ctx_max)
             } else if i >= assistant_offset && i < assistant_offset + reg_len {
                 self.dash_card_registry(rt, &snaps, is_active, tok_per_sec, ctx_used, ctx_max)
             } else {
                 self.dash_card_remote(rt, is_active, tok_per_sec, ctx_used, ctx_max)
             };
-            cards.push(card);
+            card.runtime_index = Some(i);
+            card.model_id = rt.model_id.clone();
+            card.url = Some(rt.base_url.clone());
+            if let Some(mid) = &rt.model_id {
+                card.is_favorite = self.config.is_favorite(mid);
+                card.disk_bytes = self
+                    .downloaded_models
+                    .iter()
+                    .find(|m| sanitize_model_dir(&m.model_id) == sanitize_model_dir(mid))
+                    .map(|m| m.total_bytes);
+            }
+            running.push(card);
         }
+
+        // 2) Downloaded-only cards: models with weights on disk that aren't
+        // currently running. These show size + Deploy/Delete buttons.
+        let running_ids: std::collections::HashSet<String> = runtimes
+            .iter()
+            .filter_map(|r| r.model_id.as_ref().map(|m| sanitize_model_dir(m)))
+            .collect();
+        for m in &self.downloaded_models {
+            if running_ids.contains(&sanitize_model_dir(&m.model_id)) {
+                continue;
+            }
+            let mut card = DashCard::base(m.model_id.clone(), "on disk".into());
+            card.glyph = "▪";
+            card.status_label = "downloaded".into();
+            card.model_id = Some(m.model_id.clone());
+            card.is_favorite = self.config.is_favorite(&m.model_id);
+            card.disk_bytes = Some(m.total_bytes);
+            card.can_deploy = true;
+            card.can_delete = true;
+            card.command = if m.quants.is_empty() {
+                human_size(m.total_bytes)
+            } else {
+                format!("{} · {}", m.quants.join(", "), human_size(m.total_bytes))
+            };
+            card.logs = vec![format!("weights on disk: {}", m.dir.display())];
+            running.push(card);
+        }
+
+        // 3) Order: favourites first, then running before downloaded, then name.
+        running.sort_by(|a, b| {
+            b.is_favorite
+                .cmp(&a.is_favorite)
+                .then(b.runtime_index.is_some().cmp(&a.runtime_index.is_some()))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+
+        // 4) The OpenWebUI card (infrastructure) pins to the top when running.
+        let mut cards = Vec::with_capacity(running.len() + 1);
+        if let Some(ui) = &self.openwebui {
+            cards.push(self.dash_card_openwebui(ui));
+        }
+        cards.extend(running);
         cards
+    }
+
+    fn dash_card_openwebui(&self, ui: &OpenWebUiHandle) -> DashCard {
+        let (glyph, status, is_err) = match ui.state() {
+            ProcState::Running => ("●", "running".to_string(), false),
+            ProcState::Starting => ("◐", "starting".to_string(), false),
+            ProcState::Exited { ok: false, .. } => ("✗", "exited".to_string(), true),
+            _ => ("○", "stopped".to_string(), false),
+        };
+        let mut card = DashCard::base("OpenWebUI".into(), "openwebui".into());
+        card.glyph = glyph;
+        card.status_label = status;
+        card.status_is_error = is_err;
+        card.command = ui.command().to_string();
+        card.logs = ui.recent_logs(3);
+        card.can_stop = true;
+        card.is_openwebui = true;
+        card.url = Some(ui.url().to_string());
+        card
     }
 
     fn dash_card_assistant(
@@ -1123,6 +1500,14 @@ impl App {
             error_text: None,
             is_active,
             can_stop: true,
+            runtime_index: None,
+            model_id: None,
+            is_favorite: false,
+            disk_bytes: None,
+            can_deploy: false,
+            can_delete: false,
+            is_openwebui: false,
+            url: None,
         }
     }
 
@@ -1168,6 +1553,14 @@ impl App {
             error_text: snap.and_then(|s| s.error_text()),
             is_active,
             can_stop: true,
+            runtime_index: None,
+            model_id: None,
+            is_favorite: false,
+            disk_bytes: None,
+            can_deploy: false,
+            can_delete: false,
+            is_openwebui: false,
+            url: None,
         }
     }
 
@@ -1194,6 +1587,14 @@ impl App {
             error_text: None,
             is_active,
             can_stop: true,
+            runtime_index: None,
+            model_id: None,
+            is_favorite: false,
+            disk_bytes: None,
+            can_deploy: false,
+            can_delete: false,
+            is_openwebui: false,
+            url: None,
         }
     }
 
@@ -1210,22 +1611,123 @@ impl App {
         self.set_status(format!("Copied {what} to clipboard"), false);
     }
 
-    /// Stop the model at `all_runtimes()` index `idx` (dash Stop button).
-    fn dash_stop(&mut self, idx: usize) {
-        self.runtime_selected = idx;
-        self.start_stop_runtime();
-    }
-
-    /// Make the model at `all_runtimes()` index `idx` the active one for the
-    /// next request (dash card / Use button).
-    fn dash_use(&mut self, idx: usize) {
-        let n = self.all_runtimes().len();
-        if idx >= n {
+    /// Stop the runtime/OpenWebUI backing dash card `card_idx` (Stop button).
+    fn dash_stop(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        let Some(card) = cards.get(card_idx) else {
+            return;
+        };
+        if card.is_openwebui {
+            self.stop_openwebui();
             return;
         }
-        self.runtime_selected = idx;
-        if let Some(name) = self.all_runtimes().get(idx).map(|r| r.name.clone()) {
-            self.set_status(format!("Next request uses {name}"), false);
+        if let Some(ri) = card.runtime_index {
+            self.runtime_selected = ri;
+            self.start_stop_runtime();
+        }
+    }
+
+    /// Clicking dash card `card_idx`: a running card becomes the active runtime;
+    /// a downloaded-only card offers to deploy it; the OpenWebUI card copies its
+    /// URL.
+    fn dash_use(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        let Some(card) = cards.get(card_idx) else {
+            return;
+        };
+        if let Some(ri) = card.runtime_index {
+            if let Some(name) = self.all_runtimes().get(ri).map(|r| r.name.clone()) {
+                self.runtime_selected = ri;
+                self.set_status(format!("Next request uses {name}"), false);
+            }
+        } else if card.is_openwebui {
+            if let Some(url) = card.url.clone() {
+                self.copy_to_clipboard(&url, "OpenWebUI URL");
+            }
+        } else if card.can_deploy {
+            self.dash_deploy(card_idx);
+        }
+    }
+
+    /// Deploy the downloaded model backing dash card `card_idx` (Deploy button).
+    /// Opens the Models view seeded with that model so the user confirms the
+    /// backend/quant, matching how a normal deploy is reviewed.
+    fn dash_deploy(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        let Some(model_id) = cards.get(card_idx).and_then(|c| c.model_id.clone()) else {
+            return;
+        };
+        self.set_mode(Mode::Models);
+        self.model_query = model_id.clone();
+        self.start_load_detail_for(&model_id);
+        self.set_status(
+            format!("Loading {model_id} — pick a quant/backend, then Deploy"),
+            false,
+        );
+    }
+
+    /// Toggle the favourite state of the model backing dash card `card_idx`.
+    fn dash_favorite(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        if let Some(model_id) = cards.get(card_idx).and_then(|c| c.model_id.clone()) {
+            self.toggle_favorite_model(&model_id);
+        }
+    }
+
+    /// Ask to delete the downloaded weights backing dash card `card_idx`.
+    fn dash_delete(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        let Some(card) = cards.get(card_idx) else {
+            return;
+        };
+        let Some(model_id) = card.model_id.clone() else {
+            return;
+        };
+        if !card.can_delete {
+            self.set_status("Stop the model before deleting its weights", true);
+            return;
+        }
+        let size = card
+            .disk_bytes
+            .map(human_size)
+            .unwrap_or_else(|| "its".into());
+        self.pending_delete_model = Some(model_id.clone());
+        self.modal = Some(ModalState::confirm(
+            format!("Delete {model_id}?"),
+            format!(
+                "Remove {size} of downloaded weights from disk. This frees space; the \
+                 model must be re-downloaded before it can be deployed again."
+            ),
+            ConfirmAction::DeleteModel,
+        ));
+    }
+
+    /// Perform the delete confirmed by the modal.
+    fn confirm_delete_model(&mut self) {
+        let Some(model_id) = self.pending_delete_model.take() else {
+            return;
+        };
+        match delete_downloaded(&self.paths.models_cache, &model_id) {
+            Ok(freed) => {
+                self.refresh_downloaded();
+                self.set_status(format!("Deleted {model_id} — freed {}", human_size(freed)), false);
+            }
+            Err(e) => self.raise_error(e),
+        }
+    }
+
+    /// Stop and forget the running OpenWebUI container.
+    fn stop_openwebui(&mut self) {
+        if let Some(ui) = self.openwebui.take() {
+            self.set_status("Stopping OpenWebUI…", false);
+            tokio::spawn(async move {
+                ui.stop().await;
+            });
+        } else {
+            // Nothing tracked, but a stale container may exist — clean up by name.
+            tokio::spawn(async move {
+                OpenWebUi::stop_by_name().await;
+            });
         }
     }
 
@@ -1752,16 +2254,23 @@ impl App {
     }
 
     fn start_load_detail(&mut self) {
+        let Some(id) = self.models.get(self.model_selected).map(|m| m.id.clone()) else {
+            return;
+        };
+        self.start_load_detail_for(&id);
+    }
+
+    /// Load the HF detail card for an explicit model id (used by `/dash`'s Deploy
+    /// button, which acts on a downloaded model that isn't in the search list).
+    fn start_load_detail_for(&mut self, id: &str) {
         if self.fg_busy() {
             self.set_status("Busy — Esc to cancel first", false);
             return;
         }
-        let Some(id) = self.models.get(self.model_selected).map(|m| m.id.clone()) else {
-            return;
-        };
         let Some(hf) = self.hf.clone() else {
             return;
         };
+        let id = id.to_string();
         let tx = self.bg_tx.clone();
         let label = format!("Loading {id}");
         let handle = tokio::spawn(async move {
@@ -1863,6 +2372,7 @@ impl App {
                 // Filled by the local assistant when auto_deploy_hints is on.
                 extra_args: self.deploy_extra_args.clone(),
             },
+            command_override: self.deploy_command_override.clone(),
             continue_despite_oversize: continue_oversize,
         })
     }
@@ -1880,12 +2390,52 @@ impl App {
                 DeployField::Port,
                 DeployField::GpuMemFraction,
                 DeployField::TensorParallel,
+                DeployField::Command,
             ],
-            BackendKind::LlamaCpp => {
-                vec![DeployField::Context, DeployField::Port, DeployField::GpuLayers]
-            }
+            BackendKind::LlamaCpp => vec![
+                DeployField::Context,
+                DeployField::Port,
+                DeployField::GpuLayers,
+                DeployField::Command,
+            ],
+            // Ollama is a shared server we don't spawn — no launch command to edit.
             BackendKind::Ollama => vec![DeployField::Context, DeployField::GpuLayers],
         }
+    }
+
+    /// The launch command a deploy would run right now, given the current
+    /// selection (model, backend, params). Seeds the editable command field so
+    /// "no edit" reproduces the built command. Empty for Ollama.
+    pub fn deploy_command_seed(&self) -> String {
+        let model_id = self.current_model_id().unwrap_or_default();
+        let model_str = if self.deploy_backend == BackendKind::LlamaCpp {
+            // Prefer a downloaded local GGUF path when we already have one.
+            self.downloaded_models
+                .iter()
+                .find(|m| sanitize_model_dir(&m.model_id) == sanitize_model_dir(&model_id))
+                .and_then(|m| {
+                    m.files
+                        .iter()
+                        .find(|f| f.ends_with(".gguf"))
+                        .map(|f| m.dir.join(f).display().to_string())
+                })
+                .unwrap_or_else(|| model_id.clone())
+        } else {
+            model_id.clone()
+        };
+        preview_deploy_command(
+            &self.config.backends,
+            self.deploy_backend,
+            &model_str,
+            self.deploy_port,
+            self.deploy_ctx,
+            &DeployTuning {
+                gpu_memory_fraction: self.deploy_gpu_frac,
+                tensor_parallel: self.deploy_tensor_parallel,
+                gpu_layers: self.deploy_gpu_layers,
+                extra_args: self.deploy_extra_args.clone(),
+            },
+        )
     }
 
     /// Which deploy field is being edited inline (for the renderer).
@@ -1918,6 +2468,10 @@ impl App {
                 .deploy_gpu_layers
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "auto".into()),
+            DeployField::Command => self
+                .deploy_command_override
+                .clone()
+                .unwrap_or_else(|| self.deploy_command_seed()),
         }
     }
 
@@ -1937,6 +2491,12 @@ impl App {
             DeployField::GpuLayers => {
                 self.deploy_gpu_layers.map(|n| n.to_string()).unwrap_or_default()
             }
+            // Seed with the current override, else the built command, so the
+            // user edits a full, working command line rather than a blank field.
+            DeployField::Command => self
+                .deploy_command_override
+                .clone()
+                .unwrap_or_else(|| self.deploy_command_seed()),
         };
         self.deploy_editing = Some(field);
         self.set_status(
@@ -2021,10 +2581,30 @@ impl App {
                     ok = false;
                 }
             }
+            DeployField::Command => {
+                // Blank, or identical to the freshly-built command, means "use
+                // the built command" (no override) so later field edits still
+                // take effect. Anything else is spawned verbatim.
+                if blank || raw == self.deploy_command_seed() {
+                    self.deploy_command_override = None;
+                } else {
+                    self.deploy_command_override = Some(raw.clone());
+                }
+            }
         }
         if ok {
-            self.refresh_fit();
-            self.set_status(format!("{} set", field.label()), false);
+            // The command field doesn't affect the VRAM fit estimate.
+            if field != DeployField::Command {
+                self.refresh_fit();
+            }
+            let msg = match field {
+                DeployField::Command if self.deploy_command_override.is_some() => {
+                    "custom deploy command set".to_string()
+                }
+                DeployField::Command => "using the built deploy command".to_string(),
+                _ => format!("{} set", field.label()),
+            };
+            self.set_status(msg, false);
         } else {
             self.set_status(format!("Invalid {} value", field.label()), true);
         }
@@ -2241,6 +2821,96 @@ impl App {
         self.spawn_assistant_turn(true);
     }
 
+    /// Re-scan the models cache for downloaded weights (cheap; sync).
+    fn refresh_downloaded(&mut self) {
+        self.downloaded_models = list_downloaded(&self.paths.models_cache);
+    }
+
+    /// True when a model's weights are on disk (drives the /models "downloaded"
+    /// tag). Matches by the deterministic sanitized cache-directory name.
+    pub fn is_downloaded(&self, model_id: &str) -> bool {
+        let dir = sanitize_model_dir(model_id);
+        self.downloaded_models
+            .iter()
+            .any(|m| m.model_id == model_id || sanitize_model_dir(&m.model_id) == dir)
+    }
+
+    /// The model currently in focus in `/models`: the loaded detail, else the
+    /// highlighted search result. Used by `/favorite` with no argument.
+    fn current_model_id(&self) -> Option<String> {
+        if let Some(d) = &self.model_detail {
+            return Some(d.summary.id.clone());
+        }
+        self.models.get(self.model_selected).map(|m| m.id.clone())
+    }
+
+    /// Star / unstar a model and persist the change.
+    fn toggle_favorite_model(&mut self, id: &str) {
+        let now_fav = self.config.toggle_favorite(id);
+        if let Err(e) = self.config.save(&self.paths) {
+            self.raise_error(e);
+            return;
+        }
+        self.set_status(
+            if now_fav {
+                format!("★ Favourited {id} — shows first on /dash")
+            } else {
+                format!("☆ Unfavourited {id}")
+            },
+            false,
+        );
+    }
+
+    /// Launch OpenWebUI (`/ui`) in the background, wired to the deployed models.
+    fn start_openwebui(&mut self) {
+        if self.openwebui_busy {
+            self.set_status("OpenWebUI is already starting…", false);
+            return;
+        }
+        if !OpenWebUi::docker_available() {
+            self.raise_error(
+                LocalCodeError::new(
+                    ErrorCode::BackendBinaryMissing,
+                    "Docker is required to run OpenWebUI (/ui)",
+                )
+                .with_hint("Install Docker Desktop (Windows/macOS) or Docker Engine (Linux)")
+                .with_hint("Or run it yourself: pip install open-webui && open-webui serve"),
+            );
+            return;
+        }
+        let urls: Vec<String> = self
+            .all_runtimes()
+            .iter()
+            .map(|r| r.base_url.clone())
+            .collect();
+        let n = urls.len();
+        self.openwebui_busy = true;
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = OpenWebUi::deploy(OPENWEBUI_DEFAULT_PORT, urls)
+                .await
+                .map(Box::new);
+            let _ = tx.send(BgMsg::OpenWebUiReady(result));
+        });
+        self.set_status(
+            format!("Deploying OpenWebUI (Docker) wired to {n} model endpoint(s)…"),
+            false,
+        );
+    }
+
+    /// Build the backend-management capability handed to the assistant. Wired to
+    /// the live registry so an assistant deploy shows up on `/dash` immediately.
+    fn model_ops(&self) -> Arc<dyn ModelActions> {
+        Arc::new(ModelOps {
+            registry: self.registry.clone(),
+            events: self.events.clone(),
+            gpu: self.gpu.clone(),
+            paths: self.paths.clone(),
+            config: self.config.clone(),
+            tx: self.bg_tx.clone(),
+        })
+    }
+
     fn spawn_assistant_turn(&mut self, auto: bool) {
         let assistant = Assistant::new(self.config.assistant.clone());
         let api_key = self.config.assistant_api_key();
@@ -2304,6 +2974,10 @@ impl App {
             .and_then(|d| d.card_markdown.clone());
         let workspace = self.workspace_path();
         let hf_arc = self.hf.clone().map(Arc::new);
+        // Interactive turns can deploy/stop/delete models on the user's behalf;
+        // silent auto-repair only advises (no unattended model management).
+        let model_ops: Option<Arc<dyn ModelActions>> =
+            if auto { None } else { Some(self.model_ops()) };
         let tx = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
             let logs =
@@ -2335,6 +3009,7 @@ impl App {
                     ctx,
                     api_key.as_deref(),
                     hf_arc,
+                    model_ops,
                     workspace,
                     None,
                     approver
@@ -2478,13 +3153,25 @@ impl App {
         }
         self.coding_follow = true;
 
+        // The session this turn belongs to. Tagging events with it lets the user
+        // switch to another chat mid-turn without the background turn's tokens
+        // landing in the foreground transcript.
+        let sid = self.current_session_id.clone();
+
         // Live events (streamed tokens, tool activity) flow through their own
         // channel; the forwarder exits when the turn task drops the sender.
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let fwd_tx = self.bg_tx.clone();
+        let fwd_sid = sid.clone();
         tokio::spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
-                if fwd_tx.send(BgMsg::CodingEvent(ev)).is_err() {
+                if fwd_tx
+                    .send(BgMsg::CodingEvent {
+                        session_id: fwd_sid.clone(),
+                        ev,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -2502,6 +3189,7 @@ impl App {
         let cloud_base = self.config.assistant.base_url.clone();
         let cloud_model = self.config.assistant.model.clone();
         let cloud_key = self.config.assistant_api_key();
+        let done_sid = sid.clone();
         let handle = tokio::spawn(async move {
             // Resolve runtime inside the task so we can ensure_running the local assistant.
             let runtime = if let Some(r) = existing {
@@ -2515,7 +3203,10 @@ impl App {
                         snap
                     }
                     Err(e) => {
-                        let _ = tx.send(BgMsg::CodingDone(Err(e)));
+                        let _ = tx.send(BgMsg::CodingDone {
+                            session_id: done_sid.clone(),
+                            result: Err(e),
+                        });
                         return;
                     }
                 }
@@ -2558,16 +3249,22 @@ impl App {
                 }
             }
             drop(session);
-            let _ = tx.send(BgMsg::CodingDone(result));
+            let _ = tx.send(BgMsg::CodingDone {
+                session_id: done_sid.clone(),
+                result,
+            });
         });
         self.begin_busy(BusyKind::Coding, "Agent working", handle);
     }
 
     fn new_coding_session(&mut self) {
-        if self.fg_busy() {
-            self.set_status("Agent is busy — Esc to cancel first", false);
+        // A non-coding foreground task still blocks; a coding turn is detached to
+        // the background so starting a new chat never loses the running one.
+        if self.fg_busy() && !self.busy.as_ref().is_some_and(|b| b.kind == BusyKind::Coding) {
+            self.set_status("Busy — Esc to cancel first", false);
             return;
         }
+        self.detach_current_chat_if_running();
         let workspace = self.workspace_path();
         let session = AgentSession::new(workspace);
         let store = if self.config.agent.sessions_enabled {
@@ -2601,6 +3298,66 @@ impl App {
     // Sessions view (/sessions) — list past chats, resume one
     // ------------------------------------------------------------------
 
+    /// If a coding turn is running for the current session, detach it to the
+    /// background so the user can switch away without cancelling it. The task is
+    /// already running on its own `Arc` clones and persists to disk on its own —
+    /// we just stop treating it as the foreground turn and keep its handle +
+    /// transcript snapshot so returning restores the live view. No-op unless a
+    /// coding turn is in flight.
+    fn detach_current_chat_if_running(&mut self) {
+        let is_coding = self
+            .busy
+            .as_ref()
+            .map(|b| b.kind == BusyKind::Coding)
+            .unwrap_or(false);
+        if !is_coding {
+            return;
+        }
+        let Some(busy) = self.busy.take() else {
+            return;
+        };
+        self.bg_chats.insert(
+            self.current_session_id.clone(),
+            BgChat {
+                handle: busy.handle,
+                started: busy.started,
+                session: self.session.clone(),
+                session_store: self.session_store.clone(),
+                transcript: self.coding_transcript.clone(),
+                ctx_used: self.ctx_used_tokens,
+                done: false,
+            },
+        );
+    }
+
+    /// A background turn finished. Its task already persisted the result to the
+    /// session's store; append the reply/error to the retained snapshot so
+    /// returning shows it, and notify the user.
+    fn finish_bg_chat(&mut self, sid: &str, result: &Result<String, LocalCodeError>) {
+        if let Some(chat) = self.bg_chats.get_mut(sid) {
+            chat.done = true;
+            match result {
+                Ok(reply) if !reply.trim().is_empty() => chat
+                    .transcript
+                    .push(TranscriptEntry::new(EntryKind::Agent, reply.clone())),
+                Ok(_) => {}
+                Err(e) => chat.transcript.push(TranscriptEntry::new(
+                    EntryKind::Error,
+                    format!("{}: {}", e.code, e.message),
+                )),
+            }
+        }
+        let ok = result.is_ok();
+        self.set_status(
+            if ok {
+                "A background chat finished — open it in /sessions".to_string()
+            } else {
+                "A background chat failed — open it in /sessions".to_string()
+            },
+            !ok,
+        );
+    }
+
     /// Open the sessions view with a fresh listing for this workspace.
     fn open_sessions(&mut self) {
         if !self.config.agent.sessions_enabled {
@@ -2623,12 +3380,16 @@ impl App {
         self.set_mode(Mode::Sessions);
     }
 
-    /// Switch the live chat to the picked past session. The current session
-    /// is already on disk (synced after every turn), so this only loads the
-    /// other file and swaps the in-memory state.
+    /// Switch the live chat to the picked past session. A coding turn running for
+    /// the current session is detached to the background (it keeps running and
+    /// persisting) rather than blocking the switch, so the user never loses
+    /// progress. If the target session has a turn running in the background, its
+    /// live state is re-attached instead of a disk reload.
     fn resume_session(&mut self, idx: usize) {
-        if self.fg_busy() {
-            self.set_status("Agent is busy — Esc to cancel first", false);
+        // A foreground *non-coding* task (search/bench/…) still blocks — only a
+        // coding turn is safe to background.
+        if self.fg_busy() && !self.busy.as_ref().is_some_and(|b| b.kind == BusyKind::Coding) {
+            self.set_status("Busy — Esc to cancel first", false);
             return;
         }
         let Some(meta) = self.sessions.get(idx) else {
@@ -2639,7 +3400,41 @@ impl App {
             self.set_status("Already in this chat", false);
             return;
         }
-        let loaded = match SessionStore::load(&meta.path) {
+        let target_id = meta.id.clone();
+        let meta_path = meta.path.clone();
+
+        // Park the current in-flight turn (if any) so switching doesn't kill it.
+        self.detach_current_chat_if_running();
+
+        // If the target's turn is still running in the background, re-attach its
+        // live state (same Arcs) instead of loading a stale copy from disk.
+        if let Some(chat) = self.bg_chats.get(&target_id) {
+            if !chat.done {
+                let chat = self.bg_chats.remove(&target_id).unwrap();
+                self.current_session_id = target_id;
+                self.session = chat.session;
+                self.session_store = chat.session_store;
+                self.coding_transcript = chat.transcript;
+                self.ctx_used_tokens = chat.ctx_used;
+                self.workspace_files = None;
+                self.coding_scroll = 0;
+                self.coding_follow = true;
+                self.busy = Some(Busy {
+                    kind: BusyKind::Coding,
+                    label: "Agent working".into(),
+                    started: chat.started,
+                    handle: chat.handle,
+                });
+                self.set_mode(Mode::Chat);
+                self.set_status("Resumed a chat that's still working…", false);
+                return;
+            }
+            // Completed in the background — drop the parked entry and load the
+            // full (tool-inclusive) history from disk below.
+            self.bg_chats.remove(&target_id);
+        }
+
+        let loaded = match SessionStore::load(&meta_path) {
             Ok(l) => l,
             Err(e) => {
                 self.set_status(format!("Could not open session: {}", e.message), true);
@@ -3407,6 +4202,8 @@ impl App {
                             // Fresh model: clear previous card-derived flags, then re-parse.
                             self.deploy_extra_args.clear();
                             self.deploy_hints_notes.clear();
+                            // A command override was built for the previous model.
+                            self.deploy_command_override = None;
                             if self.config.assistant.auto_deploy_hints {
                                 self.apply_card_deploy_hints();
                             }
@@ -3438,12 +4235,23 @@ impl App {
                         ));
                     }
                 }
-                BgMsg::CodingEvent(ev) => {
-                    self.apply_agent_event(ev);
-                    // Keep the context meter moving while the turn streams.
-                    self.refresh_ctx_usage();
+                BgMsg::CodingEvent { session_id, ev } => {
+                    // Only the foreground session's tokens render; a backgrounded
+                    // turn's events are dropped (its result persists to disk and
+                    // its snapshot is restored on return).
+                    if session_id == self.current_session_id {
+                        self.apply_agent_event(ev);
+                        // Keep the context meter moving while the turn streams.
+                        self.refresh_ctx_usage();
+                    }
                 }
-                BgMsg::CodingDone(result) => {
+                BgMsg::CodingDone { session_id, result } => {
+                    // A turn for a backgrounded session finished — record it there
+                    // (it already persisted) without touching the foreground.
+                    if session_id != self.current_session_id {
+                        self.finish_bg_chat(&session_id, &result);
+                        continue;
+                    }
                     // Turn stats for the status line: duration from the busy
                     // marker (grabbed before finish_busy clears it) + tool
                     // calls made since the user's message.
@@ -3707,6 +4515,26 @@ impl App {
                     Ok(()) => self.set_status("Runtime stopped", false),
                     Err(e) => self.raise_error(e),
                 },
+                BgMsg::ModelsChanged => {
+                    // A tool deployed/stopped/deleted a model. Runtimes refresh on
+                    // the next tick; refresh the on-disk set now for /models & /dash.
+                    self.refresh_downloaded();
+                    self.set_status("Models updated", false);
+                }
+                BgMsg::OpenWebUiReady(result) => {
+                    self.openwebui_busy = false;
+                    match result {
+                        Ok(handle) => {
+                            let url = handle.url().to_string();
+                            self.openwebui = Some(*handle);
+                            self.set_status(
+                                format!("OpenWebUI starting at {url} — open it in ~30s"),
+                                false,
+                            );
+                        }
+                        Err(e) => self.raise_error(e),
+                    }
+                }
                 BgMsg::UpdateCheckDone { result, manual } => match result {
                     Ok(Some(info)) => {
                         self.set_status(
@@ -3981,6 +4809,8 @@ impl App {
             ("/new", "", "start a new conversation"),
             ("/sessions", "", "switch to a past chat (resume)"),
             ("/deploy", "", "deploy the selected model"),
+            ("/ui", "", "launch the OpenWebUI browser chat (Docker)"),
+            ("/favorite", "[id]", "star/unstar a model (favourites show first on /dash)"),
             ("/doctor", "", "run environment diagnostics"),
             ("/assistant", "[install|accept]", "accept/install local Bonsai (default chat when ready)"),
             ("/update", "", "install the available update"),
@@ -4291,6 +5121,21 @@ impl App {
                 self.set_mode(Mode::Models);
                 self.start_deploy(false);
             }
+            "ui" | "openwebui" | "webui" => self.start_openwebui(),
+            "favorite" | "favourite" | "fav" | "star" => {
+                let id = if rest.is_empty() {
+                    self.current_model_id()
+                } else {
+                    Some(rest.clone())
+                };
+                match id {
+                    Some(id) => self.toggle_favorite_model(&id),
+                    None => self.set_status(
+                        "Usage: /favorite <model-id> (or select a model in /models first)",
+                        true,
+                    ),
+                }
+            }
             "bench" | "benchmark" => self.set_mode(Mode::Bench),
             "setup" => self.set_mode(Mode::Setup),
             "doctor" => {
@@ -4371,6 +5216,7 @@ impl App {
                 if let Some(name) = args.first() {
                     if let Some(k) = BackendKind::parse(name) {
                         self.deploy_backend = k;
+                        self.deploy_command_override = None;
                         self.refresh_fit();
                     } else {
                         self.set_status(format!("Unknown backend: {name}"), true);
@@ -4939,8 +5785,25 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         if let Some(b) = self.deploy_busy.take() {
             b.handle.abort();
         }
+        // Detached background coding turns end with the process; abort them so
+        // they don't keep hitting a runtime we're about to stop.
+        for (_, chat) in self.bg_chats.drain() {
+            chat.handle.abort();
+        }
         self.registry.stop_all().await;
         self.runtimes.clear();
+    }
+
+    /// Whether a coding turn is currently running for session `id` — either in
+    /// the foreground or detached to the background. Drives the `/sessions`
+    /// "working" marker.
+    pub fn session_is_working(&self, id: &str) -> bool {
+        if id == self.current_session_id
+            && self.busy.as_ref().is_some_and(|b| b.kind == BusyKind::Coding)
+        {
+            return true;
+        }
+        self.bg_chats.get(id).is_some_and(|c| !c.done)
     }
 
     // ------------------------------------------------------------------
@@ -5306,6 +6169,11 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         // Leaving Models must also close any open deploy-parameter editor, so it
         // can't reappear mid-edit with a stale buffer on return.
         self.deploy_editing = None;
+        // The downloaded-model tag (/models) and the /dash downloaded section
+        // both read the on-disk set — refresh it on entry so it reflects reality.
+        if matches!(mode, Mode::Models | Mode::Dash) {
+            self.refresh_downloaded();
+        }
     }
 
     /// Selection / scroll keys for the active mode (arrows, page keys, Tab).
@@ -5585,6 +6453,13 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 },
                 label,
             ) => self.respond_tool_confirm(label == "Confirm"),
+            (
+                ModalKind::Confirm {
+                    action: ConfirmAction::DeleteModel,
+                    ..
+                },
+                "Confirm",
+            ) => self.confirm_delete_model(),
             _ => {}
         }
     }
@@ -5717,6 +6592,9 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                     self.copy_to_clipboard(&err, "error");
                 }
             }
+            ClickTarget::DashDeploy(i) => self.dash_deploy(i),
+            ClickTarget::DashDelete(i) => self.dash_delete(i),
+            ClickTarget::DashFavorite(i) => self.dash_favorite(i),
             // Sessions: clicking a row resumes it (same as select + Enter).
             ClickTarget::SessionList => {
                 let idx = self.sessions_scroll + rel_row;
@@ -5813,6 +6691,9 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         // Switching backends changes which params are shown; drop any in-progress
         // edit so the editor can't get stuck on a now-hidden field.
         self.deploy_editing = None;
+        // A command override built for the old backend is meaningless for the
+        // new one — clear it so the field reseeds from the new backend's command.
+        self.deploy_command_override = None;
         self.deploy_backend = match self.deploy_backend {
             BackendKind::Ollama => BackendKind::LlamaCpp,
             BackendKind::LlamaCpp => BackendKind::Vllm,
@@ -5855,6 +6736,9 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             | Some(ClickTarget::DashStop(_))
             | Some(ClickTarget::DashUse(_))
             | Some(ClickTarget::DashCopyErr(_))
+            | Some(ClickTarget::DashDeploy(_))
+            | Some(ClickTarget::DashDelete(_))
+            | Some(ClickTarget::DashFavorite(_))
             | Some(ClickTarget::DashStartNew) => self.scroll_dash(delta),
             Some(ClickTarget::SessionList) => self.scroll_sessions(delta),
             _ => self.wheel_scroll(delta),
@@ -6410,6 +7294,59 @@ mod tests {
         app.runtimes.retain(|r| r.id != id);
         app.registry.monitors().remove(&id.to_string());
         assert!(app.dash_cards().is_empty());
+    }
+
+    #[test]
+    fn dash_shows_downloaded_models_with_favorites_first() {
+        let mut app = test_app();
+        app.downloaded_models = vec![
+            DownloadedModel {
+                model_id: "org/alpha".into(),
+                dir: std::path::PathBuf::from("/models/alpha"),
+                total_bytes: 2048,
+                quants: vec!["Q4_K_M".into()],
+                files: vec!["a.gguf".into()],
+            },
+            DownloadedModel {
+                model_id: "org/zeta".into(),
+                dir: std::path::PathBuf::from("/models/zeta"),
+                total_bytes: 4096,
+                quants: vec!["Q8_0".into()],
+                files: vec!["z.gguf".into()],
+            },
+        ];
+        app.config.add_favorite("org/zeta");
+
+        let cards = app.dash_cards();
+        assert_eq!(cards.len(), 2);
+        // The favourite sorts first despite "zeta" > "alpha" alphabetically.
+        assert_eq!(cards[0].model_id.as_deref(), Some("org/zeta"));
+        assert!(cards[0].is_favorite);
+        assert!(cards[0].can_deploy && cards[0].can_delete);
+        assert!(cards[0].runtime_index.is_none(), "downloaded-only, not running");
+        assert_eq!(cards[0].disk_bytes, Some(4096));
+        assert_eq!(cards[1].model_id.as_deref(), Some("org/alpha"));
+        assert!(!cards[1].is_favorite);
+    }
+
+    #[test]
+    fn dash_deploy_delete_favorite_target_the_right_model() {
+        let mut app = test_app();
+        app.downloaded_models = vec![DownloadedModel {
+            model_id: "org/alpha".into(),
+            dir: std::path::PathBuf::from("/models/alpha"),
+            total_bytes: 2048,
+            quants: vec!["Q4_K_M".into()],
+            files: vec!["a.gguf".into()],
+        }];
+        // Favouriting the downloaded card toggles config for that model id.
+        assert!(!app.config.is_favorite("org/alpha"));
+        app.dash_favorite(0);
+        assert!(app.config.is_favorite("org/alpha"));
+        // Deleting opens a confirm modal naming the model (no accidental delete).
+        app.dash_delete(0);
+        assert_eq!(app.pending_delete_model.as_deref(), Some("org/alpha"));
+        assert!(app.modal.is_some());
     }
 
     // ---- /sessions past-chat switcher --------------------------------------
@@ -7167,17 +8104,25 @@ mod tests {
                 DeployField::Context,
                 DeployField::Port,
                 DeployField::GpuMemFraction,
-                DeployField::TensorParallel
+                DeployField::TensorParallel,
+                DeployField::Command,
             ]
         );
         app.deploy_backend = BackendKind::LlamaCpp;
         assert_eq!(
             app.deploy_fields(),
-            vec![DeployField::Context, DeployField::Port, DeployField::GpuLayers]
+            vec![
+                DeployField::Context,
+                DeployField::Port,
+                DeployField::GpuLayers,
+                DeployField::Command,
+            ]
         );
+        // Ollama is a shared server we don't spawn — no launch command to edit.
         app.deploy_backend = BackendKind::Ollama;
         assert_eq!(app.deploy_fields(), vec![DeployField::Context, DeployField::GpuLayers]);
         assert!(!app.deploy_fields().contains(&DeployField::Port));
+        assert!(!app.deploy_fields().contains(&DeployField::Command));
     }
 
     #[test]

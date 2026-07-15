@@ -3,19 +3,28 @@
 mod deploy;
 mod diagnose;
 mod install;
+mod models_store;
 mod monitor;
 mod ollama;
+mod openwebui;
 mod llamacpp;
 mod smoke;
 mod vllm;
 mod sglang;
 mod registry;
 
-pub use deploy::{DeployJob, DeployProgress, DeployRequest, DeployService};
+pub use deploy::{
+    preview_deploy_command, DeployJob, DeployProgress, DeployRequest, DeployService,
+};
 pub use diagnose::{classify, diagnose, Confidence, Diagnosis, FailureClass, RepairIntent};
+pub use models_store::{
+    delete_downloaded, find_downloaded, human_size, is_downloaded, list_downloaded,
+    sanitize_model_dir, DownloadedModel,
+};
+pub use openwebui::{OpenWebUi, OpenWebUiHandle, OPENWEBUI_CONTAINER, OPENWEBUI_DEFAULT_PORT};
 pub use monitor::{
-    capture_into_monitor, format_command, spawn_exit_watch, DashSnapshot, ModelMonitor,
-    ModelMonitors, ProcState, DASH_LOG_CAP,
+    capture_into_monitor, format_command, resolve_launch, split_command, spawn_exit_watch,
+    DashSnapshot, ModelMonitor, ModelMonitors, ProcState, DASH_LOG_CAP,
 };
 pub use install::{
     can_elevate_noninteractively, ensure_llamacpp_installed, llamacpp_managed_dir,
@@ -134,6 +143,11 @@ pub struct ModelDeploySpec {
     /// Per-backend launch tuning (VRAM fraction, tensor-parallel, GPU layers).
     #[serde(default)]
     pub tuning: DeployTuning,
+    /// Full launch command entered by the user (or assistant) that replaces the
+    /// one this backend would build. When set, the backend shell-splits it into
+    /// program + args and spawns exactly that. `None` = use the built command.
+    #[serde(default)]
+    pub command_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

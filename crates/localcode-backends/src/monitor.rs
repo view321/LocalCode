@@ -243,6 +243,77 @@ fn quote_arg(a: &str) -> String {
     }
 }
 
+/// Split a shell-ish command line into program + args, the inverse of
+/// [`format_command`]. Honors single and double quotes and backslash escapes so
+/// a user-edited launch command (which may contain quoted paths) round-trips.
+/// Returns `None` when the line is empty or has no program token.
+pub fn split_command(line: &str) -> Option<(String, Vec<String>)> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_token = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single => {
+                // Escape the next char (common on Unix paths / spaces).
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                    has_token = true;
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_token = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    let program = tokens.remove(0);
+    Some((program, tokens))
+}
+
+/// Resolve what a backend should actually spawn: honor a user/assistant command
+/// override when present and parseable, otherwise the backend-built command.
+/// Returns `(program, args, display_command)` — `display_command` is what the
+/// `/dash` card shows and is byte-identical to what runs.
+pub fn resolve_launch(
+    default_bin: &str,
+    default_args: Vec<String>,
+    override_cmd: Option<&str>,
+) -> (String, Vec<String>, String) {
+    if let Some(line) = override_cmd {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Some((prog, args)) = split_command(trimmed) {
+                return (prog, args, trimmed.to_string());
+            }
+        }
+    }
+    let display = format_command(default_bin, &default_args);
+    (default_bin.to_string(), default_args, display)
+}
+
 fn push_line(buf: &Arc<Mutex<VecDeque<String>>>, line: String) {
     if let Ok(mut b) = buf.lock() {
         if b.len() >= DASH_LOG_CAP {
@@ -373,6 +444,45 @@ mod tests {
         let mon = m.register("rt", "x", BackendKind::LlamaCpp, None, "cmd", ProcState::Running);
         mon.push_log("all good");
         assert!(m.snapshot(5)[0].error_text().is_none());
+    }
+
+    #[test]
+    fn split_command_round_trips_format() {
+        let args = vec![
+            "serve".to_string(),
+            "org/model".to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+        ];
+        let line = format_command("vllm", &args);
+        let (prog, got) = split_command(&line).unwrap();
+        assert_eq!(prog, "vllm");
+        assert_eq!(got, args);
+    }
+
+    #[test]
+    fn split_command_honors_quotes() {
+        let (prog, args) =
+            split_command("llama-server -m \"C:/my models/x.gguf\" --port 8080").unwrap();
+        assert_eq!(prog, "llama-server");
+        assert_eq!(args[1], "C:/my models/x.gguf");
+        assert_eq!(args.last().unwrap(), "8080");
+    }
+
+    #[test]
+    fn resolve_launch_prefers_override() {
+        let (prog, args, display) =
+            resolve_launch("vllm", vec!["serve".into()], Some("  custom serve x  "));
+        assert_eq!(prog, "custom");
+        assert_eq!(args, vec!["serve".to_string(), "x".to_string()]);
+        assert_eq!(display, "custom serve x");
+
+        // Blank / whitespace override falls back to the built command.
+        let (prog, _args, display) = resolve_launch("vllm", vec!["serve".into()], Some("   "));
+        assert_eq!(prog, "vllm");
+        assert_eq!(display, "vllm serve");
+        let (prog, _args, _display) = resolve_launch("vllm", vec!["serve".into()], None);
+        assert_eq!(prog, "vllm");
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub struct Config {
     pub updates: UpdatesConfig,
     #[serde(default)]
     pub remote: RemoteConfig,
+    #[serde(default)]
+    pub models: ModelsConfig,
 }
 
 /// Read an env var, treating empty values as unset.
@@ -126,6 +128,15 @@ impl Default for RegistryConfig {
             mirrors: Vec::new(),
         }
     }
+}
+
+/// Model-catalogue preferences (favourites shown first in `/dash` and `/models`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsConfig {
+    /// Hugging Face model ids the user starred. Order is insertion order; the
+    /// UI renders these above other models on the dashboard.
+    #[serde(default)]
+    pub favorites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -717,7 +728,11 @@ fn default_llama_bin() -> String {
     "llama-server".into()
 }
 fn default_host() -> String {
-    "127.0.0.1".into()
+    // Bind deployed model servers on all interfaces by default so they are
+    // reachable from the LAN and from containers (e.g. the OpenWebUI Docker
+    // image reaching the host via host.docker.internal). The in-app assistant
+    // server is separate and always binds 127.0.0.1.
+    "0.0.0.0".into()
 }
 fn default_llama_port() -> u16 {
     8080
@@ -850,6 +865,37 @@ impl Config {
 
     pub fn hf_token(&self) -> Option<String> {
         env_nonempty(&self.registry.token_env)
+    }
+
+    /// True when `model_id` is starred as a favourite.
+    pub fn is_favorite(&self, model_id: &str) -> bool {
+        self.models.favorites.iter().any(|m| m == model_id)
+    }
+
+    /// Add a favourite (no-op if already present). Returns true if it was added.
+    pub fn add_favorite(&mut self, model_id: &str) -> bool {
+        if self.is_favorite(model_id) || model_id.is_empty() {
+            return false;
+        }
+        self.models.favorites.push(model_id.to_string());
+        true
+    }
+
+    /// Remove a favourite. Returns true if it was present and removed.
+    pub fn remove_favorite(&mut self, model_id: &str) -> bool {
+        let before = self.models.favorites.len();
+        self.models.favorites.retain(|m| m != model_id);
+        self.models.favorites.len() != before
+    }
+
+    /// Toggle a favourite. Returns the new state (true = now a favourite).
+    pub fn toggle_favorite(&mut self, model_id: &str) -> bool {
+        if self.is_favorite(model_id) {
+            self.remove_favorite(model_id);
+            false
+        } else {
+            self.add_favorite(model_id)
+        }
     }
 
     pub fn assistant_api_key(&self) -> Option<String> {
@@ -1001,5 +1047,34 @@ mod tests {
         assert_eq!(hosts[0], "https://hf-mirror.com");
         assert_eq!(hosts[1], "https://hf-mirror-2.com");
         assert_eq!(hosts.last().unwrap(), "https://huggingface.co");
+    }
+
+    #[test]
+    fn default_host_binds_all_interfaces() {
+        // Deployed servers must be reachable from the LAN / containers by default.
+        assert_eq!(Config::default().backends.vllm.host, "0.0.0.0");
+        assert_eq!(Config::default().backends.llamacpp.host, "0.0.0.0");
+        assert_eq!(Config::default().backends.sglang.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn favorites_toggle_and_persist() {
+        let dir = tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut cfg = Config::default();
+        assert!(!cfg.is_favorite("org/model"));
+        assert!(cfg.toggle_favorite("org/model"));
+        assert!(cfg.is_favorite("org/model"));
+        // Idempotent add, real remove.
+        assert!(!cfg.add_favorite("org/model"));
+        assert!(!cfg.toggle_favorite("org/model"));
+        assert!(!cfg.is_favorite("org/model"));
+
+        cfg.add_favorite("a/one");
+        cfg.add_favorite("b/two");
+        cfg.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.models.favorites, vec!["a/one", "b/two"]);
     }
 }

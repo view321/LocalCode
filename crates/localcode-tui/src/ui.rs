@@ -17,6 +17,7 @@ use crate::app::{
 use crate::markdown;
 use crate::theme;
 use crate::widgets::{banner_height, button, button_width, draw_inline_banner};
+use localcode_backends::human_size;
 use localcode_core::runtime::RuntimeStatus;
 use localcode_core::theme::{ThemeMode, ThemeToken};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -1087,20 +1088,28 @@ fn draw_models_list(f: &mut Frame, area: Rect, app: &mut App) {
                 } else {
                     ""
                 };
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(mark, theme::accent(&th)),
-                        Span::styled(m.id.clone(), id_style),
-                    ]),
-                    Line::from(Span::styled(
-                        format!(
-                            "  {} dl · {} likes{gguf}",
-                            human_count(m.downloads.unwrap_or(0)),
-                            human_count(m.likes.unwrap_or(0)),
-                        ),
-                        theme::muted(&th),
-                    )),
-                ])
+                let favorite = app.config.is_favorite(&m.id);
+                let downloaded = app.is_downloaded(&m.id);
+                let mut id_line: Vec<Span> = vec![Span::styled(mark, theme::accent(&th))];
+                if favorite {
+                    id_line.push(Span::styled("★ ", theme::accent(&th)));
+                }
+                id_line.push(Span::styled(m.id.clone(), id_style));
+                let mut meta: Vec<Span> = vec![Span::styled(
+                    format!(
+                        "  {} dl · {} likes{gguf}",
+                        human_count(m.downloads.unwrap_or(0)),
+                        human_count(m.likes.unwrap_or(0)),
+                    ),
+                    theme::muted(&th),
+                )];
+                if downloaded {
+                    meta.push(Span::styled(
+                        " · downloaded",
+                        theme::accent(&th).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                ListItem::new(vec![Line::from(id_line), Line::from(meta)])
             })
             .collect()
     };
@@ -1460,7 +1469,7 @@ fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
 
     // --- Header row: title · [ + new model ] · gpu summary ---
     let header = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
-    let title = format!("running models ({})", cards.len());
+    let title = format!("models ({})", cards.len());
     let mut hspans = vec![Span::styled(title, theme::muted(&th).add_modifier(Modifier::BOLD))];
     hspans.push(Span::raw("  "));
     let new_label = "+ new model";
@@ -1468,7 +1477,7 @@ fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
     hspans.extend(button(&th, new_label, false));
     f.render_widget(Paragraph::new(Line::from(hspans)), header);
     // Button click rect (title width is stable, so recompute its x).
-    let new_x = inner.x + (format!("running models ({})  ", cards.len()).width() as u16);
+    let new_x = inner.x + (format!("models ({})  ", cards.len()).width() as u16);
     click(
         app,
         Rect { x: new_x, y: header.y, width: new_w, height: 1 },
@@ -1515,8 +1524,14 @@ fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // --- Scroll so the selected card is visible ---
+    // Cards are reordered (favourites first, OpenWebUI pinned, downloaded appended)
+    // so a card's position no longer equals its runtime index — locate the active
+    // runtime's card by its stored index.
     let visible = (cards_area.height / DASH_CARD_STRIDE).max(1) as usize;
-    let sel = app.runtime_selected.min(cards.len().saturating_sub(1));
+    let sel = cards
+        .iter()
+        .position(|c| c.runtime_index == Some(app.runtime_selected))
+        .unwrap_or(0);
     let max_scroll = cards.len().saturating_sub(visible);
     if app.dash_scroll > max_scroll {
         app.dash_scroll = max_scroll;
@@ -1577,8 +1592,15 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
     } else {
         fg(&th)
     };
-    let mut l1: Vec<Span> = vec![
-        Span::styled(format!("{} ", card.glyph), glyph_style),
+    let mut l1: Vec<Span> = vec![Span::styled(format!("{} ", card.glyph), glyph_style)];
+    // Favourite star (filled when starred) before the name.
+    if card.model_id.is_some() {
+        l1.push(Span::styled(
+            if card.is_favorite { "★ " } else { "" },
+            theme::accent(&th),
+        ));
+    }
+    l1.extend([
         Span::styled(card.name.clone(), name_style),
         sep(&th),
         Span::styled(card.backend_label.clone(), theme::muted(&th)),
@@ -1591,10 +1613,14 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
                 theme::muted(&th)
             },
         ),
-    ];
+    ]);
     if let Some(v) = card.vram_bytes {
         l1.push(sep(&th));
         l1.push(Span::styled(format!("vram ~{:.1}G", gib_f(v)), fg(&th)));
+    }
+    if let Some(d) = card.disk_bytes {
+        l1.push(sep(&th));
+        l1.push(Span::styled(format!("disk {}", human_size(d)), theme::muted(&th)));
     }
     if let Some(t) = card.tok_per_sec {
         l1.push(sep(&th));
@@ -1606,6 +1632,12 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
             format!("ctx {}/{}", human_ctx(u), human_ctx(card.ctx_max)),
             fg(&th),
         ));
+    }
+    if card.is_openwebui {
+        if let Some(url) = &card.url {
+            l1.push(sep(&th));
+            l1.push(Span::styled(format!("→ {url}"), theme::accent(&th)));
+        }
     }
     if card.is_active {
         l1.push(Span::styled("  ★ next request", theme::accent(&th)));
@@ -1680,20 +1712,48 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
         }
     }
 
-    // Line 5: action buttons [ stop ] [ use ].
+    // Line 5: action buttons. Running: [stop] [use] [★]. Downloaded-only:
+    // [deploy] [delete] [★]. OpenWebUI: [stop] [copy url].
     let row5 = Rect { x: rect.x, y: rect.y + 4, width: rect.width, height: 1 };
     let mut bx = rect.x + 2;
     let mut bspans: Vec<Span> = vec![Span::raw("  ")];
-    if card.can_stop {
-        let stop_w = button_width("stop");
-        bspans.extend(button(&th, "stop", false));
-        bspans.push(Span::raw(" "));
-        click(app, Rect { x: bx, y: row5.y, width: stop_w, height: 1 }, ClickTarget::DashStop(idx));
-        bx += stop_w + 1;
+    // Helper to push a button + register its click region + advance the cursor.
+    let push_btn =
+        |app: &mut App, bspans: &mut Vec<Span>, bx: &mut u16, label: &str, filled: bool, target: ClickTarget| {
+            let bw = button_width(label);
+            bspans.extend(button(&th, label, filled));
+            bspans.push(Span::raw(" "));
+            click(app, Rect { x: *bx, y: row5.y, width: bw, height: 1 }, target);
+            *bx += bw + 1;
+        };
+
+    if card.is_openwebui {
+        if card.can_stop {
+            push_btn(app, &mut bspans, &mut bx, "stop", false, ClickTarget::DashStop(idx));
+        }
+        push_btn(app, &mut bspans, &mut bx, "copy url", false, ClickTarget::DashUse(idx));
+    } else if card.runtime_index.is_some() {
+        if card.can_stop {
+            push_btn(app, &mut bspans, &mut bx, "stop", false, ClickTarget::DashStop(idx));
+        }
+        push_btn(app, &mut bspans, &mut bx, "use", card.is_active, ClickTarget::DashUse(idx));
+        if card.model_id.is_some() {
+            let star = if card.is_favorite { "★" } else { "☆" };
+            push_btn(app, &mut bspans, &mut bx, star, card.is_favorite, ClickTarget::DashFavorite(idx));
+        }
+    } else {
+        // Downloaded-only.
+        if card.can_deploy {
+            push_btn(app, &mut bspans, &mut bx, "deploy", false, ClickTarget::DashDeploy(idx));
+        }
+        if card.can_delete {
+            push_btn(app, &mut bspans, &mut bx, "delete", true, ClickTarget::DashDelete(idx));
+        }
+        if card.model_id.is_some() {
+            let star = if card.is_favorite { "★" } else { "☆" };
+            push_btn(app, &mut bspans, &mut bx, star, card.is_favorite, ClickTarget::DashFavorite(idx));
+        }
     }
-    let use_w = button_width("use");
-    bspans.extend(button(&th, "use", card.is_active));
-    click(app, Rect { x: bx, y: row5.y, width: use_w, height: 1 }, ClickTarget::DashUse(idx));
     f.render_widget(Paragraph::new(Line::from(bspans)), row5);
 }
 
@@ -1803,6 +1863,12 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &mut App) {
             Span::raw(" ".repeat(pad_n + 2)),
             Span::styled(format!("{:>4} msgs", m.message_count), theme::muted(&th)),
         ];
+        if app.session_is_working(&m.id) {
+            spans.push(Span::styled(
+                "  · working…",
+                theme::accent(&th).add_modifier(Modifier::BOLD),
+            ));
+        }
         if is_current {
             spans.push(Span::styled("  · current", theme::accent(&th)));
         }

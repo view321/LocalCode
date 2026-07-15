@@ -1,6 +1,6 @@
 use crate::{
-    capture_into_monitor, format_command, port_in_use, probe_client, spawn_exit_watch, BackendKind,
-    DetectReport, Health, InferenceBackend, ModelDeploySpec, ModelMonitors, ProcState,
+    capture_into_monitor, port_in_use, probe_client, resolve_launch, spawn_exit_watch, BackendKind,
+    DeployTuning, DetectReport, Health, InferenceBackend, ModelDeploySpec, ModelMonitors, ProcState,
     RunningEndpoint,
 };
 use async_trait::async_trait;
@@ -150,39 +150,16 @@ impl InferenceBackend for SglangBackend {
             message: "Starting SGLang".into(),
         });
 
-        // Built as a Vec so context / tuning flags can be appended. SGLang
-        // previously ignored context entirely (KV cache sized to the model's
-        // native max); --context-length bounds it like the other backends.
-        let mut args: Vec<String> = vec![
-            "-m".into(),
-            "sglang.launch_server".into(),
-            "--model-path".into(),
-            model.clone(),
-            "--host".into(),
-            self.cfg.host.clone(),
-            "--port".into(),
-            port.to_string(),
-        ];
-        if spec.context_length > 0 {
-            args.push("--context-length".into());
-            args.push(spec.context_length.to_string());
-        }
-        if let Some(frac) = spec.tuning.gpu_memory_fraction {
-            args.push("--mem-fraction-static".into());
-            args.push(format!("{frac}"));
-        }
-        if let Some(tp) = spec.tuning.tensor_parallel {
-            args.push("--tp-size".into());
-            args.push(tp.to_string());
-        }
-        for a in &spec.tuning.extra_args {
-            if !a.is_empty() {
-                args.push(a.clone());
-            }
-        }
+        let built = build_args(&model, &self.cfg.host, port, spec.context_length, &spec.tuning);
+        // Honor a full command override (deploy panel / assistant); the override
+        // replaces the python interpreter + module invocation entirely.
+        let (program, args, command) = resolve_launch(
+            &py.display().to_string(),
+            built,
+            spec.command_override.as_deref(),
+        );
         let runtime_id = Uuid::new_v4();
-        let command = format_command(&py.display().to_string(), &args);
-        let mut child = tokio::process::Command::new(py)
+        let mut child = tokio::process::Command::new(&program)
             .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
@@ -294,4 +271,66 @@ impl InferenceBackend for SglangBackend {
             }),
         }
     }
+}
+
+/// Build the `python -m sglang.launch_server …` argument list (without python).
+fn build_args(
+    model: &str,
+    host: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> Vec<String> {
+    // SGLang previously ignored context entirely (KV cache sized to the model's
+    // native max); --context-length bounds it like the other backends.
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        "sglang.launch_server".into(),
+        "--model-path".into(),
+        model.to_string(),
+        "--host".into(),
+        host.to_string(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    if context_length > 0 {
+        args.push("--context-length".into());
+        args.push(context_length.to_string());
+    }
+    if let Some(frac) = tuning.gpu_memory_fraction {
+        args.push("--mem-fraction-static".into());
+        args.push(format!("{frac}"));
+    }
+    if let Some(tp) = tuning.tensor_parallel {
+        args.push("--tp-size".into());
+        args.push(tp.to_string());
+    }
+    for a in &tuning.extra_args {
+        if !a.is_empty() {
+            args.push(a.clone());
+        }
+    }
+    args
+}
+
+/// The `(program, args)` an SGLang deploy would spawn — used to seed the
+/// editable deploy-command field.
+pub(crate) fn plan_command(
+    cfg: &SglangConfig,
+    model: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> (String, Vec<String>) {
+    let py = std::path::PathBuf::from(&cfg.bin);
+    let program = if py.is_absolute() && py.exists() {
+        py.display().to_string()
+    } else {
+        which::which("python3")
+            .or_else(|_| which::which("python"))
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string())
+    };
+    (program, build_args(model, &cfg.host, port, context_length, tuning))
 }

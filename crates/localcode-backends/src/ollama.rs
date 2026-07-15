@@ -497,6 +497,7 @@ mod tests {
             context_length: 8192,
             force_oversize: false,
             tuning: crate::DeployTuning::default(),
+            command_override: None,
         }
     }
 

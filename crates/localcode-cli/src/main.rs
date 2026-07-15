@@ -292,6 +292,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
                     gpu_layers,
                     extra_args: Vec::new(),
                 },
+                command_override: None,
                 continue_despite_oversize: force,
             };
             let job = svc.deploy(req).await?;
