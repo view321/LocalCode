@@ -64,7 +64,7 @@ pub enum ConfirmAction {
     InstallBackend(BackendKind),
     /// Apply a diagnosed repair (after showing the exact commands it will run).
     ApplyRepair,
-    /// Install the bundled local Bonsai assistant (llama.cpp + -hf Q4_1 pull).
+    /// Install the bundled local Bonsai assistant (PrismML llama.cpp + Q4_1 GGUF).
     InstallLocalAssistant,
 }
 

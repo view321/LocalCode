@@ -106,17 +106,18 @@ provider instead.
 ### Local Bonsai assistant (default chat)
 
 On first launch LocalCode offers to install a **local assistant** based on
-[prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf),
-started with:
+[prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)
+**Q4_1** (`Bonsai-27B-dspark-Q4_1.gguf`, ~1.8 GB), started like the model card:
 
 ```bash
-./llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1
+./build/bin/llama-server \
+    -m Bonsai-27B-dspark-Q4_1.gguf \
+    --host 127.0.0.1 --port 18080 -ngl 99
 ```
 
-(~1.8 GB on first pull via llama.cpp’s `-hf` download). Bonsai needs the
-**[PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)** (custom
-1-bit / hybrid-attention kernels) — stock ggml-org builds will not load it.
-LocalCode installs that runtime automatically:
+Bonsai needs the **[PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)**
+(custom kernels) — stock ggml-org builds will not load it. LocalCode installs
+that runtime automatically:
 
 1. **Preferred (model card):** when `git` and `cmake` are on PATH, clone
    `https://github.com/PrismML-Eng/llama.cpp` and build with
@@ -124,6 +125,7 @@ LocalCode installs that runtime automatically:
    `cmake --build build -j`.
 2. **Fallback:** download a matching prebuilt from
    [PrismML-Eng/llama.cpp releases](https://github.com/PrismML-Eng/llama.cpp/releases).
+3. **Weights:** download `Bonsai-27B-dspark-Q4_1.gguf` into the assistant data dir.
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
 - Re-install later with `/assistant install`.
@@ -136,9 +138,8 @@ LocalCode installs that runtime automatically:
 Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
 `18080`), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
 
-> First start runs `llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1` against the
-> managed PrismML build. Set `HF_TOKEN` if the download is gated or rate-limited.
-> For a CUDA build you need the CUDA toolkit (`nvcc` on PATH) at install time.
+> Set `HF_TOKEN` if the GGUF download is gated or rate-limited. For a CUDA build
+> you need the CUDA toolkit (`nvcc` on PATH) at install time.
 
 ### Remote GPU over SSH
 

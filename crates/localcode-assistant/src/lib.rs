@@ -1,8 +1,8 @@
-//! In-app repair assistant: local Bonsai 27B (llama.cpp -hf) + hosted fallback.
+//! In-app repair assistant: local Bonsai 27B (llama.cpp `-m` Q4_1) + hosted fallback.
 //!
 //! ## Local assistant
-//! - Model: [`constants::BONSAI_HF_REF`] via `llama-server -hf …`
-//! - Backend: managed `llama-server` (auto-installed)
+//! - Model: [`constants::BONSAI_FILE`] via `llama-server -m … -ngl 99`
+//! - Backend: managed PrismML `llama-server` (auto-built)
 //! - Tools: shell, filesystem, git, Hugging Face model cards/search, doctor snapshot
 //! - Onboarding: user is prompted once; decline is remembered
 //! - Default conversation: TUI uses this runtime when no other model is deployed
@@ -301,7 +301,7 @@ pub fn startup_greeting(ready: bool) -> String {
     } else {
         format!(
             "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant \
-             (`llama-server -hf {BONSAI_HF_REF}`, ~1.8 GB) for offline repair, HF catalogue \
+             (`llama-server -m {BONSAI_FILE} -ngl 99`, ~1.8 GB Q4_1) for offline repair, HF catalogue \
              access, and a default local chat. You'll be prompted once, or run /assistant install."
         )
     }

@@ -27,7 +27,7 @@ use localcode_api_client::ApiClient;
 use localcode_assistant::{
     ensure_running, extract_deploy_hints, install_local_assistant, install_need, install_offer_body,
     is_installed, quant_compatibility_note, should_offer_install, startup_greeting, Assistant,
-    AssistantContext, LocalAssistantRuntime, ASSISTANT_DISPLAY_NAME, BONSAI_HF_REF, InstallNeed,
+    AssistantContext, LocalAssistantRuntime, ASSISTANT_DISPLAY_NAME, BONSAI_FILE, InstallNeed,
 };
 use localcode_backends::{
     can_elevate_noninteractively, diagnose, ensure_llamacpp_installed, resolve_install_plan,
@@ -626,7 +626,7 @@ pub struct App {
     pub deploy_progress: u8,
     /// Local Bonsai weights + llama-server are present.
     pub local_assistant_ready: bool,
-    /// Live handle for the local Bonsai assistant (`llama-server -hf …`).
+    /// Live handle for the local Bonsai assistant (`llama-server -m … Q4_1`).
     /// Kept so the default conversation can use it without `/assistant`.
     local_assistant: Option<std::sync::Arc<LocalAssistantRuntime>>,
     /// Install of the local assistant in progress.
@@ -952,7 +952,7 @@ impl App {
         });
     }
 
-    /// Kick off `llama-server -hf …` in the background when the assistant is installed.
+    /// Kick off `llama-server -m … Q4_1` in the background when the assistant is installed.
     fn warm_start_local_assistant(&mut self) {
         if self.local_assistant.is_some() {
             return;
@@ -965,7 +965,7 @@ impl App {
             let _ = tx.send(BgMsg::AssistantRuntimeReady(result));
         });
         self.set_status(
-            format!("Starting local {ASSISTANT_DISPLAY_NAME} ({BONSAI_HF_REF})…"),
+            format!("Starting local {ASSISTANT_DISPLAY_NAME} (-m {BONSAI_FILE} -ngl 99)…"),
             false,
         );
     }
@@ -3269,7 +3269,7 @@ impl App {
                                 format!("{ASSISTANT_DISPLAY_NAME} ready"),
                                 format!(
                                     "Local assistant is installed and is your default conversation model.\n\n\
-                                     Launch: llama-server -hf {BONSAI_HF_REF}\n\n{}\n\n\
+                                     Launch: llama-server -m {BONSAI_FILE} -ngl 99\n\n{}\n\n\
                                      Just type in chat — no /assistant needed. It can search Hugging Face, \
                                      read model cards, help deploy models, and fix LocalCode issues.",
                                     quant_compatibility_note()
@@ -3305,7 +3305,7 @@ impl App {
                         }
                         self.set_status(
                             format!(
-                                "{ASSISTANT_DISPLAY_NAME} ready — default chat uses -hf {BONSAI_HF_REF}"
+                                "{ASSISTANT_DISPLAY_NAME} ready — default chat uses -m {BONSAI_FILE} -ngl 99"
                             ),
                             false,
                         );

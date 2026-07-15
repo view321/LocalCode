@@ -1,12 +1,16 @@
 //! Dedicated llama-server process for the local Bonsai assistant.
 //!
-//! Launch shape (user-requested):
-//!   `./llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 …`
+//! Launch shape (model card server example, Q4_1 quant):
+//! ```text
+//! ./build/bin/llama-server \
+//!     -m Bonsai-27B-dspark-Q4_1.gguf \
+//!     --host 127.0.0.1 --port … -ngl 99
+//! ```
 
 use crate::constants::{
-    ASSISTANT_MODEL_ID, BONSAI_HF_REF, BONSAI_TEMPERATURE, BONSAI_TOP_K, BONSAI_TOP_P,
+    ASSISTANT_MODEL_ID, BONSAI_FILE, BONSAI_QUANT, BONSAI_TEMPERATURE, BONSAI_TOP_K, BONSAI_TOP_P,
 };
-use crate::install::{mark_ready, model_installed, resolve_llama_bin};
+use crate::install::{mark_ready, model_installed, model_path, resolve_llama_bin};
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
@@ -41,7 +45,7 @@ impl LocalAssistantRuntime {
             self.base_url.clone(),
         );
         r.model_id = Some(self.model_id.clone());
-        r.quantization = Some("Q4_1".into());
+        r.quantization = Some(BONSAI_QUANT.into());
         r.status = RuntimeStatus::Healthy;
         r
     }
@@ -80,9 +84,9 @@ impl LocalAssistantRuntime {
 
 /// Start (or reuse a healthy) assistant llama-server on `cfg.assistant.local_port`.
 ///
-/// Command:
+/// Command (model-card shape, Q4_1):
 /// ```text
-/// llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 --host 127.0.0.1 --port … -ngl …
+/// llama-server -m Bonsai-27B-dspark-Q4_1.gguf --host 127.0.0.1 --port … -ngl 99
 /// ```
 pub async fn ensure_running(
     cfg: &Config,
@@ -99,6 +103,19 @@ pub async fn ensure_running(
         )
         .with_hint("https://github.com/PrismML-Eng/llama.cpp")
     })?;
+
+    let gguf = model_path(paths);
+    if !gguf.is_file() {
+        return Err(LocalCodeError::new(
+            ErrorCode::DeployDownloadFailed,
+            format!("Bonsai GGUF not found at {}", gguf.display()),
+        )
+        .with_hint(format!(
+            "Run /assistant install to download {BONSAI_FILE} (~1.8 GB)"
+        ))
+        .with_hint("https://huggingface.co/prism-ml/Bonsai-27B-gguf")
+        .retryable(true));
+    }
 
     let port = cfg.assistant.local_port;
     let host = "127.0.0.1";
@@ -126,46 +143,49 @@ pub async fn ensure_running(
         .retryable(true));
     }
 
-    let ctx = cfg.assistant.local_context.max(2048);
     let ngl = cfg.assistant.local_gpu_layers;
+    // Model card example uses -ngl 99; keep optional -c from config when set.
+    let ctx = cfg.assistant.local_context.max(2048);
 
     info!(
         bin = %bin.display(),
-        hf = BONSAI_HF_REF,
+        model = %gguf.display(),
         port,
-        "starting local assistant llama-server (-hf)"
+        ngl,
+        "starting local assistant llama-server (-m Q4_1)"
     );
 
-    let mut args: Vec<String> = vec![
-        // User-requested launch: llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1
-        "-hf".into(),
-        BONSAI_HF_REF.into(),
+    // Model card: llama-server -m Bonsai-….gguf --host … --port … -ngl 99
+    let args: Vec<String> = vec![
+        "-m".into(),
+        gguf.display().to_string(),
         "--host".into(),
         host.into(),
         "--port".into(),
         port.to_string(),
+        "-ngl".into(),
+        ngl.to_string(),
         "-c".into(),
         ctx.to_string(),
-        "--n-gpu-layers".into(),
-        ngl.to_string(),
-        // Generation defaults from the Bonsai card (server-side defaults).
+        // Generation defaults from the Bonsai card (thinking mode).
         "--temp".into(),
         BONSAI_TEMPERATURE.to_string(),
         "--top-p".into(),
         BONSAI_TOP_P.to_string(),
         "--top-k".into(),
         BONSAI_TOP_K.to_string(),
+        // OpenAI API + tool calling templates.
+        "--jinja".into(),
     ];
-    // Quiet chat UI; OpenAI API + tool calling templates.
-    args.push("--jinja".into());
 
-    // Pass HF token so gated / rate-limited downloads succeed.
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(&args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // HF token not required for -m of a local file, but keep for any runtime
+    // fetches the binary may still attempt.
     if let Some(token) = cfg.hf_token() {
         cmd.env("HF_TOKEN", &token);
         cmd.env("HUGGING_FACE_HUB_TOKEN", &token);
@@ -175,13 +195,14 @@ pub async fn ensure_running(
         LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
             .with_cause("Failed to spawn llama-server for the assistant")
             .with_hint(format!(
-                "Tried: {} -hf {BONSAI_HF_REF} — ensure llama-server supports -hf (recent llama.cpp)",
-                bin.display()
+                "Tried: {} -m {} --host {host} --port {port} -ngl {ngl}",
+                bin.display(),
+                gguf.display()
             ))
             .retryable(true)
     })?;
 
-    drain_child_io("assistant-llama", &mut child);
+    let stderr_tail = drain_child_io_capture("assistant-llama", &mut child);
 
     let runtime = LocalAssistantRuntime {
         child: Arc::new(Mutex::new(Some(child))),
@@ -190,12 +211,16 @@ pub async fn ensure_running(
         model_id: ASSISTANT_MODEL_ID.into(),
     };
 
-    // Wait for health (HF download + model load can take a while).
+    // Wait for health (model load can take a while on CPU).
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(600);
     loop {
         if runtime.is_healthy().await {
             mark_ready(paths);
-            info!(port, hf = BONSAI_HF_REF, "local assistant server ready");
+            info!(
+                port,
+                model = %gguf.display(),
+                "local assistant server ready"
+            );
             return Ok(runtime);
         }
         // Child died?
@@ -204,16 +229,25 @@ pub async fn ensure_running(
             if let Some(child) = guard.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
                     *guard = None;
+                    let log = stderr_tail.lock().await.clone();
+                    let log_snip = if log.is_empty() {
+                        "(no stderr captured — check logs)".into()
+                    } else {
+                        // Keep last ~2 KB of server output for the error dialog.
+                        let bytes = log.as_bytes();
+                        let start = bytes.len().saturating_sub(2048);
+                        String::from_utf8_lossy(&bytes[start..]).into_owned()
+                    };
                     return Err(LocalCodeError::new(
                         ErrorCode::BackendStartFailed,
                         format!("Assistant llama-server exited: {status}"),
                     )
                     .with_cause(format!(
-                        "Command was: llama-server -hf {BONSAI_HF_REF}. \
-                         Check network, HF_TOKEN, and that the quant exists on the repo."
+                        "Command was: llama-server -m {BONSAI_FILE} --host {host} --port {port} -ngl {ngl}"
                     ))
+                    .with_cause(log_snip)
+                    .with_hint("Requires PrismML llama.cpp (custom 1-bit / DSpark kernels)")
                     .with_hint("https://huggingface.co/prism-ml/Bonsai-27B-gguf")
-                    .with_hint("Set HF_TOKEN if the repo is gated or rate-limited")
                     .retryable(true));
                 }
             }
@@ -225,9 +259,8 @@ pub async fn ensure_running(
                 "Assistant llama-server did not become healthy in time",
             )
             .with_hint(format!(
-                "First start downloads {BONSAI_HF_REF} via -hf; check free disk space and network"
+                "Loading {BONSAI_FILE}; check free RAM/VRAM (several GB peak)"
             ))
-            .with_hint("Check free RAM/VRAM; Bonsai needs several GB peak at short context")
             .retryable(true));
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -238,8 +271,13 @@ fn port_in_use(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
 }
 
-fn drain_child_io(tag: &str, child: &mut Child) {
+/// Drain stdout/stderr to tracing; also accumulate stderr for failure messages.
+fn drain_child_io_capture(
+    tag: &str,
+    child: &mut Child,
+) -> Arc<Mutex<String>> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    let stderr_acc = Arc::new(Mutex::new(String::new()));
     if let Some(stdout) = child.stdout.take() {
         let tag = tag.to_string();
         tokio::spawn(async move {
@@ -251,28 +289,33 @@ fn drain_child_io(tag: &str, child: &mut Child) {
     }
     if let Some(stderr) = child.stderr.take() {
         let tag = tag.to_string();
+        let acc = stderr_acc.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "assistant_io", backend = %tag, "{line}");
+                tracing::info!(target: "assistant_io", backend = %tag, "{line}");
+                let mut g = acc.lock().await;
+                if g.len() < 16_384 {
+                    g.push_str(&line);
+                    g.push('\n');
+                }
             }
         });
     }
+    stderr_acc
 }
 
 /// Soft check used by the TUI without starting the server.
-/// Ready when a **PrismML** llama-server is present and the model has been
-/// pulled (or is already marked ready from a previous successful start).
+/// Ready when a **PrismML** llama-server is present and the Q4_1 GGUF is on disk.
 pub fn is_installed(_cfg: &Config, paths: &AppPaths) -> bool {
     localcode_backends::resolve_prism_llamacpp_bin(paths).is_some() && model_installed(paths)
 }
 
-/// Note about the -hf launch path and custom runtime.
+/// Note about the -m launch path and custom runtime.
 pub fn quant_compatibility_note() -> &'static str {
-    "The assistant starts with: llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 \
-     using the PrismML llama.cpp fork (auto-built from source when git+cmake are \
-     available, or a Prism prebuilt). Stock llama.cpp cannot load this model. \
-     Set HF_TOKEN if the HF download fails."
+    "The assistant starts with: llama-server -m Bonsai-27B-dspark-Q4_1.gguf \
+     --host 127.0.0.1 --port <local_port> -ngl 99 \
+     using the PrismML llama.cpp fork. Stock llama.cpp cannot load this model."
 }
 
 impl Drop for LocalAssistantRuntime {
