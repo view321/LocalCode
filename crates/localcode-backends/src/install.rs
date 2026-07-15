@@ -41,12 +41,15 @@ pub enum InstallStep {
         args: Vec<String>,
         display: String,
     },
-    /// Download a prebuilt llama.cpp release for this OS and extract it into
-    /// `dest_dir`, then repoint the backend at the extracted `llama-server`
-    /// binary. Runs entirely in-process (HTTP + unarchive — `.zip` on Windows,
-    /// `.tar.gz` on Linux/macOS) so llama.cpp installs from the TUI on platforms
-    /// without a package manager.
+    /// Download a prebuilt **PrismML** llama.cpp release (Bonsai / Q1_0 kernels)
+    /// for this OS and extract it into `dest_dir`, then repoint the backend at
+    /// the extracted `llama-server`. Same in-process HTTP + unarchive path as a
+    /// generic release fetch (`.zip` on Windows, `.tar.gz` on Linux/macOS).
     FetchLlamaCpp { dest_dir: PathBuf, display: String },
+    /// Clone + cmake-build the PrismML llama.cpp fork as described on the
+    /// Bonsai model card (`git clone` → `cmake -B build [-DGGML_CUDA=ON]` →
+    /// `cmake --build build -j`). Preferred when `git` and `cmake` are on PATH.
+    BuildPrismLlamaCpp { dest_dir: PathBuf, display: String },
 }
 
 impl InstallStep {
@@ -89,6 +92,7 @@ impl InstallStep {
             InstallStep::PipInstall { package } => format!("python -m pip install {package}"),
             InstallStep::Sudo { display, .. } => display.clone(),
             InstallStep::FetchLlamaCpp { display, .. } => display.clone(),
+            InstallStep::BuildPrismLlamaCpp { display, .. } => display.clone(),
         }
     }
 }
@@ -236,32 +240,49 @@ fn ollama_plan(os: &str, has: &dyn Fn(&str) -> bool) -> InstallPlan {
 }
 
 fn llamacpp_plan(os: &str, has: &dyn Fn(&str) -> bool, dest_dir: &Path) -> InstallPlan {
-    // A package manager gives the cleanest, self-updating install when present.
-    if matches!(os, "macos" | "linux") && has("brew") {
-        return InstallPlan::automated(vec![InstallStep::command(
-            "brew",
-            &["install", "llama.cpp"],
-        )]);
+    // Bonsai (and other Prism 1-bit GGUFs) need the PrismML llama.cpp fork —
+    // stock ggml-org / Homebrew builds lack the Q1_0_g128 hybrid-attention
+    // kernels. Prefer the model-card source build when the toolchain is present;
+    // otherwise fetch a Prism prebuilt release.
+    //
+    // Model card (https://huggingface.co/prism-ml/Bonsai-27B-gguf):
+    //   git clone https://github.com/PrismML-Eng/llama.cpp
+    //   cmake -B build -DGGML_CUDA=ON && cmake --build build -j   # CUDA
+    //   cmake -B build && cmake --build build -j                 # Metal / CPU
+    if has("git") && has("cmake") {
+        let cuda_hint = if has("nvcc") {
+            " with CUDA (GGML_CUDA=ON)"
+        } else if os == "macos" {
+            " with Metal (default on macOS)"
+        } else {
+            " (CPU)"
+        };
+        return InstallPlan::automated(vec![InstallStep::BuildPrismLlamaCpp {
+            dest_dir: dest_dir.to_path_buf(),
+            display: format!(
+                "Build PrismML llama.cpp from source{cuda_hint} → {}",
+                dest_dir.display()
+            ),
+        }]);
     }
-    // Otherwise fetch a prebuilt release and extract it in-app (works on
-    // Windows and package-manager-less Linux/macOS). CPU build: universally
-    // compatible — GPU users can still use Ollama/vLLM.
     if matches!(os, "windows" | "linux" | "macos") {
         return InstallPlan::automated(vec![InstallStep::FetchLlamaCpp {
             dest_dir: dest_dir.to_path_buf(),
             display: format!(
-                "Download prebuilt llama.cpp (CPU) from github.com/ggml-org/llama.cpp and install to {}",
+                "Download prebuilt PrismML llama.cpp (Bonsai kernels) from github.com/PrismML-Eng/llama.cpp → {}",
                 dest_dir.display()
             ),
         }]);
     }
     InstallPlan::Manual {
-        summary: "Download a prebuilt llama.cpp server binary and point config at it.".into(),
+        summary: "Bonsai needs the PrismML llama.cpp fork (custom 1-bit kernels).".into(),
         steps: vec![
-            "Download the latest release build for your OS/GPU".into(),
-            "Unzip it, then put llama-server(.exe) on PATH or set backends.llamacpp.bin".into(),
+            "git clone https://github.com/PrismML-Eng/llama.cpp && cd llama.cpp".into(),
+            "cmake -B build -DGGML_CUDA=ON   # or omit -DGGML_CUDA on macOS/CPU".into(),
+            "cmake --build build -j".into(),
+            "Point backends.llamacpp.bin at build/bin/llama-server(.exe)".into(),
         ],
-        url: "https://github.com/ggml-org/llama.cpp/releases".into(),
+        url: "https://github.com/PrismML-Eng/llama.cpp".into(),
     }
 }
 
@@ -340,8 +361,14 @@ pub fn resolve_llamacpp_bin(configured: &str, paths: &AppPaths) -> Option<PathBu
     find_file(&managed, primary).or_else(|| find_file(&managed, "llama-server"))
 }
 
-/// Ensure a usable `llama-server` exists: reuse PATH / managed install, or run
-/// the platform install plan (Homebrew or in-app FetchLlamaCpp).
+/// Ensure a usable **PrismML** `llama-server` exists (Bonsai-compatible).
+///
+/// Reuses a managed install under [`llamacpp_managed_dir`] when a
+/// [`.prism-ml`](PRISM_MARKER) marker is present; otherwise runs the platform
+/// install plan (source build from PrismML-Eng/llama.cpp, or Prism prebuilt).
+///
+/// Stock `llama-server` on PATH alone is **not** sufficient for Bonsai — it
+/// lacks the custom 1-bit kernels — so we do not short-circuit on PATH here.
 ///
 /// Returns the absolute path to the binary. Callers should persist it as
 /// `backends.llamacpp.bin` so later runs do not depend on PATH.
@@ -351,9 +378,9 @@ pub async fn ensure_llamacpp_installed(
 ) -> Result<PathBuf, LocalCodeError> {
     paths.ensure_dirs()?;
 
-    if let Some(p) = resolve_llamacpp_bin("llama-server", paths) {
+    if let Some(p) = resolve_prism_llamacpp_bin(paths) {
         let _ = progress.send(format!(
-            "llama-server already available at {}",
+            "PrismML llama-server already available at {}",
             p.display()
         ));
         return Ok(p);
@@ -362,7 +389,9 @@ pub async fn ensure_llamacpp_installed(
     let plan = resolve_install_plan(BackendKind::LlamaCpp, paths);
     match &plan {
         InstallPlan::Automated { display, .. } => {
-            let _ = progress.send(format!("Installing llama.cpp…\n{display}"));
+            let _ = progress.send(format!(
+                "Installing PrismML llama.cpp (required for Bonsai)…\n{display}"
+            ));
         }
         InstallPlan::Manual {
             summary,
@@ -376,7 +405,7 @@ pub async fn ensure_llamacpp_installed(
             .with_cause(steps.join("\n"))
             .with_hint(format!("See {url}"))
             .with_hint(
-                "Install llama-server manually, then set backends.llamacpp.bin in config.toml",
+                "Build or download PrismML llama-server, then set backends.llamacpp.bin in config.toml",
             ));
         }
     }
@@ -386,9 +415,17 @@ pub async fn ensure_llamacpp_installed(
         return Ok(PathBuf::from(r.bin));
     }
 
-    // Package-manager installs (e.g. brew) leave the binary on PATH without a repoint.
-    if let Some(p) = resolve_llamacpp_bin("llama-server", paths) {
+    if let Some(p) = resolve_prism_llamacpp_bin(paths) {
         let _ = progress.send(format!("llama-server ready at {}", p.display()));
+        return Ok(p);
+    }
+
+    // Last resort: any managed/PATH binary (legacy stock installs).
+    if let Some(p) = resolve_llamacpp_bin("llama-server", paths) {
+        let _ = progress.send(format!(
+            "llama-server at {} (may lack Prism 1-bit kernels — Bonsai may fail)",
+            p.display()
+        ));
         return Ok(p);
     }
 
@@ -397,7 +434,39 @@ pub async fn ensure_llamacpp_installed(
         "llama-server not found after install",
     )
     .with_hint("Install llama.cpp from the Backends panel or set backends.llamacpp.bin")
+    .with_hint("Bonsai requires https://github.com/PrismML-Eng/llama.cpp")
     .retryable(true))
+}
+
+/// Marker file written next to a managed PrismML llama.cpp install.
+const PRISM_MARKER: &str = ".prism-ml";
+
+/// Managed `llama-server` that was installed from the PrismML fork (build or
+/// prebuilt). Returns `None` if only a stock / unmarked tree is present.
+pub fn resolve_prism_llamacpp_bin(paths: &AppPaths) -> Option<PathBuf> {
+    let managed = llamacpp_managed_dir(paths);
+    if !managed.join(PRISM_MARKER).is_file() {
+        return None;
+    }
+    let primary = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    find_file(&managed, primary).or_else(|| find_file(&managed, "llama-server"))
+}
+
+fn write_prism_marker(dest_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dest_dir.join(PRISM_MARKER),
+        format!(
+            "repo=https://github.com/PrismML-Eng/llama.cpp\n\
+             purpose=Bonsai / Q1_0_g128 hybrid-attention kernels\n\
+             installed_by=localcode\n"
+        ),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Resolve an install plan against the real environment.
@@ -510,6 +579,13 @@ pub async fn run_install(
                     bin,
                 });
             }
+            InstallStep::BuildPrismLlamaCpp { dest_dir, .. } => {
+                let bin = build_prism_llamacpp(dest_dir, &progress, cid).await?;
+                repoint = Some(Repoint {
+                    kind: BackendKind::LlamaCpp,
+                    bin,
+                });
+            }
             InstallStep::Sudo {
                 program,
                 args,
@@ -567,10 +643,11 @@ async fn run_step(
             .with_cause(format!("step: {display}")));
         }
         // Handled by `run_install` directly (it needs to capture the repoint).
-        InstallStep::FetchLlamaCpp { display, .. } => {
+        InstallStep::FetchLlamaCpp { display, .. }
+        | InstallStep::BuildPrismLlamaCpp { display, .. } => {
             return Err(LocalCodeError::new(
                 ErrorCode::BackendInstallFailed,
-                "Internal: a fetch step reached the generic step runner",
+                "Internal: a managed llama.cpp step reached the generic step runner",
             )
             .with_correlation(cid)
             .with_cause(format!("step: {display}")));
@@ -618,17 +695,18 @@ async fn run_step(
 }
 
 // ----------------------------------------------------------------------------
-// llama.cpp prebuilt fetch (in-app download + extract, no package manager)
+// PrismML llama.cpp (Bonsai kernels) — prebuilt fetch + source build
 // ----------------------------------------------------------------------------
 
-/// GitHub API for the latest llama.cpp release.
-const LLAMACPP_RELEASES_API: &str =
-    "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+/// PrismML fork — required for Bonsai Q1_0 / DSpark GGUFs (model card).
+const PRISM_LLAMACPP_GIT: &str = "https://github.com/PrismML-Eng/llama.cpp.git";
+/// GitHub API for the latest PrismML llama.cpp release (prebuilt binaries).
+const PRISM_LLAMACPP_RELEASES_API: &str =
+    "https://api.github.com/repos/PrismML-Eng/llama.cpp/releases/latest";
 
-/// Download and extract a prebuilt llama.cpp release into `dest_dir`, returning
-/// the absolute path to the extracted `llama-server` binary. Honest failure — a
-/// clear, retryable error when no matching asset exists or extraction fails —
-/// never a fabricated success.
+/// Download and extract a prebuilt **PrismML** llama.cpp release into
+/// `dest_dir`, returning the absolute path to `llama-server`. Prefer CUDA when
+/// the host has NVIDIA tooling; otherwise a CPU/Metal asset.
 async fn fetch_llamacpp(
     dest_dir: &Path,
     progress: &UnboundedSender<String>,
@@ -637,7 +715,11 @@ async fn fetch_llamacpp(
     let fail = |msg: String| {
         LocalCodeError::new(ErrorCode::BackendInstallFailed, msg)
             .with_correlation(cid)
-            .with_hint("Or install llama.cpp manually from github.com/ggml-org/llama.cpp/releases")
+            .with_hint(
+                "Or build from source: git clone https://github.com/PrismML-Eng/llama.cpp \
+                 && cmake -B build -DGGML_CUDA=ON && cmake --build build -j",
+            )
+            .with_hint("https://huggingface.co/prism-ml/Bonsai-27B-gguf")
             .retryable(true)
     };
 
@@ -648,9 +730,12 @@ async fn fetch_llamacpp(
         .build()
         .map_err(|e| fail(e.to_string()))?;
 
-    let _ = progress.send("$ querying github.com/ggml-org/llama.cpp for the latest release".into());
+    let prefer_cuda = which::which("nvidia-smi").is_ok() || which::which("nvcc").is_ok();
+    let _ = progress.send(
+        "$ querying github.com/PrismML-Eng/llama.cpp for the latest Prism release".into(),
+    );
     let resp = client
-        .get(LLAMACPP_RELEASES_API)
+        .get(PRISM_LLAMACPP_RELEASES_API)
         .send()
         .await
         .map_err(|e| fail(format!("Couldn't reach the GitHub releases API: {e}")))?;
@@ -675,10 +760,19 @@ async fn fetch_llamacpp(
         })
         .unwrap_or_default();
 
-    let (asset_name, asset_url) =
-        pick_llamacpp_asset(&assets, std::env::consts::OS, std::env::consts::ARCH).ok_or_else(
-            || fail("The latest release has no prebuilt CPU build for this OS/arch".into()),
-        )?;
+    let (asset_name, asset_url) = pick_llamacpp_asset(
+        &assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        prefer_cuda,
+    )
+    .ok_or_else(|| {
+        fail(
+            "The latest Prism release has no prebuilt binary for this OS/arch \
+             (install git + cmake to build from source instead)"
+                .into(),
+        )
+    })?;
 
     let _ = progress.send(format!("$ downloading {asset_name}"));
     let bytes = client
@@ -692,7 +786,11 @@ async fn fetch_llamacpp(
         .map_err(|e| fail(format!("Download interrupted: {e}")))?
         .to_vec();
 
-    let _ = progress.send(format!("$ extracting {} ({} MiB)", asset_name, bytes.len() / 1_048_576));
+    let _ = progress.send(format!(
+        "$ extracting {} ({} MiB)",
+        asset_name,
+        bytes.len() / 1_048_576
+    ));
     let dest = dest_dir.to_path_buf();
     let name = asset_name.clone();
     let bin = tokio::task::spawn_blocking(move || extract_llamacpp_archive(&bytes, &dest, &name))
@@ -700,55 +798,292 @@ async fn fetch_llamacpp(
         .map_err(|e| fail(e.to_string()))?
         .map_err(fail)?;
 
-    let _ = progress.send(format!("llama-server installed to {}", bin.display()));
+    write_prism_marker(dest_dir).map_err(fail)?;
+    let _ = progress.send(format!(
+        "PrismML llama-server installed to {}",
+        bin.display()
+    ));
     Ok(bin.display().to_string())
 }
 
-/// Pick the CPU release asset matching this OS/arch, preferring the most
-/// specific name. Pure so the matching rules are unit-tested. Returns
-/// `(name, download_url)`. GPU/accelerator builds (CUDA/HIP/Vulkan/OpenVINO/…)
-/// are excluded — the CPU build runs everywhere; GPU users can use Ollama/vLLM
-/// instead.
+/// Clone and cmake-build the PrismML llama.cpp fork (model-card quickstart).
 ///
-/// Archive format is OS-specific: llama.cpp ships Windows builds as `.zip` and
-/// Linux/macOS builds as `.tar.gz`. Matching on the wrong extension is why the
-/// in-app fetch silently found nothing on Linux — so the accepted extensions
-/// are chosen per-OS here and honored by [`extract_llamacpp_archive`].
+/// ```text
+/// git clone https://github.com/PrismML-Eng/llama.cpp
+/// cmake -B build -DGGML_CUDA=ON   # when nvcc is present
+/// cmake --build build -j
+/// ```
+async fn build_prism_llamacpp(
+    dest_dir: &Path,
+    progress: &UnboundedSender<String>,
+    cid: localcode_core::CorrelationId,
+) -> Result<String, LocalCodeError> {
+    let fail = |msg: String| {
+        LocalCodeError::new(ErrorCode::BackendInstallFailed, msg)
+            .with_correlation(cid)
+            .with_hint(
+                "Model card build: https://huggingface.co/prism-ml/Bonsai-27B-gguf \
+                 (git clone PrismML-Eng/llama.cpp, cmake -B build, cmake --build build -j)",
+            )
+            .with_hint("Need git, cmake, and a C/C++ toolchain (Visual Studio / Xcode / build-essential)")
+            .retryable(true)
+    };
+
+    if which::which("git").is_err() {
+        return Err(fail("`git` not found on PATH".into()));
+    }
+    if which::which("cmake").is_err() {
+        return Err(fail("`cmake` not found on PATH".into()));
+    }
+
+    let src_dir = dest_dir.join("src");
+    std::fs::create_dir_all(dest_dir).map_err(|e| fail(e.to_string()))?;
+
+    // Clone or refresh the PrismML fork (shallow).
+    if src_dir.join(".git").is_dir() {
+        let _ = progress.send(format!(
+            "$ git -C {} pull --ff-only (PrismML llama.cpp)",
+            src_dir.display()
+        ));
+        let status = tokio::process::Command::new("git")
+            .args(["-C"])
+            .arg(&src_dir)
+            .args(["pull", "--ff-only"])
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .await
+            .map_err(|e| fail(format!("git pull failed to start: {e}")))?;
+        if !status.success() {
+            let _ = progress.send(
+                "git pull failed — continuing with existing tree (may be offline)".into(),
+            );
+        }
+    } else {
+        // Remove a partial non-git tree so clone can succeed.
+        if src_dir.exists() {
+            let _ = std::fs::remove_dir_all(&src_dir);
+        }
+        let _ = progress.send(format!("$ git clone --depth 1 {PRISM_LLAMACPP_GIT}"));
+        let mut child = tokio::process::Command::new("git")
+            .args(["clone", "--depth", "1", PRISM_LLAMACPP_GIT])
+            .arg(&src_dir)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| fail(format!("git clone failed to start: {e}")))?;
+        forward_lines(child.stdout.take(), progress.clone());
+        forward_lines(child.stderr.take(), progress.clone());
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| fail(format!("git clone wait: {e}")))?;
+        if !status.success() {
+            return Err(fail(format!(
+                "git clone of PrismML llama.cpp failed ({status})"
+            )));
+        }
+    }
+
+    let want_cuda = which::which("nvcc").is_ok();
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .to_string();
+
+    // Configure (model card: cmake -B build [-DGGML_CUDA=ON]).
+    let mut cmake_args: Vec<String> = vec![
+        "-B".into(),
+        "build".into(),
+        "-DCMAKE_BUILD_TYPE=Release".into(),
+        // Server binary is what LocalCode / Bonsai need.
+        "-DLLAMA_BUILD_SERVER=ON".into(),
+    ];
+    if want_cuda {
+        cmake_args.push("-DGGML_CUDA=ON".into());
+        let _ = progress.send(
+            "$ cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release (PrismML llama.cpp)".into(),
+        );
+    } else if cfg!(target_os = "macos") {
+        let _ = progress.send(
+            "$ cmake -B build -DCMAKE_BUILD_TYPE=Release (Metal default on macOS)".into(),
+        );
+    } else {
+        let _ = progress.send(
+            "$ cmake -B build -DCMAKE_BUILD_TYPE=Release (CPU; install CUDA toolkit + nvcc for GPU)"
+                .into(),
+        );
+    }
+
+    let mut cfg = tokio::process::Command::new("cmake");
+    cfg.args(&cmake_args)
+        .current_dir(&src_dir)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cfg
+        .spawn()
+        .map_err(|e| fail(format!("cmake configure failed to start: {e}")))?;
+    forward_lines(child.stdout.take(), progress.clone());
+    forward_lines(child.stderr.take(), progress.clone());
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| fail(format!("cmake configure wait: {e}")))?;
+    if !status.success() {
+        return Err(fail(format!(
+            "cmake configure failed ({status}). On Windows install Visual Studio C++ tools; \
+             for CUDA install the CUDA toolkit so `nvcc` is on PATH."
+        )));
+    }
+
+    // Build (model card: cmake --build build -j).
+    let mut build_args: Vec<String> = vec![
+        "--build".into(),
+        "build".into(),
+        "-j".into(),
+        jobs.clone(),
+    ];
+    // Multi-config generators (Visual Studio) need an explicit config.
+    if cfg!(windows) {
+        build_args.push("--config".into());
+        build_args.push("Release".into());
+    }
+    let _ = progress.send(format!(
+        "$ cmake --build build -j {jobs}{}",
+        if cfg!(windows) {
+            " --config Release"
+        } else {
+            ""
+        }
+    ));
+    let mut child = tokio::process::Command::new("cmake")
+        .args(&build_args)
+        .current_dir(&src_dir)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| fail(format!("cmake build failed to start: {e}")))?;
+    forward_lines(child.stdout.take(), progress.clone());
+    forward_lines(child.stderr.take(), progress.clone());
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| fail(format!("cmake build wait: {e}")))?;
+    if !status.success() {
+        return Err(fail(format!(
+            "cmake build failed ({status}). Check compiler / CUDA toolkit output above."
+        )));
+    }
+
+    let bin_name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    // Search the whole managed tree (build/bin, build/bin/Release, …).
+    let bin = find_file(dest_dir, bin_name)
+        .or_else(|| find_file(&src_dir, bin_name))
+        .ok_or_else(|| {
+            fail(format!(
+                "{bin_name} was not produced under {}",
+                dest_dir.display()
+            ))
+        })?;
+
+    write_prism_marker(dest_dir).map_err(fail)?;
+    let _ = progress.send(format!(
+        "PrismML llama-server built at {} ({})",
+        bin.display(),
+        if want_cuda { "CUDA" } else { "CPU/Metal" }
+    ));
+    Ok(bin.display().to_string())
+}
+
+/// Pick a Prism (or compatible) release asset for this OS/arch.
+///
+/// When `prefer_cuda` is true, CUDA builds are preferred on Windows/Linux;
+/// otherwise CPU (or macOS Metal) archives win. HIP/Vulkan/OpenVINO are never
+/// chosen automatically (driver matrix too wide). Pure for unit tests.
+///
+/// Archive format: Windows `.zip`, Linux/macOS `.tar.gz`.
 fn pick_llamacpp_asset(
     assets: &[(String, String)],
     os: &str,
     arch: &str,
+    prefer_cuda: bool,
 ) -> Option<(String, String)> {
-    const GPU_MARKERS: [&str; 10] = [
-        "cuda", "cu11", "cu12", "hip", "rocm", "vulkan", "sycl", "musa", "kompute", "openvino",
+    const SKIP_MARKERS: [&str; 8] = [
+        "hip", "rocm", "vulkan", "sycl", "musa", "kompute", "openvino", "kleidiai",
     ];
+    // cudart DLL packs are not the full binary archive.
+    const SKIP_NAME: [&str; 2] = ["cudart", "xcframework"];
+
     let exts: &[&str] = if os == "windows" {
         &[".zip"]
     } else {
         &[".tar.gz", ".tgz"]
     };
-    let cpu_archive = |n: &str| {
+    let is_archive = |n: &str| {
         let l = n.to_lowercase();
-        exts.iter().any(|e| l.ends_with(e)) && !GPU_MARKERS.iter().any(|m| l.contains(m))
+        exts.iter().any(|e| l.ends_with(e))
+            && !SKIP_MARKERS.iter().any(|m| l.contains(m))
+            && !SKIP_NAME.iter().any(|m| l.contains(m))
+    };
+    let is_cuda = |n: &str| {
+        let l = n.to_lowercase();
+        l.contains("cuda") || l.contains("cu12") || l.contains("cu11")
     };
     let all = |n: &str, pats: &[&str]| {
         let l = n.to_lowercase();
         pats.iter().all(|p| l.contains(p))
     };
-    let prefs: Vec<Vec<&str>> = match (os, arch) {
+
+    let os_prefs: Vec<Vec<&str>> = match (os, arch) {
         ("windows", "aarch64") => vec![vec!["win", "arm64"], vec!["bin-win"]],
-        ("windows", _) => vec![vec!["win", "x64"], vec!["bin-win"]],
-        ("linux", "aarch64") => vec![vec!["ubuntu", "arm64"], vec!["linux", "arm64"]],
-        ("linux", _) => vec![vec!["ubuntu", "x64"], vec!["ubuntu"], vec!["linux", "x64"]],
-        ("macos", "aarch64") => vec![vec!["macos", "arm64"], vec!["bin-macos"]],
-        ("macos", _) => vec![vec!["macos", "x64"], vec!["bin-macos"]],
+        ("windows", _) => vec![vec!["win", "x64"], vec!["bin-win"], vec!["win"]],
+        ("linux", "aarch64") => vec![
+            vec!["ubuntu", "arm64"],
+            vec!["linux", "arm64"],
+            vec!["ubuntu"],
+        ],
+        ("linux", _) => vec![
+            vec!["ubuntu", "x64"],
+            vec!["linux", "x64"],
+            vec!["ubuntu"],
+            vec!["linux"],
+        ],
+        ("macos", "aarch64") => vec![vec!["macos", "arm64"], vec!["bin-macos"], vec!["macos"]],
+        ("macos", _) => vec![vec!["macos", "x64"], vec!["bin-macos"], vec!["macos"]],
         _ => return None,
     };
-    for pats in &prefs {
-        if let Some((n, u)) = assets
-            .iter()
-            .find(|(n, _)| cpu_archive(n) && all(n, pats))
-        {
+
+    let candidates: Vec<&(String, String)> = assets
+        .iter()
+        .filter(|(n, _)| is_archive(n))
+        .collect();
+
+    // Pass 1: OS match + CUDA if preferred.
+    // Pass 2: OS match + non-CUDA.
+    for want_cuda in [prefer_cuda && os != "macos", false] {
+        for pats in &os_prefs {
+            if let Some((n, u)) = candidates.iter().find(|(n, _)| {
+                all(n, pats) && is_cuda(n) == want_cuda
+            }) {
+                return Some((n.clone(), u.clone()));
+            }
+        }
+    }
+    // Pass 3: any OS-matching archive (CUDA or not).
+    for pats in &os_prefs {
+        if let Some((n, u)) = candidates.iter().find(|(n, _)| all(n, pats)) {
             return Some((n.clone(), u.clone()));
         }
     }
@@ -1305,37 +1640,57 @@ mod tests {
     }
 
     #[test]
-    fn llamacpp_brew_when_available() {
-        let has = |b: &str| b == "brew";
+    fn llamacpp_builds_prism_when_git_and_cmake_present() {
+        // Model-card path: source-build PrismML-Eng/llama.cpp (not Homebrew stock).
+        let has = |b: &str| b == "git" || b == "cmake";
         let steps = automated(ip(BackendKind::LlamaCpp, "macos", &has, false));
-        assert!(steps[0].display().contains("brew install llama.cpp"));
+        assert!(matches!(&steps[0], InstallStep::BuildPrismLlamaCpp { .. }));
+        assert!(steps[0].display().contains("PrismML"));
     }
 
     #[test]
-    fn llamacpp_windows_fetches_prebuilt_in_app() {
-        // No package manager on Windows: install by downloading a prebuilt
-        // release in-app, so the user never has to leave the TUI.
+    fn llamacpp_builds_with_cuda_hint_when_nvcc_present() {
+        let has = |b: &str| matches!(b, "git" | "cmake" | "nvcc");
+        let steps = automated(ip(BackendKind::LlamaCpp, "linux", &has, false));
+        assert!(matches!(&steps[0], InstallStep::BuildPrismLlamaCpp { .. }));
+        assert!(steps[0].display().contains("CUDA"));
+    }
+
+    #[test]
+    fn llamacpp_windows_fetches_prism_prebuilt_without_toolchain() {
+        // No git/cmake: fall back to Prism release download in-app.
         let steps = automated(ip(BackendKind::LlamaCpp, "windows", &no, false));
         assert!(matches!(&steps[0], InstallStep::FetchLlamaCpp { .. }));
-        assert!(steps[0].display().contains("llama.cpp"));
+        assert!(steps[0].display().contains("PrismML"));
     }
 
     #[test]
-    fn llamacpp_linux_without_brew_fetches_prebuilt() {
+    fn llamacpp_linux_without_toolchain_fetches_prism_prebuilt() {
         let steps = automated(ip(BackendKind::LlamaCpp, "linux", &no, false));
         assert!(matches!(&steps[0], InstallStep::FetchLlamaCpp { .. }));
+        assert!(steps[0].display().contains("PrismML"));
     }
 
     #[test]
-    fn picks_cpu_windows_asset_over_gpu_builds() {
+    fn picks_cpu_windows_asset_when_cuda_not_preferred() {
         let assets = vec![
             ("llama-b100-bin-win-cuda-12.4-x64.zip".to_string(), "cuda-url".to_string()),
             ("llama-b100-bin-win-cpu-x64.zip".to_string(), "cpu-url".to_string()),
             ("llama-b100-bin-ubuntu-x64.zip".to_string(), "linux-url".to_string()),
         ];
-        let (name, url) = pick_llamacpp_asset(&assets, "windows", "x86_64").unwrap();
+        let (name, url) = pick_llamacpp_asset(&assets, "windows", "x86_64", false).unwrap();
         assert_eq!(url, "cpu-url");
         assert!(name.contains("cpu"));
+    }
+
+    #[test]
+    fn picks_cuda_windows_asset_when_preferred() {
+        let assets = vec![
+            ("llama-prism-bin-win-cuda-12.4-x64.zip".to_string(), "cuda-url".to_string()),
+            ("llama-bin-win-cpu-x64.zip".to_string(), "cpu-url".to_string()),
+        ];
+        let (_name, url) = pick_llamacpp_asset(&assets, "windows", "x86_64", true).unwrap();
+        assert_eq!(url, "cuda-url");
     }
 
     #[test]
@@ -1345,10 +1700,12 @@ mod tests {
             ("llama-b100-bin-win-cpu-x64.zip".to_string(), "win-url".to_string()),
         ];
         assert_eq!(
-            pick_llamacpp_asset(&assets, "linux", "x86_64").unwrap().1,
+            pick_llamacpp_asset(&assets, "linux", "x86_64", false)
+                .unwrap()
+                .1,
             "linux-url"
         );
-        assert!(pick_llamacpp_asset(&assets, "freebsd", "x86_64").is_none());
+        assert!(pick_llamacpp_asset(&assets, "freebsd", "x86_64", false).is_none());
     }
 
     #[test]
@@ -1360,24 +1717,24 @@ mod tests {
             "llama-b100-bin-ubuntu-x64.zip".to_string(),
             "zip".to_string(),
         )];
-        assert!(pick_llamacpp_asset(&zip_only, "linux", "x86_64").is_none());
+        assert!(pick_llamacpp_asset(&zip_only, "linux", "x86_64", false).is_none());
 
         let both = vec![
             ("llama-b100-bin-ubuntu-x64.zip".to_string(), "zip".to_string()),
             ("llama-b100-bin-ubuntu-x64.tar.gz".to_string(), "targz".to_string()),
         ];
         assert_eq!(
-            pick_llamacpp_asset(&both, "linux", "x86_64").unwrap().1,
+            pick_llamacpp_asset(&both, "linux", "x86_64", false)
+                .unwrap()
+                .1,
             "targz"
         );
     }
 
     #[test]
-    fn excludes_openvino_and_gpu_builds_on_linux() {
-        // The real release lists accelerator builds (openvino, vulkan, rocm,
-        // sycl) *before* the plain CPU tarball; the plain ubuntu-x64 build must
-        // still win. openvino in particular is not a GPU marker by name, so it
-        // was added explicitly.
+    fn excludes_openvino_vulkan_rocm_on_linux() {
+        // Accelerator packs that need special drivers are never auto-picked;
+        // plain CPU (or CUDA when preferred) wins.
         let assets = vec![
             ("llama-b100-bin-ubuntu-openvino-2026.2.1-x64.tar.gz".into(), "openvino".into()),
             ("llama-b100-bin-ubuntu-vulkan-x64.tar.gz".to_string(), "vulkan".into()),
@@ -1385,7 +1742,9 @@ mod tests {
             ("llama-b100-bin-ubuntu-x64.tar.gz".to_string(), "cpu".to_string()),
         ];
         assert_eq!(
-            pick_llamacpp_asset(&assets, "linux", "x86_64").unwrap().1,
+            pick_llamacpp_asset(&assets, "linux", "x86_64", false)
+                .unwrap()
+                .1,
             "cpu"
         );
     }
@@ -1397,13 +1756,36 @@ mod tests {
             ("llama-b100-bin-macos-x64.tar.gz".to_string(), "x64".to_string()),
         ];
         assert_eq!(
-            pick_llamacpp_asset(&assets, "macos", "aarch64").unwrap().1,
+            pick_llamacpp_asset(&assets, "macos", "aarch64", false)
+                .unwrap()
+                .1,
             "arm"
         );
         assert_eq!(
-            pick_llamacpp_asset(&assets, "macos", "x86_64").unwrap().1,
+            pick_llamacpp_asset(&assets, "macos", "x86_64", false)
+                .unwrap()
+                .1,
             "x64"
         );
+    }
+
+    #[test]
+    fn resolve_prism_requires_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let managed = paths.llamacpp_dir();
+        std::fs::create_dir_all(managed.join("build/bin")).unwrap();
+        let server = if cfg!(windows) {
+            managed.join("build/bin/llama-server.exe")
+        } else {
+            managed.join("build/bin/llama-server")
+        };
+        std::fs::write(&server, b"x").unwrap();
+        // Without marker → not treated as Prism.
+        assert!(resolve_prism_llamacpp_bin(&paths).is_none());
+        write_prism_marker(&managed).unwrap();
+        assert_eq!(resolve_prism_llamacpp_bin(&paths).unwrap(), server);
     }
 
     #[test]
@@ -1444,13 +1826,35 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_pick_a_gpu_only_release() {
-        // No CPU asset available → no silent GPU install; caller shows an error.
+    fn refuses_vulkan_only_release_without_cpu_or_cuda() {
+        // Vulkan/HIP packs alone are not auto-installed (driver matrix).
         let assets = vec![
-            ("llama-b100-bin-win-cuda-x64.zip".to_string(), "c".to_string()),
             ("llama-b100-bin-win-vulkan-x64.zip".to_string(), "v".to_string()),
+            ("llama-b100-bin-win-hip-radeon-x64.zip".to_string(), "h".to_string()),
         ];
-        assert!(pick_llamacpp_asset(&assets, "windows", "x86_64").is_none());
+        assert!(pick_llamacpp_asset(&assets, "windows", "x86_64", false).is_none());
+        assert!(pick_llamacpp_asset(&assets, "windows", "x86_64", true).is_none());
+    }
+
+    #[test]
+    fn cuda_only_release_picked_when_cuda_preferred() {
+        let assets = vec![
+            ("llama-prism-bin-win-cuda-12.4-x64.zip".to_string(), "c".to_string()),
+        ];
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "windows", "x86_64", true)
+                .unwrap()
+                .1,
+            "c"
+        );
+        // Without prefer_cuda we still accept CUDA as last resort if it's the
+        // only OS-matching archive.
+        assert_eq!(
+            pick_llamacpp_asset(&assets, "windows", "x86_64", false)
+                .unwrap()
+                .1,
+            "c"
+        );
     }
 
     #[test]

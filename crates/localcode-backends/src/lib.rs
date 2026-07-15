@@ -14,8 +14,8 @@ pub use deploy::{DeployJob, DeployProgress, DeployRequest, DeployService};
 pub use diagnose::{classify, diagnose, Confidence, Diagnosis, FailureClass, RepairIntent};
 pub use install::{
     can_elevate_noninteractively, ensure_llamacpp_installed, llamacpp_managed_dir,
-    resolve_install_plan, resolve_llamacpp_bin, resolve_repair, run_install, run_repair,
-    InstallPlan, InstallStep, RepairPlan, Repoint,
+    resolve_install_plan, resolve_llamacpp_bin, resolve_prism_llamacpp_bin, resolve_repair,
+    run_install, run_repair, InstallPlan, InstallStep, RepairPlan, Repoint,
 };
 pub use registry::BackendRegistry;
 pub use smoke::{smoke_test, SmokeReport};

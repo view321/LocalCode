@@ -122,7 +122,7 @@ setup_llama() {
     info "llama-server ready"
   else
     warn "llama-server setup failed — run: localcode setup"
-    warn "Or install manually: https://github.com/ggml-org/llama.cpp/releases"
+    warn "Or build PrismML llama.cpp: https://github.com/PrismML-Eng/llama.cpp (required for Bonsai)"
   fi
 }
 

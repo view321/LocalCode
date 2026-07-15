@@ -170,7 +170,7 @@ function Setup-Llama {
     }
     catch {
         Write-Warn "llama-server setup failed — run: localcode setup"
-        Write-Warn "Or install manually: https://github.com/ggml-org/llama.cpp/releases"
+        Write-Warn "Or build PrismML llama.cpp: https://github.com/PrismML-Eng/llama.cpp (required for Bonsai)"
     }
 }
 

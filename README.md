@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/view321/LocalCode/main/scripts/inst
 irm https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.ps1 | iex
 ```
 
-Scripts install Rust (via rustup) if needed, clone this repo, build the release binary, place `localcode` on your PATH (`~/.local/bin` or `%USERPROFILE%\.local\bin`), and run `localcode setup` to install a managed **llama-server** (prebuilt CPU build) into LocalCode’s data dir, writing the absolute path to `backends.llamacpp.bin` in config. Skip with `LOCALCODE_SKIP_LLAMA=1`.
+Scripts install Rust (via rustup) if needed, clone this repo, build the release binary, place `localcode` on your PATH (`~/.local/bin` or `%USERPROFILE%\.local\bin`), and run `localcode setup` to install a managed **PrismML llama-server** (source build when git+cmake are available, else Prism prebuilt) into LocalCode’s data dir, writing the absolute path to `backends.llamacpp.bin` in config. Skip with `LOCALCODE_SKIP_LLAMA=1`.
 
 You can re-run setup anytime:
 
@@ -113,7 +113,17 @@ started with:
 ./llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1
 ```
 
-(~1.8 GB on first pull via llama.cpp’s `-hf` download; auto-installs `llama-server`):
+(~1.8 GB on first pull via llama.cpp’s `-hf` download). Bonsai needs the
+**[PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)** (custom
+1-bit / hybrid-attention kernels) — stock ggml-org builds will not load it.
+LocalCode installs that runtime automatically:
+
+1. **Preferred (model card):** when `git` and `cmake` are on PATH, clone
+   `https://github.com/PrismML-Eng/llama.cpp` and build with
+   `cmake -B build -DGGML_CUDA=ON` (if `nvcc` is present) then
+   `cmake --build build -j`.
+2. **Fallback:** download a matching prebuilt from
+   [PrismML-Eng/llama.cpp releases](https://github.com/PrismML-Eng/llama.cpp/releases).
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
 - Re-install later with `/assistant install`.
@@ -126,9 +136,9 @@ started with:
 Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
 `18080`), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
 
-> First start runs `llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1` (needs a recent
-> llama.cpp with `-hf` support). Set `HF_TOKEN` if the download is gated or
-> rate-limited.
+> First start runs `llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1` against the
+> managed PrismML build. Set `HF_TOKEN` if the download is gated or rate-limited.
+> For a CUDA build you need the CUDA toolkit (`nvcc` on PATH) at install time.
 
 ### Remote GPU over SSH
 

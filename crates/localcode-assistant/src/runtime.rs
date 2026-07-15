@@ -91,11 +91,13 @@ pub async fn ensure_running(
     let bin = resolve_llama_bin(cfg, paths).ok_or_else(|| {
         LocalCodeError::new(
             ErrorCode::BackendBinaryMissing,
-            "llama-server not found for the local assistant",
+            "PrismML llama-server not found for the local assistant",
         )
         .with_hint(
-            "Install llama.cpp from the Backends panel or accept the assistant install offer",
+            "Accept the assistant install offer (builds PrismML-Eng/llama.cpp) \
+             or run localcode setup",
         )
+        .with_hint("https://github.com/PrismML-Eng/llama.cpp")
     })?;
 
     let port = cfg.assistant.local_port;
@@ -259,16 +261,18 @@ fn drain_child_io(tag: &str, child: &mut Child) {
 }
 
 /// Soft check used by the TUI without starting the server.
-/// Ready when llama-server is present and the model has been pulled (or is
-/// already marked ready from a previous successful start).
-pub fn is_installed(cfg: &Config, paths: &AppPaths) -> bool {
-    resolve_llama_bin(cfg, paths).is_some() && model_installed(paths)
+/// Ready when a **PrismML** llama-server is present and the model has been
+/// pulled (or is already marked ready from a previous successful start).
+pub fn is_installed(_cfg: &Config, paths: &AppPaths) -> bool {
+    localcode_backends::resolve_prism_llamacpp_bin(paths).is_some() && model_installed(paths)
 }
 
-/// Note about the -hf launch path.
+/// Note about the -hf launch path and custom runtime.
 pub fn quant_compatibility_note() -> &'static str {
     "The assistant starts with: llama-server -hf prism-ml/Bonsai-27B-gguf:Q4_1 \
-     (llama.cpp downloads the quant on first launch). Set HF_TOKEN if download fails."
+     using the PrismML llama.cpp fork (auto-built from source when git+cmake are \
+     available, or a Prism prebuilt). Stock llama.cpp cannot load this model. \
+     Set HF_TOKEN if the HF download fails."
 }
 
 impl Drop for LocalAssistantRuntime {
