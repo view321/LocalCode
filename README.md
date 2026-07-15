@@ -128,7 +128,8 @@ that runtime automatically:
 3. **Weights:** download `Bonsai-27B-dspark-Q4_1.gguf` into the assistant data dir.
 
 - You can **decline** — preference is remembered (`assistant.local_preference`).
-- Re-install later with `/assistant install`.
+- Accept later with **`/assistant`** (or `/assistant accept`), **`/assistant install`**,
+  or **Settings → Accept local assistant**.
 - When ready it becomes the **default chat runtime** — type normally in the
   conversation view; you do not need to hunt for `/assistant`.
 - Tools: shell + filesystem, **Hugging Face search & model cards**, doctor

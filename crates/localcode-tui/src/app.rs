@@ -274,6 +274,10 @@ pub enum SettingAction {
     ToggleShellSandbox,
     ToggleSessions,
     ToggleAutoCompact,
+    /// Accept / install the bundled local Bonsai assistant.
+    AcceptLocalAssistant,
+    TogglePreferLocal,
+    ToggleAutoHandleErrors,
     ToggleTool(usize),
     ToggleSkill(usize),
     ReloadSkills,
@@ -900,29 +904,12 @@ impl App {
             app.ensure_llama_server_background();
         }
 
-        // One-time offer to install the local Bonsai assistant (user can decline).
+        // One-time offer to accept/install the local Bonsai assistant (user can decline).
+        // Re-offer any time with `/assistant`, `/assistant accept`, or Settings.
         if should_offer_install(&app.config) {
-            let need = install_need(&app.config, &app.paths);
-            if need != InstallNeed::Ready {
-                app.modal = Some(ModalState::confirm(
-                    format!("Install local {ASSISTANT_DISPLAY_NAME} assistant?"),
-                    format!(
-                        "{}\n\n{}",
-                        install_offer_body(&need),
-                        quant_compatibility_note()
-                    ),
-                    ConfirmAction::InstallLocalAssistant,
-                ));
-            } else {
-                // Files already present (e.g. copied in) — mark accepted.
-                app.config.assistant.local_preference = LocalAssistantPreference::Accepted;
-                let _ = app.config.save(&app.paths);
-            }
-        }
-
-        // Warm-start the local Bonsai assistant so the default conversation can
-        // use it without the user hunting for /assistant.
-        if app.local_assistant_ready && app.config.assistant.prefer_local {
+            app.offer_local_assistant_accept();
+        } else if app.local_assistant_ready && app.config.assistant.prefer_local {
+            // Already accepted in a previous session — warm-start for default chat.
             app.warm_start_local_assistant();
         }
 
@@ -1937,21 +1924,17 @@ impl App {
     }
 
     fn start_assistant(&mut self) {
-        if !self.assistant_configured && !self.local_assistant_ready {
-            // Offer local install when nothing is configured yet.
-            if should_offer_install(&self.config)
-                || self.config.assistant.local_preference == LocalAssistantPreference::Declined
-            {
-                let need = install_need(&self.config, &self.paths);
-                self.modal = Some(ModalState::confirm(
-                    format!("Install local {ASSISTANT_DISPLAY_NAME} assistant?"),
-                    install_offer_body(&need),
-                    ConfirmAction::InstallLocalAssistant,
-                ));
-                return;
-            }
+        // Prefer the local accept/install flow when Bonsai is not ready.
+        if !self.local_assistant_ready
+            || self.config.assistant.local_preference != LocalAssistantPreference::Accepted
+        {
+            self.offer_local_assistant_accept();
+            return;
+        }
+        if !self.assistant_configured {
             self.set_status(
-                "Assistant not configured — accept the local Bonsai install or set OPENROUTER_API_KEY",
+                "Assistant not configured — accept the local Bonsai install (Settings or /assistant) \
+                 or set OPENROUTER_API_KEY",
                 true,
             );
             return;
@@ -1961,6 +1944,38 @@ impl App {
             return;
         }
         self.spawn_assistant_turn(false);
+    }
+
+    /// Prompt the user to accept (and install) the local Bonsai assistant.
+    /// Used by `/assistant`, first-run offer, and Settings → Accept.
+    fn offer_local_assistant_accept(&mut self) {
+        if self.assistant_install_busy.is_some() {
+            self.set_status("Assistant install already running", false);
+            return;
+        }
+        let need = install_need(&self.config, &self.paths);
+        if need == InstallNeed::Ready {
+            // Weights + Prism binary already present — mark accepted and warm-start.
+            self.config.assistant.local_preference = LocalAssistantPreference::Accepted;
+            let _ = self.config.save(&self.paths);
+            self.local_assistant_ready = is_installed(&self.config, &self.paths);
+            self.assistant_configured = true;
+            self.set_status(
+                format!("{ASSISTANT_DISPLAY_NAME} accepted — starting local server…"),
+                false,
+            );
+            self.warm_start_local_assistant();
+            return;
+        }
+        self.modal = Some(ModalState::confirm(
+            format!("Accept local {ASSISTANT_DISPLAY_NAME} assistant?"),
+            format!(
+                "{}\n\n{}",
+                install_offer_body(&need),
+                quant_compatibility_note()
+            ),
+            ConfirmAction::InstallLocalAssistant,
+        ));
     }
 
     /// Background auto-handle after an error (no modal until the reply arrives).
@@ -2123,7 +2138,7 @@ impl App {
         self.config.assistant.local_preference = LocalAssistantPreference::Declined;
         let _ = self.config.save(&self.paths);
         self.set_status(
-            "Local assistant declined — you can install later with /assistant install",
+            "Local assistant declined — accept later with /assistant or Settings → Accept local assistant",
             false,
         );
     }
@@ -3623,7 +3638,7 @@ impl App {
             ("/new", "", "start a new conversation"),
             ("/deploy", "", "deploy the selected model"),
             ("/doctor", "", "run environment diagnostics"),
-            ("/assistant", "[install]", "install/start local Bonsai (default chat when ready)"),
+            ("/assistant", "[install|accept]", "accept/install local Bonsai (default chat when ready)"),
             ("/update", "", "install the available update"),
             ("/logs", "", "show the log directory path"),
             ("/help", "", "keyboard & mouse help"),
@@ -3945,13 +3960,31 @@ impl App {
                 self.set_mode(Mode::Chat);
                 self.new_coding_session();
             }
-            "assistant" | "ask" => {
-                if args.first().map(|s| s.as_str()) == Some("install") {
-                    self.start_install_local_assistant();
-                } else {
-                    self.start_assistant();
+            "assistant" | "ask" => match args.first().map(|s| s.as_str()) {
+                // Force install after accept (skips re-prompt only if already accepted).
+                Some("install") => {
+                    if self.config.assistant.local_preference
+                        != LocalAssistantPreference::Accepted
+                    {
+                        self.offer_local_assistant_accept();
+                    } else {
+                        self.start_install_local_assistant();
+                    }
                 }
-            }
+                // Explicit accept / re-offer.
+                Some("accept") => self.offer_local_assistant_accept(),
+                // Default: prompt to accept when not ready; otherwise run a help turn.
+                _ => {
+                    if !self.local_assistant_ready
+                        || self.config.assistant.local_preference
+                            != LocalAssistantPreference::Accepted
+                    {
+                        self.offer_local_assistant_accept();
+                    } else {
+                        self.start_assistant();
+                    }
+                }
+            },
             "update" => self.open_update_modal(),
             "redetect" | "detect" => {
                 self.start_detect();
@@ -4118,6 +4151,48 @@ impl App {
             "auto-compact",
             self.config.agent.auto_compact,
             SettingAction::ToggleAutoCompact,
+        ));
+
+        // Local Bonsai assistant (accept / prefer / auto-diagnose).
+        r.push(SettingsRow::header("assistant — local Bonsai"));
+        let pref = self.config.assistant.local_preference;
+        let accept_value = match (pref, self.local_assistant_ready) {
+            (LocalAssistantPreference::Accepted, true) => {
+                "accepted · ready — default chat".to_string()
+            }
+            (LocalAssistantPreference::Accepted, false) => {
+                "accepted · not installed — Enter to install".to_string()
+            }
+            (LocalAssistantPreference::Declined, _) => {
+                "declined — Enter to accept & install".to_string()
+            }
+            (LocalAssistantPreference::NotPrompted, _) => {
+                "not accepted — Enter to accept & install".to_string()
+            }
+        };
+        r.push(SettingsRow {
+            label: "accept local assistant".into(),
+            value: accept_value,
+            kind: SettingsRowKind::Action(match pref {
+                LocalAssistantPreference::Accepted if self.local_assistant_ready => "ready",
+                LocalAssistantPreference::Accepted => "install",
+                _ => "accept",
+            }),
+            action: Some(SettingAction::AcceptLocalAssistant),
+        });
+        r.push(toggle(
+            "prefer local",
+            self.config.assistant.prefer_local,
+            SettingAction::TogglePreferLocal,
+        ));
+        r.push(toggle(
+            "auto-handle errors",
+            self.config.assistant.auto_handle_errors,
+            SettingAction::ToggleAutoHandleErrors,
+        ));
+        r.push(SettingsRow::info(
+            "",
+            "also: /assistant or /assistant accept · install with /assistant install",
         ));
 
         // Agent: system prompt, AGENTS.md, workspace.
@@ -4292,6 +4367,32 @@ impl App {
             }
             SettingAction::ToggleAutoCompact => {
                 self.config.agent.auto_compact = !self.config.agent.auto_compact;
+            }
+            SettingAction::AcceptLocalAssistant => {
+                // Opens confirm / starts install; do not double-save here.
+                self.offer_local_assistant_accept();
+                return;
+            }
+            SettingAction::TogglePreferLocal => {
+                self.config.assistant.prefer_local = !self.config.assistant.prefer_local;
+                if self.config.assistant.prefer_local
+                    && self.local_assistant_ready
+                    && self.local_assistant.is_none()
+                {
+                    self.warm_start_local_assistant();
+                }
+                self.set_status(
+                    if self.config.assistant.prefer_local {
+                        "Prefer local Bonsai when ready"
+                    } else {
+                        "Local Bonsai not preferred for default chat"
+                    },
+                    false,
+                );
+            }
+            SettingAction::ToggleAutoHandleErrors => {
+                self.config.assistant.auto_handle_errors =
+                    !self.config.assistant.auto_handle_errors;
             }
             SettingAction::ToggleTool(i) => self.toggle_tool(i),
             SettingAction::ToggleSkill(i) => self.toggle_skill(i),
@@ -6250,7 +6351,15 @@ mod tests {
         app.mode = Mode::Settings;
         let rows = app.settings_rows();
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-        for expected in ["system prompt", "use AGENTS.md", "skills dir", "shell sandbox"] {
+        for expected in [
+            "system prompt",
+            "use AGENTS.md",
+            "skills dir",
+            "shell sandbox",
+            "accept local assistant",
+            "prefer local",
+            "auto-handle errors",
+        ] {
             assert!(labels.contains(&expected), "missing settings row: {expected}");
         }
         // The bundled sample skill shows up as an enable/disable toggle.

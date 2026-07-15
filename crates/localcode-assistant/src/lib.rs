@@ -302,7 +302,7 @@ pub fn startup_greeting(ready: bool) -> String {
         format!(
             "Tip: install the local {ASSISTANT_DISPLAY_NAME} assistant \
              (`llama-server -m {BONSAI_FILE} -ngl 99`, ~1.8 GB Q4_1) for offline repair, HF catalogue \
-             access, and a default local chat. You'll be prompted once, or run /assistant install."
+             access, and a default local chat. Accept with /assistant or Settings → Accept local assistant."
         )
     }
 }
