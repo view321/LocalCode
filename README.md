@@ -152,22 +152,27 @@ Accounts are **optional**. Local browse, deploy, coding, and benchmarks work off
 
 No tabs. A thin top line shows live chips (runtime health, GPU, API) and an
 update badge; the middle is the conversation transcript; the bottom is the
-**omnibar**, which is active in every mode.
+**omnibar** — a bordered multi-line composer that is active in every mode.
 
-- **Type** a message + `Enter` → chat with the agent.
-- Type **`/`** → the command menu opens above the bar (`↑`/`↓` pick, `Enter`
-  run, `Esc` close). `Ctrl+K` also opens it.
-- **`Esc`** → close a panel, or cancel the running task at home.
+- **Type** a message + `Enter` → chat with the agent. `Shift+Enter` (or
+  `Ctrl+Enter` / `Ctrl+J`) inserts a newline; multi-line paste just works.
+- Type **`/`** → the command menu docks right above the bar (`↑`/`↓` or the
+  mouse wheel pick, `Enter`/click run, `Esc` close). `Ctrl+K` also opens it.
+- Type **`@`** → a file picker docks above the bar; pick a workspace file to
+  attach its contents to the message (`@src/main.rs` style references).
+- **`Esc`** → close a picker/panel, or cancel the running task at home.
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send the prompt (or run the highlighted command) |
+| `Enter` | Send the prompt (or run the highlighted command / attach the file) |
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` | Insert a newline (multi-line composer) |
 | `/` or `Ctrl+K` | Open the command menu |
-| `↑`/`↓` | Command menu / panel navigation (input history at home) |
-| `Ctrl+↑`/`Ctrl+↓` | Grow/shrink the omnibar |
+| `@` | Attach a workspace file to the message |
+| `↑`/`↓` | Picker / panel navigation (input history at home) |
 | `Shift+Tab` | Cycle agent approvals (always approve → auto → approve edits → ask permission) |
 | `Ctrl+S` | Save config &nbsp;·&nbsp; `Ctrl+C` quit |
-| `Esc` | Close panel / cancel task |
+| `F2` | Select mode: release the mouse to copy text (press again to leave) |
+| `Esc` | Close picker/panel / cancel task |
 
 | Command | Opens |
 |---------|-------|
@@ -186,13 +191,14 @@ shell command; `ask permission` asks before every tool call. Headless runs
 (`localcode agent run`) have no prompt, so gated calls are refused there —
 pass `--approvals always` for unattended runs.
 
-**Themes**: `dark` (grayscale), `neon` (light blue), `pink` (hot pink), and
-`sage` (soft green on gray) — cycle with `/theme` or click a name in the
-status bar.
+**Themes**: `ember` (amber on dark maroon — the default), `dark` (grayscale),
+`neon` (light blue), `pink` (hot pink), and `sage` (soft green on gray) —
+cycle with `/theme`, or use the swatch dots at the right of the status bar
+(hover a dot for the theme's name, click to switch).
 
-Panels open as **popups** above the bar. **Model cards** render as formatted
-markdown with metadata chips and scroll independently; the focused pane has the
-accent border. **Pane sizes persist** across restarts (drag the pane borders).
+Everything renders **inline** — no popups: confirms and errors are banners at
+the top of the working area, pickers dock above the omnibar. **Model cards**
+render as formatted markdown with metadata chips and scroll independently.
 
 Mouse-first: click list rows, buttons (Deploy, Connect, Backend/Quant), and
 fields to edit; scroll wheel in transcript/card/panels (honors `ui.mouse`;

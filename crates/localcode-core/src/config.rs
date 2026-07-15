@@ -55,7 +55,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: ThemeMode::Dark,
+            theme: ThemeMode::default(),
             mouse: true,
             right_rail_hover_brightens: true,
             composer_rows: default_composer_rows(),
@@ -812,7 +812,7 @@ mod tests {
         let cfg = Config::default();
         cfg.save(&paths).unwrap();
         let loaded = Config::load(&paths).unwrap();
-        assert_eq!(loaded.ui.theme, ThemeMode::Dark);
+        assert_eq!(loaded.ui.theme, ThemeMode::default(), "default theme round-trips");
         assert_eq!(loaded.backends.default.kind, "ollama");
     }
 

@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeMode {
+    /// The default: warm cream text and amber accents on a near-black maroon
+    /// background, with a deep-red selection bar (the ember/fire palette).
     #[default]
+    Ember,
     Dark,
     /// Neon: light blue + white on dark gray. Replaces the old grayscale
     /// `Light` theme; the serde alias keeps existing `theme = "light"` configs
@@ -21,12 +24,18 @@ impl ThemeMode {
     /// The themes offered by the status-bar switcher and `/theme`, in order.
     /// `HighContrast` is reachable only via the config file (accessibility
     /// escape hatch), so it is intentionally left out of the cycle.
-    pub const SWITCHER: [ThemeMode; 4] =
-        [ThemeMode::Dark, ThemeMode::Neon, ThemeMode::NeonPink, ThemeMode::Sage];
+    pub const SWITCHER: [ThemeMode; 5] = [
+        ThemeMode::Ember,
+        ThemeMode::Dark,
+        ThemeMode::Neon,
+        ThemeMode::NeonPink,
+        ThemeMode::Sage,
+    ];
 
     /// Short label shown in the switcher and Settings.
     pub fn label(self) -> &'static str {
         match self {
+            ThemeMode::Ember => "ember",
             ThemeMode::Dark => "dark",
             ThemeMode::Neon => "neon",
             ThemeMode::NeonPink => "pink",
@@ -61,16 +70,35 @@ impl Theme {
 
     /// RGB for a named token.
     ///
-    /// `Dark` is grayscale (emphasis by brightness). The two **neon** themes
-    /// (`Neon`, `NeonPink`) put white text and a saturated accent (light blue /
-    /// hot pink) on a dark-gray background; they replaced the old grayscale
-    /// `Light` theme. `Sage` is soft green text on a gray background.
-    /// `HighContrast` keeps its own saturated palette.
+    /// `Ember` (the default) is the fire palette from the design swatch: warm
+    /// cream text and amber accents on a near-black maroon background, with a
+    /// deep-red selection bar. `Dark` is grayscale (emphasis by brightness).
+    /// The two **neon** themes (`Neon`, `NeonPink`) put white text and a
+    /// saturated accent (light blue / hot pink) on a dark-gray background;
+    /// they replaced the old grayscale `Light` theme. `Sage` is soft green
+    /// text on a gray background. `HighContrast` keeps its own saturated
+    /// palette.
     ///
     /// `SelBg` is the background of the currently-selected row/element — the
     /// only token that is meant to be used as a background fill.
     pub fn token_rgb(&self, token: ThemeToken) -> (u8, u8, u8) {
         match self.mode {
+            // Ember (cream + amber on near-black maroon; deep-red selection).
+            ThemeMode::Ember => match token {
+                ThemeToken::Bg => (24, 10, 12),
+                ThemeToken::Fg => (240, 228, 214),
+                ThemeToken::Muted | ThemeToken::NavIdle => (176, 138, 122),
+                ThemeToken::Border => (86, 38, 30),
+                // Amber (#FAA307): selected names, buttons, the user prompt.
+                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (250, 163, 7),
+                ThemeToken::Faint => (110, 66, 54),
+                ThemeToken::Work => (255, 186, 8),
+                // Deep red (#6A040F) bar behind the selected row.
+                ThemeToken::SelBg => (106, 4, 15),
+                ThemeToken::Ok => (250, 163, 7),
+                ThemeToken::Warn => (232, 93, 4),
+                ThemeToken::Error => (255, 99, 60),
+            },
             // Dark (dark + gray).
             ThemeMode::Dark => match token {
                 ThemeToken::Bg => (13, 13, 15),
@@ -82,7 +110,7 @@ impl Theme {
                 ThemeToken::Faint => (60, 60, 66),
                 ThemeToken::Work => (207, 207, 212),
                 // A lighter gray bar behind the selected row.
-                ThemeToken::SelBg => (44, 44, 54),
+                ThemeToken::SelBg => (54, 54, 68),
                 // Grayscale semantics: good/active = emphasis, idle = muted,
                 // error = primary text (bold at the call site).
                 ThemeToken::Ok => (243, 243, 245),
@@ -117,19 +145,20 @@ impl Theme {
                 ThemeToken::Warn => (150, 120, 155),
                 ThemeToken::Error => (240, 236, 246),
             },
-            // Sage (soft green text on gray).
+            // Sage (soft green text on gray). Darker ground + lighter text
+            // than the first cut — clearly readable without going neon.
             ThemeMode::Sage => match token {
-                ThemeToken::Bg => (40, 43, 40),
-                ThemeToken::Fg => (185, 210, 180),
-                ThemeToken::Muted | ThemeToken::NavIdle => (124, 140, 122),
-                ThemeToken::Border => (62, 66, 62),
-                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (150, 225, 150),
-                ThemeToken::Faint => (80, 88, 78),
-                ThemeToken::Work => (150, 225, 150),
-                ThemeToken::SelBg => (58, 70, 56),
-                ThemeToken::Ok => (150, 225, 150),
-                ThemeToken::Warn => (124, 140, 122),
-                ThemeToken::Error => (185, 210, 180),
+                ThemeToken::Bg => (30, 34, 30),
+                ThemeToken::Fg => (202, 224, 196),
+                ThemeToken::Muted | ThemeToken::NavIdle => (134, 152, 132),
+                ThemeToken::Border => (70, 78, 70),
+                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (160, 235, 156),
+                ThemeToken::Faint => (84, 94, 82),
+                ThemeToken::Work => (160, 235, 156),
+                ThemeToken::SelBg => (56, 76, 54),
+                ThemeToken::Ok => (160, 235, 156),
+                ThemeToken::Warn => (134, 152, 132),
+                ThemeToken::Error => (202, 224, 196),
             },
             ThemeMode::HighContrast => match token {
                 ThemeToken::NavIdle => (170, 170, 170),
@@ -185,7 +214,7 @@ mod tests {
                 + (a.1 as i32 - b.1 as i32).abs()
                 + (a.2 as i32 - b.2 as i32).abs()
         };
-        for mode in [ThemeMode::Neon, ThemeMode::NeonPink, ThemeMode::Sage] {
+        for mode in [ThemeMode::Ember, ThemeMode::Neon, ThemeMode::NeonPink, ThemeMode::Sage] {
             let t = Theme::new(mode);
             let bg = t.token_rgb(ThemeToken::Bg);
             for token in [ThemeToken::NavHover, ThemeToken::NavActive, ThemeToken::Fg] {
@@ -198,5 +227,13 @@ mod tests {
             assert!(dist(bg, sel) > 20, "{mode:?} selection bar too close to background");
             assert!(dist(sel, t.token_rgb(ThemeToken::Accent)) > 150, "{mode:?} accent unreadable on selection");
         }
+    }
+
+    /// Ember is the shipped default and leads the switcher cycle.
+    #[test]
+    fn ember_is_the_default_theme() {
+        assert_eq!(ThemeMode::default(), ThemeMode::Ember);
+        assert_eq!(ThemeMode::SWITCHER[0], ThemeMode::Ember);
+        assert_eq!(ThemeMode::Sage.next(), ThemeMode::Ember, "cycle wraps to the default");
     }
 }

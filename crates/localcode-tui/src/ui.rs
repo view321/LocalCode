@@ -1,10 +1,12 @@
 //! View rendering.
 //!
 //! Three chrome-light zones (redesign spec §2): a one-line **status bar**, a
-//! single scrollable **working area**, and a one-line modal **omnibar**. No
-//! popups or overlays — every former panel renders inline in the working area,
-//! and confirms/errors are inline banners. Two grayscale themes; the only
-//! animated glyph is the braille spinner, shown only while busy.
+//! single scrollable **working area**, and a bordered multi-line **omnibar**
+//! anchored at the bottom. No popups or overlays — every former panel renders
+//! inline in the working area, and confirms/errors are inline banners. The
+//! command palette ('/') and the file picker ('@') dock directly above the
+//! omnibar, where the eye already is. The only animated glyph is the braille
+//! spinner, shown only while busy.
 
 use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode, SettingAction, SettingsRowKind};
 use crate::markdown;
@@ -149,26 +151,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // The omnibar is a multi-line composer: its height grows with the input
-    // (capped by ui.composer_rows and the available height). A one-line hint bar
-    // sits *below* it so the input row is never the terminal's very last line.
-    let cap = app.config.ui.composer_rows.clamp(1, 10);
-    let max_by_area = area.height.saturating_sub(6).max(1);
+    // The omnibar is a bordered multi-line composer: at least two text rows
+    // (so it always reads as *the* input box), growing with the input up to
+    // ui.composer_rows. The '/' command palette and the '@' file picker dock
+    // directly above it.
+    let cap = app.config.ui.composer_rows.clamp(1, 10).max(2);
+    let max_by_area = area.height.saturating_sub(7).max(1);
     let composer_h = (app.coding_input.split('\n').count().max(1) as u16)
+        .max(2)
         .min(cap)
-        .min(max_by_area)
-        .max(1);
+        .min(max_by_area);
 
-    // Status (1) · rule (1) · working area (min) · omnibar (rule + composer) ·
-    // hint bar (1).
+    // Bottom-docked picker band ('/' commands or '@' files), sized to its rows.
+    let band_rows: u16 = if app.slash_active() {
+        app.palette_items().len().clamp(1, 10) as u16
+    } else if app.at_picker_active() {
+        app.at_matches().len().clamp(1, 8) as u16
+    } else {
+        0
+    };
+    let band_rows = band_rows.min(area.height.saturating_sub(composer_h + 5));
+
+    // Status (1) · rule (1) · working area (min) · picker band · omnibar
+    // (composer + top/bottom border).
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1 + composer_h),
-            Constraint::Length(1),
+            Constraint::Length(band_rows),
+            Constraint::Length(composer_h + 2),
         ])
         .split(area);
 
@@ -181,12 +194,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         main[1],
     );
     draw_working_area(f, main[2], app);
-    draw_omnibar(f, main[3], app);
-    draw_hint_bar(f, main[4], app);
+    if main[3].height > 0 {
+        draw_picker_band(f, main[3], app);
+    }
+    draw_omnibar(f, main[4], app);
 }
 
-/// The working area: an inline banner (if any) at the top, the command list
-/// while commanding, otherwise the current mode's view.
+/// The working area: an inline banner (if any) at the top, otherwise the
+/// current mode's view. (The command list no longer replaces this area — it
+/// docks above the omnibar; see [`draw_picker_band`].)
 fn draw_working_area(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(modal) = app.modal.clone() {
         let h = banner_height(&modal, &app.theme, area.width).min(area.height);
@@ -204,10 +220,6 @@ fn draw_working_area(f: &mut Frame, area: Rect, app: &mut App) {
         for (rect, i) in hits {
             click(app, rect, ClickTarget::ModalButton(i));
         }
-        return;
-    }
-    if app.slash_active() {
-        draw_command_list(f, area, app);
         return;
     }
     draw_mode(f, area, app);
@@ -234,8 +246,17 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
     let inner = pad(area);
 
-    // Left cluster: spinner · model · vram · ctx.
+    // Left cluster: select-mode chip · spinner · model · vram · ctx.
     let mut left: Vec<Span> = Vec::new();
+    if !app.mouse_capture {
+        // The mouse is released for terminal-native copy; F2 is the way back.
+        left.push(Span::styled(
+            "SELECT",
+            theme::accent(&th).add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(" copy text · F2 to exit", theme::muted(&th)));
+        left.push(sep(&th));
+    }
     match spinner_frame(app) {
         Some(c) => left.push(Span::styled(format!("{c} "), theme::work(&th))),
         None => left.push(Span::raw("  ")),
@@ -292,8 +313,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(Paragraph::new(Line::from(left)), inner);
 
-    // Right cluster: version/update · <theme switcher>. The switcher lists every
-    // selectable theme; the active one is accented, and each is clickable.
+    // Right cluster: version/update · theme swatches. Each theme is a dot in
+    // its own accent colour (the active one is ◉); hovering a dot reveals its
+    // name to the left, so the names never occupy the bar at rest.
     let (ver_text, ver_style, is_update) = if let Some(v) = &app.update_installed {
         (format!("v{v} — restart"), theme::muted(&th), false)
     } else if let Some(info) = &app.update_available {
@@ -301,40 +323,65 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         (format!("v{}", env!("CARGO_PKG_VERSION")), theme::muted(&th), false)
     };
-    let mut right: Vec<Span> = vec![Span::styled(ver_text.clone(), ver_style), sep(&th)];
-    for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
-        if i > 0 {
-            right.push(Span::styled(" · ", theme::faint(&th)));
-        }
-        let style = if th.mode == *m {
-            theme::accent(&th).add_modifier(Modifier::BOLD)
-        } else {
-            theme::muted(&th)
-        };
-        right.push(Span::styled(m.label(), style));
-    }
-    right.push(Span::raw(" "));
-    let rw = spans_width(&right);
+    // Fixed-width layout (label slot · version · sep · dots) so revealing a
+    // name on hover never shifts the dots under the cursor.
+    let label_slot: u16 = 1 + ThemeMode::SWITCHER
+        .iter()
+        .map(|m| m.label().width() as u16)
+        .max()
+        .unwrap_or(0);
+    let ver_w = ver_text.width() as u16;
+    let dots_w = (ThemeMode::SWITCHER.len() as u16) * 2; // "◉ " per theme
+    let rw = label_slot + ver_w + 3 + dots_w;
     if inner.width > rw + 8 {
         let rx = inner.x + inner.width - rw;
+        let dots_x = rx + label_slot + ver_w + 3;
+        // Which dot is the mouse over (if any)?
+        let hovered: Option<ThemeMode> = app.hover.and_then(|(hc, hr)| {
+            if hr != inner.y {
+                return None;
+            }
+            ThemeMode::SWITCHER
+                .iter()
+                .enumerate()
+                .find(|(i, _)| {
+                    let x = dots_x + (*i as u16) * 2;
+                    hc >= x && hc < x + 2
+                })
+                .map(|(_, m)| *m)
+        });
+        let label = hovered.map(|m| m.label()).unwrap_or("");
+        let mut right: Vec<Span> = vec![
+            Span::styled(
+                format!("{label:>w$} ", w = label_slot.saturating_sub(1) as usize),
+                theme::muted(&th),
+            ),
+            Span::styled(ver_text, ver_style),
+            sep(&th),
+        ];
+        for m in ThemeMode::SWITCHER.iter() {
+            let dot = if th.mode == *m { "◉" } else { "●" };
+            let (r, g, b) = localcode_core::Theme::new(*m).token_rgb(ThemeToken::Accent);
+            right.push(Span::styled(
+                format!("{dot} "),
+                Style::default().fg(ratatui::style::Color::Rgb(r, g, b)),
+            ));
+        }
         f.render_widget(
             Paragraph::new(Line::from(right)),
             Rect { x: rx, y: inner.y, width: rw, height: 1 },
         );
-        // Click regions: version badge, then one per switcher theme.
-        let mut cx = rx;
-        let ver_w = ver_text.width() as u16;
+        // Click regions: version badge, then one per swatch dot.
         if is_update {
-            click(app, Rect { x: cx, y: inner.y, width: ver_w, height: 1 }, ClickTarget::UpdateBadge);
+            click(
+                app,
+                Rect { x: rx + label_slot, y: inner.y, width: ver_w, height: 1 },
+                ClickTarget::UpdateBadge,
+            );
         }
-        cx += ver_w + sep(&th).width() as u16;
         for (i, m) in ThemeMode::SWITCHER.iter().enumerate() {
-            if i > 0 {
-                cx += 3; // " · "
-            }
-            let lw = m.label().width() as u16;
-            click(app, Rect { x: cx, y: inner.y, width: lw, height: 1 }, ClickTarget::Theme(*m));
-            cx += lw;
+            let x = dots_x + (i as u16) * 2;
+            click(app, Rect { x, y: inner.y, width: 2, height: 1 }, ClickTarget::Theme(*m));
         }
     }
 }
@@ -345,17 +392,34 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
-    f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_type(BorderType::Plain)
-            .border_style(theme::border(&th)),
-        area,
-    );
+
+    // A full pseudographic frame in the accent colour: the input box is the one
+    // element that should always be findable at a glance.
+    let title = if app.sudo_prompt().is_some() {
+        " sudo "
+    } else if app.slash_active() {
+        " command "
+    } else if app.mode != Mode::Chat {
+        app.mode.tag()
+    } else {
+        ""
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent(&th));
+    if !title.is_empty() {
+        block = block.title(Span::styled(format!(" {} ", title.trim()), theme::muted(&th)));
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height == 0 {
+        return;
+    }
     let row = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(1),
         height: 1,
     };
 
@@ -371,39 +435,43 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
         let spans = vec![
             Span::styled(label, theme::muted(&th)),
             Span::styled(dots, fg(&th)),
-            Span::styled(format!("   {cmd_clip}"), theme::faint(&th)),
+            Span::styled("█", theme::accent(&th)),
+            Span::styled(format!("  {cmd_clip}"), theme::faint(&th)),
             Span::styled(hint, theme::faint(&th)),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)), row);
         return;
     }
 
-    let commanding = app.slash_active();
+    let prefix = Span::styled("❯ ", theme::accent(&th).add_modifier(Modifier::BOLD));
+    let prefix_w = prefix.width();
+    let caret = |s: String| Span::styled(s, Style::default().add_modifier(Modifier::REVERSED));
 
-    // First-row prefix: an optional [mode] tag then the prompt caret.
-    let mut prefix: Vec<Span> = Vec::new();
-    if !commanding && app.mode != Mode::Chat {
-        prefix.push(Span::styled(format!("[{}] ", app.mode.tag()), theme::muted(&th)));
-    }
-    prefix.push(Span::styled("❯ ", theme::muted(&th)));
-    let prefix_w: usize = prefix.iter().map(|s| s.width()).sum();
-
-    // Empty: show the placeholder on the first row.
+    // Empty: prompt + a visible caret block + the placeholder — so there is
+    // always a text cursor showing where typing goes.
     if app.coding_input.is_empty() {
-        let mut spans = prefix;
-        let placeholder = if commanding {
-            "run a command — ↵ to execute, Esc to cancel"
+        let agent_busy = app
+            .busy
+            .as_ref()
+            .is_some_and(|b| b.kind == crate::app::BusyKind::Coding);
+        let placeholder = if agent_busy {
+            "agent is working… Esc cancels"
         } else {
             app.mode.placeholder()
         };
-        spans.push(Span::styled(placeholder, theme::faint(&th)));
+        let spans = vec![
+            prefix,
+            caret(" ".into()),
+            Span::raw(" "),
+            Span::styled(placeholder, theme::faint(&th)),
+        ];
         f.render_widget(Paragraph::new(Line::from(spans)), row);
         return;
     }
 
-    // Multi-line composer: render a window of `composer_h` lines that keeps the
-    // caret visible, highlighting the caret cell on its line.
-    let composer_h = area.height.saturating_sub(1).max(1) as usize;
+    // Multi-line composer: render a window of `inner.height` lines that keeps
+    // the caret visible, highlighting the caret cell on its line.
+    let composer_h = inner.height as usize;
     let lines: Vec<&str> = app.coding_input.split('\n').collect();
     let (cur_line, cur_col) = app.omnibar_cursor_line_col();
     let start = if cur_line >= composer_h {
@@ -415,7 +483,7 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
         let y = row.y + vi as u16;
         let mut spans: Vec<Span> = Vec::new();
         if li == 0 {
-            spans.extend(prefix.iter().cloned());
+            spans.push(prefix.clone());
         } else {
             spans.push(Span::raw(" ".repeat(prefix_w)));
         }
@@ -433,7 +501,7 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
                 String::new()
             };
             spans.push(Span::styled(before, fg(&th)));
-            spans.push(Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)));
+            spans.push(caret(at));
             spans.push(Span::styled(after, fg(&th)));
         } else {
             spans.push(Span::styled(lines[li].to_string(), fg(&th)));
@@ -445,110 +513,108 @@ fn draw_omnibar(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// One faint line below the omnibar (so the input row is never the terminal's
-/// last line) that also surfaces the key hints — crucially Shift+Enter.
-fn draw_hint_bar(f: &mut Frame, area: Rect, app: &App) {
+// ---------------------------------------------------------------------------
+// Picker band (§7.2) — commands ('/') or files ('@'), docked above the omnibar
+// ---------------------------------------------------------------------------
+
+/// One row of a picker band: full-width selection bar when picked, clickable,
+/// wheel-scrollable (the wheel moves the selection; see `wheel_scroll_at`).
+fn band_row(
+    f: &mut Frame,
+    app: &mut App,
+    rect: Rect,
+    spans: Vec<Span<'static>>,
+    selected: bool,
+    target: ClickTarget,
+) {
     let th = app.theme;
-    let inner = pad(area);
-    let spans: Vec<Span> = if !app.mouse_capture {
-        vec![Span::styled(
-            "SELECT MODE — drag to select & copy · F2 or /select to resume mouse",
-            theme::accent(&th).add_modifier(Modifier::BOLD),
-        )]
-    } else if app.sudo_prompt().is_some() {
-        vec![Span::styled(
-            "type your sudo password · ↵ run · Esc cancel",
-            theme::faint(&th),
-        )]
-    } else if app.modal.is_some() {
-        vec![Span::styled(
-            "←→ choose · ↵ confirm · Esc dismiss",
-            theme::faint(&th),
-        )]
-    } else if app.slash_active() {
-        vec![Span::styled(
-            "↵ run · ↑↓ select · Esc cancel",
-            theme::faint(&th),
-        )]
-    } else if app.mode == Mode::Settings {
-        vec![Span::styled(
-            "↑↓ move · ↵ toggle/edit · click a row · Esc back",
-            theme::faint(&th),
-        )]
-    } else if let Some(b) = app.busy.as_ref().filter(|b| b.kind == crate::app::BusyKind::Coding) {
-        // While the agent runs, the one key that matters is Esc.
-        vec![
-            Span::styled("Esc cancel", theme::faint(&th)),
-            sep(&th),
-            Span::styled(
-                format!("agent working {}s", b.started.elapsed().as_secs()),
-                theme::faint(&th),
-            ),
-        ]
-    } else {
-        let submit = if app.mode == Mode::Models { "↵ search" } else { "↵ send" };
-        let mut spans = vec![
-            Span::styled(submit, theme::faint(&th)),
-            sep(&th),
-            Span::styled("⇧↵ newline", theme::faint(&th)),
-            sep(&th),
-            Span::styled("/ commands", theme::faint(&th)),
-            sep(&th),
-            Span::styled(
-                if app.mode == Mode::Chat { "↑↓ history" } else { "Esc back" },
-                theme::faint(&th),
-            ),
-        ];
-        if app.mode == Mode::Chat {
-            spans.push(sep(&th));
-            spans.push(Span::styled("⇧Tab approvals", theme::faint(&th)));
-        }
-        spans
-    };
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    let mut all = vec![Span::styled(
+        if selected { "▌ " } else { "  " },
+        theme::accent(&th),
+    )];
+    all.extend(spans);
+    let para = Paragraph::new(Line::from(all));
+    f.render_widget(
+        if selected {
+            para.style(theme::selected(&th))
+        } else {
+            para
+        },
+        rect,
+    );
+    click(app, rect, target);
 }
 
-// ---------------------------------------------------------------------------
-// Command list (§7.2)
-// ---------------------------------------------------------------------------
+/// The window of `visible` rows that keeps `sel` in view.
+fn band_window(sel: usize, len: usize, visible: usize) -> std::ops::Range<usize> {
+    let start = if sel < visible { 0 } else { sel + 1 - visible };
+    let start = start.min(len.saturating_sub(visible.max(1)));
+    start..(start + visible).min(len)
+}
 
-fn draw_command_list(f: &mut Frame, area: Rect, app: &mut App) {
+/// The '/' command palette or the '@' file picker, rendered directly above the
+/// omnibar so the suggestions appear where the user is already looking.
+fn draw_picker_band(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
-    let inner = pad(area);
-    let items = app.palette_items();
-    let sel = app.palette_selected.min(items.len().saturating_sub(1));
-
-    let header = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("commands  ", theme::muted(&th)),
-            Span::styled("↵ runs the first match", theme::faint(&th)),
-        ])),
-        header,
-    );
-
-    for (i, item) in items.iter().enumerate() {
-        let y = inner.y + 2 + i as u16;
-        if y >= inner.y + inner.height {
-            break;
+    let visible = area.height as usize;
+    if app.slash_active() {
+        let items = app.palette_items();
+        if items.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "  no matching command — ↵ runs the text as typed",
+                    theme::faint(&th),
+                )),
+                Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+            );
+            return;
         }
-        let (name, desc) = item.split_once("  —  ").unwrap_or((item.as_str(), ""));
-        let marked = i == sel;
-        let name_style = if marked {
+        let sel = app.palette_selected.min(items.len() - 1);
+        for (vi, i) in band_window(sel, items.len(), visible).enumerate() {
+            let (name, desc) = items[i].split_once("  —  ").unwrap_or((items[i].as_str(), ""));
+            let selected = i == sel;
+            let name_style = if selected {
+                theme::accent(&th).add_modifier(Modifier::BOLD)
+            } else {
+                fg(&th)
+            };
+            let spans = vec![
+                Span::styled(format!("{name:<24}"), name_style),
+                Span::raw("  "),
+                Span::styled(desc.to_string(), theme::muted(&th)),
+            ];
+            let rect = Rect { x: area.x, y: area.y + vi as u16, width: area.width, height: 1 };
+            band_row(f, app, rect, spans, selected, ClickTarget::CommandItem(i));
+        }
+        return;
+    }
+
+    // '@' file picker.
+    let files = app.at_matches();
+    if files.is_empty() {
+        return;
+    }
+    let sel = app.at_selected.min(files.len() - 1);
+    for (vi, i) in band_window(sel, files.len(), visible).enumerate() {
+        let selected = i == sel;
+        let (dir, name) = match files[i].rsplit_once('/') {
+            Some((d, n)) => (format!("{d}/"), n.to_string()),
+            None => (String::new(), files[i].clone()),
+        };
+        let name_style = if selected {
             theme::accent(&th).add_modifier(Modifier::BOLD)
         } else {
             fg(&th)
         };
-        let mark = if marked { "› " } else { "  " };
-        let line = Line::from(vec![
-            Span::styled(mark, theme::accent(&th)),
-            Span::styled(format!("{name:<14}"), name_style),
-            Span::styled(format!("  {desc}"), theme::muted(&th)),
-        ]);
-        let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        let para = Paragraph::new(line);
-        f.render_widget(if marked { para.style(theme::selected(&th)) } else { para }, rect);
-        click(app, rect, ClickTarget::CommandItem(i));
+        let mut spans = vec![
+            Span::styled(dir, theme::muted(&th)),
+            Span::styled(name, name_style),
+        ];
+        if selected {
+            spans.push(Span::styled("  ↵ attach", theme::muted(&th)));
+        }
+        let rect = Rect { x: area.x, y: area.y + vi as u16, width: area.width, height: 1 };
+        band_row(f, app, rect, spans, selected, ClickTarget::AtItem(i));
     }
 }
 

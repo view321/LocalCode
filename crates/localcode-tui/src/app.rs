@@ -11,8 +11,9 @@ use crate::ui;
 use crate::widgets::{ConfirmAction, ModalKind, ModalState};
 use async_trait::async_trait;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -85,7 +86,7 @@ impl Mode {
     /// Omnibar placeholder text for this mode (chat / search / read-only views).
     pub fn placeholder(self) -> &'static str {
         match self {
-            Mode::Chat => "message the agent…    / for commands",
+            Mode::Chat => "message the agent…    @ attaches a file · / for commands",
             Mode::Models => "search models — type to filter, Enter to run",
             Mode::Settings => "↑↓ move · Enter toggle/edit · or type to chat",
             _ => "type to chat, or / for commands",
@@ -140,6 +141,8 @@ pub enum ClickTarget {
     UpdateBadge,
     // Command list (shown while the omnibar starts with '/')
     CommandItem(usize),
+    // '@' file-picker rows (shown while the caret is in an '@' token)
+    AtItem(usize),
     // Inline banner buttons (were modal buttons)
     ModalButton(usize),
     // Chat
@@ -479,6 +482,17 @@ pub struct App {
     /// Highlighted index in the command list (shown when the omnibar text
     /// starts with '/').
     pub palette_selected: usize,
+    /// Last known mouse position (col, row) — drives hover affordances like
+    /// the theme-switcher name reveal. `None` until the mouse first moves.
+    pub hover: Option<(u16, u16)>,
+    /// Highlighted index in the '@' file picker.
+    pub at_selected: usize,
+    /// The '@' token the picker was dismissed for (Esc). Typing changes the
+    /// token, which reopens the picker.
+    at_dismissed: Option<String>,
+    /// Lazily-walked workspace file list (relative, '/'-separated) backing the
+    /// '@' picker. Invalidated on new session / workspace change.
+    workspace_files: Option<Vec<String>>,
     pub assistant_configured: bool,
     /// None while the startup probe is still running.
     pub api_healthy: Option<bool>,
@@ -640,6 +654,10 @@ impl App {
             modal: None,
             pending_tool_confirm: None,
             palette_selected: 0,
+            hover: None,
+            at_selected: 0,
+            at_dismissed: None,
+            workspace_files: None,
             assistant_configured,
             api_healthy: None,
             gpu,
@@ -1571,6 +1589,15 @@ impl App {
         self.coding_cursor = 0;
         self.coding_transcript
             .push(TranscriptEntry::new(EntryKind::You, input.clone()));
+        // '@path' references: the transcript shows what was typed; the agent
+        // receives the prompt with each referenced file's contents appended.
+        let (prompt, attached) = self.expand_at_context(&input);
+        if !attached.is_empty() {
+            self.coding_transcript.push(TranscriptEntry::new(
+                EntryKind::System,
+                format!("attached: {}", attached.join(", ")),
+            ));
+        }
         self.coding_follow = true;
 
         // Live events (streamed tokens, tool activity) flow through their own
@@ -1597,7 +1624,7 @@ impl App {
             let result = agent
                 .run_turn(
                     &mut session,
-                    &input,
+                    &prompt,
                     &runtime,
                     api_key.as_deref(),
                     Some(&approver),
@@ -1619,6 +1646,8 @@ impl App {
             self.workspace_path(),
             false,
         )));
+        // Re-walk the workspace next time '@' is used — files likely changed.
+        self.workspace_files = None;
         self.coding_transcript = vec![TranscriptEntry::new(
             EntryKind::System,
             "new session started",
@@ -2719,7 +2748,7 @@ impl App {
             ("/setup", "", "first-run setup & doctor"),
             ("/settings", "", "preferences & config file"),
             ("/mode", "[always|auto|edits|ask]", "how much the agent asks before running tools"),
-            ("/theme", "", "cycle dark / neon / pink / sage"),
+            ("/theme", "", "cycle ember / dark / neon / pink / sage"),
             ("/select", "", "release mouse to select & copy text (F2)"),
             ("/chat", "", "back to the conversation"),
             ("/new", "", "start a new conversation"),
@@ -2777,6 +2806,171 @@ impl App {
     /// Is the omnibar currently a slash-command entry?
     pub fn slash_active(&self) -> bool {
         self.coding_input.starts_with('/')
+    }
+
+    // ------------------------------------------------------------------
+    // '@' context picker (attach workspace files to an agent message)
+    // ------------------------------------------------------------------
+
+    /// The '@' token the caret is currently inside, as `(start_char_index,
+    /// query_after_the_at)`. A token is the whitespace-delimited word ending at
+    /// the caret; it counts only when that word starts with '@'.
+    pub fn at_token(&self) -> Option<(usize, String)> {
+        if self.slash_active() {
+            return None;
+        }
+        let chars: Vec<char> = self.coding_input.chars().collect();
+        let cur = self.coding_cursor.min(chars.len());
+        let mut start = cur;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let word: String = chars[start..cur].iter().collect();
+        word.strip_prefix('@').map(|rest| (start, rest.to_string()))
+    }
+
+    /// Is the '@' file picker open? True while the caret sits in an '@' token
+    /// that has matches and wasn't just dismissed with Esc.
+    pub fn at_picker_active(&mut self) -> bool {
+        let Some((_, q)) = self.at_token() else {
+            return false;
+        };
+        if self.at_dismissed.as_deref() == Some(q.as_str()) {
+            return false;
+        }
+        !self.at_matches().is_empty()
+    }
+
+    /// Workspace files matching the current '@' query — file-name prefix hits
+    /// first, then path substring hits. Empty query lists everything.
+    pub fn at_matches(&mut self) -> Vec<String> {
+        let q = match self.at_token() {
+            Some((_, q)) => q.to_lowercase(),
+            None => return Vec::new(),
+        };
+        let mut scored: Vec<(u8, &String)> = self
+            .workspace_file_list()
+            .iter()
+            .filter_map(|p| {
+                let pl = p.to_lowercase();
+                let name = pl.rsplit('/').next().unwrap_or(&pl);
+                let rank = if q.is_empty() || name.starts_with(&q) {
+                    0
+                } else if pl.contains(&q) {
+                    1
+                } else {
+                    return None;
+                };
+                Some((rank, p))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        scored.into_iter().map(|(_, p)| p.clone()).collect()
+    }
+
+    /// Replace the '@' token at the caret with the selected file path (plus a
+    /// trailing space) so typing can continue naturally.
+    fn at_complete(&mut self) {
+        let Some((start, _)) = self.at_token() else {
+            return;
+        };
+        let items = self.at_matches();
+        if items.is_empty() {
+            return;
+        }
+        let path = items[self.at_selected.min(items.len() - 1)].clone();
+        let chars: Vec<char> = self.coding_input.chars().collect();
+        let cur = self.coding_cursor.min(chars.len());
+        let mut out: String = chars[..start].iter().collect();
+        let insert = format!("@{path} ");
+        out.push_str(&insert);
+        out.extend(chars[cur..].iter());
+        self.coding_input = out;
+        self.coding_cursor = start + insert.chars().count();
+        self.at_selected = 0;
+        self.at_dismissed = None;
+    }
+
+    /// The workspace file list backing the '@' picker, walked once and cached.
+    /// Skips VCS/build/dependency directories and caps the walk so a giant
+    /// workspace can't stall the UI thread.
+    fn workspace_file_list(&mut self) -> &[String] {
+        if self.workspace_files.is_none() {
+            const SKIP_DIRS: [&str; 10] = [
+                ".git", ".hg", ".svn", "target", "node_modules", "dist", "build",
+                "__pycache__", ".venv", "venv",
+            ];
+            const MAX_FILES: usize = 2000;
+            let root = self.workspace_path();
+            let mut out: Vec<String> = Vec::new();
+            let mut stack = vec![root.clone()];
+            while let Some(dir) = stack.pop() {
+                if out.len() >= MAX_FILES {
+                    break;
+                }
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if path.is_dir() {
+                        if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
+                            stack.push(path);
+                        }
+                    } else if out.len() < MAX_FILES {
+                        if let Ok(rel) = path.strip_prefix(&root) {
+                            out.push(rel.to_string_lossy().replace('\\', "/"));
+                        }
+                    }
+                }
+            }
+            out.sort();
+            self.workspace_files = Some(out);
+        }
+        self.workspace_files.as_deref().unwrap_or(&[])
+    }
+
+    /// Expand `@path` references in a prompt: the agent receives the original
+    /// text plus each referenced file's contents in a fenced block. Returns the
+    /// expanded prompt and the list of attached paths (for transcript feedback).
+    fn expand_at_context(&mut self, input: &str) -> (String, Vec<String>) {
+        const PER_FILE_CHARS: usize = 24_000;
+        const TOTAL_CHARS: usize = 96_000;
+        let root = self.workspace_path();
+        let mut attached: Vec<String> = Vec::new();
+        let mut blocks = String::new();
+        for word in input.split_whitespace() {
+            let Some(frag) = word.strip_prefix('@').filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            if attached.iter().any(|a| a == frag) {
+                continue;
+            }
+            let path = root.join(frag);
+            let Ok(mut content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content.len() > PER_FILE_CHARS {
+                let mut cut = PER_FILE_CHARS;
+                while !content.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                content.truncate(cut);
+                content.push_str("\n… (truncated)");
+            }
+            if blocks.len() + content.len() > TOTAL_CHARS {
+                break;
+            }
+            blocks.push_str(&format!("\n--- {frag} ---\n{content}\n"));
+            attached.push(frag.to_string());
+        }
+        if attached.is_empty() {
+            (input.to_string(), attached)
+        } else {
+            (
+                format!("{input}\n\nAttached files (referenced with @):\n{blocks}"),
+                attached,
+            )
+        }
     }
 
     /// Run the currently-highlighted menu command, keeping any args the user
@@ -3303,7 +3497,11 @@ impl App {
                 self.reload_skills_list();
             }
             SettingField::McpPath => self.config.agent.mcp_config = opt,
-            SettingField::Workspace => self.config.agent.workspace_root = opt,
+            SettingField::Workspace => {
+                self.config.agent.workspace_root = opt;
+                // The '@' picker's file cache is rooted at the workspace.
+                self.workspace_files = None;
+            }
         }
         self.refresh_agent_summaries();
         match self.config.save(&self.paths) {
@@ -3536,6 +3734,37 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
+        // The '@' file picker owns navigation and completion while open; every
+        // other key falls through and keeps editing the omnibar text.
+        if self.at_picker_active() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.at_dismissed = self.at_token().map(|(_, q)| q);
+                    return;
+                }
+                KeyCode::Up => {
+                    self.at_selected = self.at_selected.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    let n = self.at_matches().len();
+                    if n > 0 {
+                        self.at_selected = (self.at_selected + 1).min(n - 1);
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.at_complete();
+                    return;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    self.at_complete();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Esc: cancel a running task; else leave a non-chat mode / clear input.
         // A running deploy is deliberately NOT in this set — it is cancelled only
         // via its Cancel button, so here Esc just leaves Models / clears input.
@@ -3555,14 +3784,22 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
-        // Enter submits; Shift+Enter / Alt+Enter insert a newline so the omnibar
-        // is a real multi-line composer.
+        // Enter submits; Shift+Enter / Alt+Enter / Ctrl+Enter insert a newline
+        // so the omnibar is a real multi-line composer. Ctrl+J is the fallback
+        // for terminals that don't report modified Enter at all.
         if key.code == KeyCode::Enter {
-            if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
                 self.omnibar_insert_newline();
             } else {
                 self.omnibar_submit();
             }
+            return;
+        }
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.omnibar_insert_newline();
             return;
         }
 
@@ -3611,6 +3848,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
                     self.coding_cursor -= 1;
                 }
                 self.palette_selected = 0;
+                self.at_selected = 0;
             }
             KeyCode::Delete => {
                 if self.coding_cursor < self.coding_input.chars().count() {
@@ -3624,9 +3862,44 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 self.coding_cursor += 1;
                 self.coding_hist_idx = None;
                 self.palette_selected = 0;
+                self.at_selected = 0;
             }
             _ => {}
         }
+    }
+
+    /// Bracketed paste: insert the pasted text where input currently goes.
+    /// Newlines are preserved in the omnibar (this is what makes multi-line
+    /// paste work — without it each pasted line-break would submit the turn)
+    /// and flattened for the single-line field editors.
+    pub fn handle_paste(&mut self, pasted: &str) {
+        let text = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(ps) = &mut self.pending_sudo {
+            for c in text.chars().filter(|c| *c != '\n') {
+                ps.buf.push(c);
+            }
+            return;
+        }
+        if self.modal.is_some() {
+            return;
+        }
+        let flat = || text.replace('\n', " ");
+        if self.mode == Mode::Remote && self.remote_editing {
+            self.remote_field_edit.push_str(&flat());
+            return;
+        }
+        if self.mode == Mode::Settings && self.settings_editing.is_some() {
+            self.settings_field_edit.push_str(&flat());
+            return;
+        }
+        if self.mode == Mode::Models && self.deploy_editing.is_some() {
+            self.deploy_field_edit.push_str(&flat());
+            return;
+        }
+        let idx = char_to_byte(&self.coding_input, self.coding_cursor);
+        self.coding_input.insert_str(idx, &text);
+        self.coding_cursor += text.chars().count();
+        self.coding_hist_idx = None;
     }
 
     /// Insert a newline at the caret (Shift/Alt+Enter) — makes the omnibar a
@@ -3720,6 +3993,8 @@ to select, click deploy. Remote: click a field to edit, then connect."
         self.coding_cursor = 0;
         self.coding_hist_idx = None;
         self.palette_selected = 0;
+        self.at_selected = 0;
+        self.at_dismissed = None;
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -3948,6 +4223,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use event::MouseButton::Left;
         let (col, row) = (mouse.column, mouse.row);
+        self.hover = Some((col, row));
         match mouse.kind {
             MouseEventKind::Down(Left) => self.handle_left_click(col, row),
             MouseEventKind::ScrollUp => self.wheel_scroll_at(-3, col, row),
@@ -3990,6 +4266,12 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 self.palette_selected = i;
                 self.run_selected_slash();
             }
+            return;
+        }
+        // '@' file picker: clicking a row attaches that file.
+        if let ClickTarget::AtItem(i) = region.target {
+            self.at_selected = i;
+            self.at_complete();
             return;
         }
 
@@ -4085,7 +4367,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
             // Settings — toggle / edit / theme / reload.
             ClickTarget::Setting(action) => self.activate_setting(action),
             // Handled above.
-            ClickTarget::ModalButton(_) | ClickTarget::CommandItem(_) => {}
+            ClickTarget::ModalButton(_) | ClickTarget::CommandItem(_) | ClickTarget::AtItem(_) => {}
         }
     }
 
@@ -4126,8 +4408,26 @@ to select, click deploy. Remote: click a field to edit, then connect."
     }
 
     /// Route the wheel to whatever scrollable is under the cursor, falling back
-    /// to the active mode's main scrollable.
+    /// to the active mode's main scrollable. While the command palette or the
+    /// '@' file picker is open, the wheel moves their selection — wherever the
+    /// cursor is — so the list is scrollable the moment it appears.
     fn wheel_scroll_at(&mut self, delta: i64, col: u16, row: u16) {
+        if self.slash_active() {
+            let n = self.palette_items().len();
+            if n > 0 {
+                let cur = self.palette_selected.min(n - 1) as i64;
+                self.palette_selected = (cur + delta.signum()).clamp(0, n as i64 - 1) as usize;
+            }
+            return;
+        }
+        if self.at_picker_active() {
+            let n = self.at_matches().len();
+            if n > 0 {
+                let cur = self.at_selected.min(n - 1) as i64;
+                self.at_selected = (cur + delta.signum()).clamp(0, n as i64 - 1) as usize;
+            }
+            return;
+        }
         match self.region_at(col, row).map(|r| r.target) {
             Some(ClickTarget::ModelList) => self.scroll_list_models(delta),
             Some(ClickTarget::QuantList) => self.scroll_card(delta),
@@ -4228,16 +4528,31 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         default_hook(panic_info);
     }));
 
     let mouse_enabled = config.ui.mouse;
     enable_raw_mode().map_err(LocalCodeError::from)?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(LocalCodeError::from)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste).map_err(LocalCodeError::from)?;
     if mouse_enabled {
         execute!(io::stdout(), EnableMouseCapture).map_err(LocalCodeError::from)?;
+    }
+    // Where the terminal supports the kitty keyboard protocol (a no-op query on
+    // Windows), opt in to disambiguated escape codes so Shift+Enter/Alt+Enter
+    // are reported and the multi-line composer works over SSH too.
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(LocalCodeError::from)?;
@@ -4256,8 +4571,11 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
     // still alive to reap them. Idempotent, so the normal-quit call is harmless.
     app.shutdown().await;
 
+    if keyboard_enhanced {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
+    }
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste).ok();
     // Always release the mouse — select mode may have toggled capture at
     // runtime, so the startup flag no longer reflects the live state.
     execute!(terminal.backend_mut(), DisableMouseCapture).ok();
@@ -4298,6 +4616,7 @@ async fn run_loop(
             match event::read().map_err(LocalCodeError::from)? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(m) => app.handle_mouse(m),
+                Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(_, _) => {
                     // Layout recomputes on next draw
                 }
@@ -4379,17 +4698,19 @@ mod tests {
     }
 
     #[test]
-    fn theme_cycle_visits_neon_variants() {
+    fn theme_cycle_starts_at_ember_and_visits_all() {
         let mut app = test_app();
-        app.set_theme(ThemeMode::Dark);
-        app.toggle_theme();
-        assert_eq!(app.config.ui.theme, ThemeMode::Neon);
-        app.toggle_theme();
-        assert_eq!(app.config.ui.theme, ThemeMode::NeonPink);
-        app.toggle_theme();
-        assert_eq!(app.config.ui.theme, ThemeMode::Sage);
-        app.toggle_theme();
-        assert_eq!(app.config.ui.theme, ThemeMode::Dark);
+        assert_eq!(app.config.ui.theme, ThemeMode::Ember, "ember is the default");
+        for expected in [
+            ThemeMode::Dark,
+            ThemeMode::Neon,
+            ThemeMode::NeonPink,
+            ThemeMode::Sage,
+            ThemeMode::Ember,
+        ] {
+            app.toggle_theme();
+            assert_eq!(app.config.ui.theme, expected);
+        }
     }
 
     #[test]
@@ -4749,22 +5070,54 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_makes_a_multiline_composer_and_hint_bar_is_last() {
+    fn modified_enter_makes_a_multiline_composer_inside_the_bordered_omnibar() {
         let mut app = test_app();
         typ(&mut app, "first");
-        // Shift+Enter inserts a newline instead of submitting.
+        // Shift+Enter inserts a newline instead of submitting; Ctrl+Enter and
+        // Ctrl+J are the fallbacks for terminals that don't report Shift+Enter.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         typ(&mut app, "second");
-        assert_eq!(app.coding_input, "first\nsecond");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        typ(&mut app, "third");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        typ(&mut app, "fourth");
+        assert_eq!(app.coding_input, "first\nsecond\nthird\nfourth");
 
         let screen = render_to_string(&mut app, 100, 30);
-        assert!(screen.contains("first") && screen.contains("second"));
-        // A hint bar sits below the omnibar (so the ❯ input row is not last) and
-        // advertises Shift+Enter for a newline.
+        assert!(screen.contains("second") && screen.contains("fourth"));
+        // The omnibar is a full pseudographic box: its bottom border — not the
+        // input row — is the last thing on screen.
         let rows: Vec<&str> = screen.lines().collect();
         let last = rows.iter().rev().find(|r| !r.trim().is_empty()).unwrap();
-        assert!(last.contains("newline") || last.contains("commands"), "last: {last:?}");
+        assert!(last.contains('╰') && last.contains('╯'), "bordered omnibar bottom: {last:?}");
         assert!(!last.contains('❯'), "the input row must not be the terminal's last line");
+    }
+
+    #[test]
+    fn paste_inserts_multiline_text_without_submitting() {
+        let mut app = test_app();
+        typ(&mut app, "start ");
+        app.handle_paste("line1\r\nline2");
+        assert_eq!(app.coding_input, "start line1\nline2");
+        assert!(
+            app.coding_transcript.iter().all(|e| e.kind != EntryKind::You),
+            "a pasted newline must not submit the turn"
+        );
+    }
+
+    #[test]
+    fn empty_omnibar_shows_a_visible_caret() {
+        use ratatui::style::Modifier;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let reversed = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            .count();
+        assert!(reversed >= 1, "a caret block is drawn even with no input");
     }
 
     #[test]
@@ -4928,5 +5281,108 @@ mod tests {
         // than being swallowed (deploy is cancelled only via its button).
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Chat);
+    }
+
+    /// A test app whose agent workspace is a temp dir seeded with `files`.
+    fn workspace_app(files: &[&str]) -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for f in files {
+            let p = dir.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("content of {f}")).unwrap();
+        }
+        let mut app = test_app();
+        app.config.agent.workspace_root = Some(dir.path().to_string_lossy().to_string());
+        (app, dir)
+    }
+
+    #[test]
+    fn at_opens_file_picker_and_enter_completes_the_path() {
+        let (mut app, _dir) = workspace_app(&["src/main.rs", "src/lib.rs", "README.md"]);
+        typ(&mut app, "explain @ma");
+        assert!(app.at_picker_active());
+        let items = app.at_matches();
+        assert!(items.iter().any(|p| p == "src/main.rs"), "{items:?}");
+        // Enter completes the token in place instead of submitting the turn.
+        app.at_selected = items.iter().position(|p| p == "src/main.rs").unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.coding_input, "explain @src/main.rs ");
+        assert!(!app.at_picker_active(), "picker closes after completion");
+        assert!(
+            app.coding_transcript.iter().all(|e| e.kind != EntryKind::You),
+            "completing must not submit"
+        );
+    }
+
+    #[test]
+    fn at_esc_dismisses_picker_but_typing_reopens_it() {
+        let (mut app, _dir) = workspace_app(&["alpha.rs", "beta.rs"]);
+        typ(&mut app, "@");
+        assert!(app.at_picker_active());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.at_picker_active(), "Esc closes the picker");
+        assert_eq!(app.coding_input, "@", "Esc keeps the typed text");
+        typ(&mut app, "a");
+        assert!(app.at_picker_active(), "typing reopens it");
+    }
+
+    #[test]
+    fn at_references_attach_file_contents_to_the_prompt() {
+        let (mut app, _dir) = workspace_app(&["src/main.rs"]);
+        let (prompt, attached) = app.expand_at_context("explain @src/main.rs please");
+        assert_eq!(attached, vec!["src/main.rs".to_string()]);
+        assert!(prompt.starts_with("explain @src/main.rs please"));
+        assert!(prompt.contains("content of src/main.rs"));
+        // A reference that resolves to nothing leaves the prompt untouched.
+        let (p2, a2) = app.expand_at_context("see @nope.txt");
+        assert_eq!(p2, "see @nope.txt");
+        assert!(a2.is_empty());
+    }
+
+    #[test]
+    fn wheel_moves_the_command_palette_selection() {
+        let mut app = test_app();
+        typ(&mut app, "/");
+        assert_eq!(app.palette_selected, 0);
+        app.wheel_scroll_at(3, 0, 0);
+        app.wheel_scroll_at(3, 0, 0);
+        assert_eq!(app.palette_selected, 2, "wheel-down walks the palette");
+        app.wheel_scroll_at(-3, 0, 0);
+        assert_eq!(app.palette_selected, 1, "wheel-up walks back");
+    }
+
+    #[test]
+    fn command_palette_docks_directly_above_the_omnibar() {
+        let mut app = test_app();
+        typ(&mut app, "/models");
+        let screen = render_to_string(&mut app, 100, 30);
+        let rows: Vec<&str> = screen.lines().collect();
+        // The row showing the command's catalog description is the palette row
+        // (the transcript's welcome text also mentions "/models").
+        let cmd_row = rows
+            .iter()
+            .position(|r| r.contains("search & deploy HuggingFace models"))
+            .expect("palette row on screen");
+        let prompt_row = rows.iter().position(|r| r.contains('❯')).expect("input row");
+        assert!(
+            cmd_row < prompt_row && prompt_row - cmd_row <= 3,
+            "palette docks above the omnibar (palette row {cmd_row}, input row {prompt_row})"
+        );
+    }
+
+    #[test]
+    fn hovering_a_theme_dot_reveals_its_name() {
+        let mut app = test_app();
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(!screen.contains("neon"), "theme names stay hidden at rest");
+        let region = app
+            .click_regions
+            .iter()
+            .find(|r| r.target == ClickTarget::Theme(ThemeMode::Neon))
+            .copied()
+            .expect("a swatch dot per theme");
+        app.hover = Some((region.rect.x, region.rect.y));
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(screen.contains("neon"), "hovering a dot reveals its name");
     }
 }
