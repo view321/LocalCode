@@ -12,6 +12,8 @@ pub enum ThemeMode {
     Neon,
     /// Neon variation: hot pink + white on dark gray.
     NeonPink,
+    /// Soft green text on a gray background — the calm phosphor look.
+    Sage,
     HighContrast,
 }
 
@@ -19,7 +21,8 @@ impl ThemeMode {
     /// The themes offered by the status-bar switcher and `/theme`, in order.
     /// `HighContrast` is reachable only via the config file (accessibility
     /// escape hatch), so it is intentionally left out of the cycle.
-    pub const SWITCHER: [ThemeMode; 3] = [ThemeMode::Dark, ThemeMode::Neon, ThemeMode::NeonPink];
+    pub const SWITCHER: [ThemeMode; 4] =
+        [ThemeMode::Dark, ThemeMode::Neon, ThemeMode::NeonPink, ThemeMode::Sage];
 
     /// Short label shown in the switcher and Settings.
     pub fn label(self) -> &'static str {
@@ -27,6 +30,7 @@ impl ThemeMode {
             ThemeMode::Dark => "dark",
             ThemeMode::Neon => "neon",
             ThemeMode::NeonPink => "pink",
+            ThemeMode::Sage => "sage",
             ThemeMode::HighContrast => "contrast",
         }
     }
@@ -60,7 +64,8 @@ impl Theme {
     /// `Dark` is grayscale (emphasis by brightness). The two **neon** themes
     /// (`Neon`, `NeonPink`) put white text and a saturated accent (light blue /
     /// hot pink) on a dark-gray background; they replaced the old grayscale
-    /// `Light` theme. `HighContrast` keeps its own saturated palette.
+    /// `Light` theme. `Sage` is soft green text on a gray background.
+    /// `HighContrast` keeps its own saturated palette.
     ///
     /// `SelBg` is the background of the currently-selected row/element — the
     /// only token that is meant to be used as a background fill.
@@ -112,6 +117,20 @@ impl Theme {
                 ThemeToken::Warn => (150, 120, 155),
                 ThemeToken::Error => (240, 236, 246),
             },
+            // Sage (soft green text on gray).
+            ThemeMode::Sage => match token {
+                ThemeToken::Bg => (40, 43, 40),
+                ThemeToken::Fg => (185, 210, 180),
+                ThemeToken::Muted | ThemeToken::NavIdle => (124, 140, 122),
+                ThemeToken::Border => (62, 66, 62),
+                ThemeToken::Accent | ThemeToken::NavActive | ThemeToken::NavHover => (150, 225, 150),
+                ThemeToken::Faint => (80, 88, 78),
+                ThemeToken::Work => (150, 225, 150),
+                ThemeToken::SelBg => (58, 70, 56),
+                ThemeToken::Ok => (150, 225, 150),
+                ThemeToken::Warn => (124, 140, 122),
+                ThemeToken::Error => (185, 210, 180),
+            },
             ThemeMode::HighContrast => match token {
                 ThemeToken::NavIdle => (170, 170, 170),
                 ThemeToken::NavHover => (255, 255, 255),
@@ -157,16 +176,16 @@ pub enum ThemeToken {
 mod tests {
     use super::*;
 
-    /// The neon themes must keep their accent/text well clear of the dark
+    /// The colored themes must keep their accent/text well clear of the
     /// background (and the selection bar must sit between the two).
     #[test]
-    fn neon_themes_are_readable() {
+    fn colored_themes_are_readable() {
         let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
             (a.0 as i32 - b.0 as i32).abs()
                 + (a.1 as i32 - b.1 as i32).abs()
                 + (a.2 as i32 - b.2 as i32).abs()
         };
-        for mode in [ThemeMode::Neon, ThemeMode::NeonPink] {
+        for mode in [ThemeMode::Neon, ThemeMode::NeonPink, ThemeMode::Sage] {
             let t = Theme::new(mode);
             let bg = t.token_rgb(ThemeToken::Bg);
             for token in [ThemeToken::NavHover, ThemeToken::NavActive, ThemeToken::Fg] {

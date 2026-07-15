@@ -1,5 +1,5 @@
 use crate::{
-    port_in_use, probe_client, spawn_io_capture, BackendKind, DetectReport, Health,
+    port_in_use, probe_client, spawn_io_capture, BackendKind, DeployTuning, DetectReport, Health,
     InferenceBackend, ModelDeploySpec, RunningEndpoint,
 };
 use async_trait::async_trait;
@@ -101,7 +101,7 @@ impl InferenceBackend for VllmBackend {
             message: "Starting vLLM (model download may take a while)".into(),
         });
 
-        let args = serve_args(&model, &self.cfg.host, port, spec.context_length);
+        let args = serve_args(&model, &self.cfg.host, port, spec.context_length, &spec.tuning);
         let mut child = tokio::process::Command::new(&self.cfg.bin)
             .args(&args)
             .kill_on_drop(true)
@@ -249,8 +249,15 @@ impl InferenceBackend for VllmBackend {
 /// cache for the model's full native context (often 128k) and OOMs at startup
 /// on a single consumer GPU. We bound it to the context the user picked — the
 /// same value llama.cpp receives via `-c`. A zero context (unset) is skipped so
-/// vLLM keeps its own default.
-fn serve_args(model: &str, host: &str, port: u16, context_length: u32) -> Vec<String> {
+/// vLLM keeps its own default. The optional tuning flags (VRAM fraction,
+/// tensor-parallel) are only emitted when the user set them.
+fn serve_args(
+    model: &str,
+    host: &str,
+    port: u16,
+    context_length: u32,
+    tuning: &DeployTuning,
+) -> Vec<String> {
     let mut args = vec![
         "serve".into(),
         model.to_string(),
@@ -262,6 +269,14 @@ fn serve_args(model: &str, host: &str, port: u16, context_length: u32) -> Vec<St
     if context_length > 0 {
         args.push("--max-model-len".into());
         args.push(context_length.to_string());
+    }
+    if let Some(frac) = tuning.gpu_memory_fraction {
+        args.push("--gpu-memory-utilization".into());
+        args.push(format!("{frac}"));
+    }
+    if let Some(tp) = tuning.tensor_parallel {
+        args.push("--tensor-parallel-size".into());
+        args.push(tp.to_string());
     }
     args
 }
@@ -313,7 +328,7 @@ mod tests {
 
     #[test]
     fn serve_args_bound_kv_cache_to_context() {
-        let args = serve_args("org/model", "127.0.0.1", 8000, 8192);
+        let args = serve_args("org/model", "127.0.0.1", 8000, 8192, &DeployTuning::default());
         assert_eq!(&args[..2], &["serve", "org/model"]);
         // The KV-cache bound that keeps vLLM from OOMing on a 128k default.
         let i = args.iter().position(|a| a == "--max-model-len").expect("flag present");
@@ -322,7 +337,34 @@ mod tests {
 
     #[test]
     fn serve_args_omit_context_when_zero() {
-        let args = serve_args("org/model", "127.0.0.1", 8000, 0);
+        let args = serve_args("org/model", "127.0.0.1", 8000, 0, &DeployTuning::default());
         assert!(!args.iter().any(|a| a == "--max-model-len"));
+    }
+
+    #[test]
+    fn serve_args_emit_tuning_flags_when_set() {
+        let tuning = DeployTuning {
+            gpu_memory_fraction: Some(0.85),
+            tensor_parallel: Some(2),
+            gpu_layers: None,
+        };
+        let args = serve_args("org/model", "127.0.0.1", 8000, 8192, &tuning);
+        let i = args
+            .iter()
+            .position(|a| a == "--gpu-memory-utilization")
+            .expect("frac flag present");
+        assert_eq!(args[i + 1], "0.85");
+        let j = args
+            .iter()
+            .position(|a| a == "--tensor-parallel-size")
+            .expect("tp flag present");
+        assert_eq!(args[j + 1], "2");
+    }
+
+    #[test]
+    fn serve_args_omit_tuning_flags_when_unset() {
+        let args = serve_args("org/model", "127.0.0.1", 8000, 8192, &DeployTuning::default());
+        assert!(!args.iter().any(|a| a == "--gpu-memory-utilization"));
+        assert!(!args.iter().any(|a| a == "--tensor-parallel-size"));
     }
 }

@@ -1,6 +1,7 @@
 //! Coding agent tools.
 
 use async_trait::async_trait;
+use localcode_core::config::ApprovalMode;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -53,12 +54,62 @@ pub enum ToolRisk {
     High,
 }
 
-/// Interactive approval hook for risky tool calls. The TUI implements this by
-/// showing a confirmation modal; headless runs have no approver, so risky
-/// commands are refused instead of silently executed.
+/// Interactive approval hook for gated tool calls. The TUI implements this by
+/// showing a confirmation banner; headless runs have no approver, so gated
+/// calls are refused instead of silently executed.
 #[async_trait]
 pub trait ToolApprover: Send + Sync {
     async fn approve(&self, description: &str) -> bool;
+}
+
+/// Whether `call` needs interactive approval under `mode`, and if so the
+/// human-readable request to show. `None` = run without asking.
+///
+/// - `AlwaysApprove` gates nothing.
+/// - `Auto` gates destructive shell commands only.
+/// - `ApproveEdits` gates workspace mutations: file writes/patches and every
+///   shell command (a shell command can mutate anything).
+/// - `AskPermission` gates every call.
+pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
+    let arg = |k: &str| call.arguments.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+    let describe = || match call.name.as_str() {
+        "shell.exec" => {
+            let cmd = arg("command");
+            let flag = if is_destructive(cmd) { " (flagged destructive)" } else { "" };
+            format!("Run shell command{flag}:\n\n  {cmd}")
+        }
+        "fs.write" => {
+            let n = call
+                .arguments
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|c| c.chars().count())
+                .unwrap_or(0);
+            format!("Write file: {} ({n} chars, replaces existing content)", arg("path"))
+        }
+        "fs.apply_patch" => format!("Edit file: {}", arg("path")),
+        "fs.read" => format!("Read file: {}", arg("path")),
+        "fs.list" => format!("List directory: {}", arg("path")),
+        "fs.search" => format!("Search files for: {}", arg("pattern")),
+        other => format!("Run tool: {other}"),
+    };
+    let gated = match mode {
+        ApprovalMode::AlwaysApprove => false,
+        ApprovalMode::Auto => {
+            call.name == "shell.exec"
+                && call
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(is_destructive)
+                    .unwrap_or(false)
+        }
+        ApprovalMode::ApproveEdits => {
+            matches!(call.name.as_str(), "fs.write" | "fs.apply_patch" | "shell.exec")
+        }
+        ApprovalMode::AskPermission => true,
+    };
+    gated.then(describe)
 }
 
 pub struct ToolRegistry {
@@ -103,9 +154,13 @@ impl ToolRegistry {
 
     pub fn openai_tools_schema(&self) -> Value {
         let tools = vec![
-            tool_schema("fs.read", "Read a file (output truncated for large files)", json!({
+            tool_schema("fs.read", "Read a file (output truncated for large files). For big files pass start_line (1-based) and max_lines to read a slice.", json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer", "description": "1-based first line to read" },
+                    "max_lines": { "type": "integer", "description": "max lines to return" }
+                },
                 "required": ["path"]
             })),
             tool_schema("fs.list", "List directory", json!({
@@ -168,7 +223,7 @@ impl ToolRegistry {
         &self,
         call: &ToolCall,
         workspace: &Path,
-        confirm_destructive: bool,
+        approval: ApprovalMode,
         approver: Option<&dyn ToolApprover>,
     ) -> Result<ToolResult, LocalCodeError> {
         info!(tool = %call.name, "tool execute");
@@ -181,6 +236,24 @@ impl ToolRegistry {
             )
             .with_hint("Enable it in Settings → tools if you want the agent to use it"));
         }
+        // One approval gate for every tool, driven by the approval mode.
+        if let Some(request) = approval_request(call, approval) {
+            let approved = match approver {
+                Some(a) => a.approve(&request).await,
+                None => false,
+            };
+            if !approved {
+                return Err(LocalCodeError::new(
+                    ErrorCode::Cancelled,
+                    format!("Tool call not approved: {}", call.name),
+                )
+                .with_cause(format!(
+                    "Approval mode '{}' requires confirmation for this call",
+                    approval.label()
+                ))
+                .with_hint("The user declined (or no interactive approval is available)"));
+            }
+        }
         match call.name.as_str() {
             "fs.read" => {
                 let path = arg_path(call, workspace, "path")?;
@@ -188,8 +261,30 @@ impl ToolRegistry {
                     LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
                         .with_cause(format!("Cannot read {}", path.display()))
                 })?;
+                let start = call
+                    .arguments
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| (n.max(1) - 1) as usize);
+                let max = call.arguments.get("max_lines").and_then(|v| v.as_u64());
+                let output = match (start, max) {
+                    (None, None) => content,
+                    (start, max) => {
+                        let start = start.unwrap_or(0);
+                        let total = content.lines().count();
+                        let take = max.map(|n| n as usize).unwrap_or(usize::MAX);
+                        let slice: Vec<&str> =
+                            content.lines().skip(start).take(take).collect();
+                        format!(
+                            "[lines {}-{} of {total}]\n{}",
+                            start + 1,
+                            start + slice.len(),
+                            slice.join("\n")
+                        )
+                    }
+                };
                 Ok(ToolResult {
-                    output: truncate_output(&content, MAX_READ_CHARS),
+                    output: truncate_output(&output, MAX_READ_CHARS),
                     risk: ToolRisk::Low,
                 })
             }
@@ -330,24 +425,6 @@ impl ToolRegistry {
                     .ok_or_else(|| {
                         LocalCodeError::new(ErrorCode::AgentToolFailed, "command required")
                     })?;
-                if confirm_destructive && is_destructive(command) {
-                    let approved = match approver {
-                        Some(a) => {
-                            a.approve(&format!("Run shell command:\n\n  {command}")).await
-                        }
-                        None => false,
-                    };
-                    if !approved {
-                        return Err(LocalCodeError::new(
-                            ErrorCode::Cancelled,
-                            format!("Destructive command not approved: {command}"),
-                        )
-                        .with_cause("Safety policy: destructive shell commands need approval")
-                        .with_hint(
-                            "The user declined (or no interactive approval is available)",
-                        ));
-                    }
-                }
                 run_shell(command, workspace).await
             }
             "git.status" => shell_git(workspace, &["status", "--short"]).await,
@@ -611,7 +688,9 @@ mod tests {
             name: "fs.write".into(),
             arguments: json!({"path": "a.txt", "content": "hello world"}),
         };
-        reg.execute(&write, dir.path(), false, None).await.unwrap();
+        reg.execute(&write, dir.path(), ApprovalMode::Auto, None)
+            .await
+            .unwrap();
         let patch = ToolCall {
             id: "2".into(),
             name: "fs.apply_patch".into(),
@@ -621,14 +700,36 @@ mod tests {
                 "new_string": "hi"
             }),
         };
-        reg.execute(&patch, dir.path(), false, None).await.unwrap();
+        reg.execute(&patch, dir.path(), ApprovalMode::Auto, None)
+            .await
+            .unwrap();
         let read = ToolCall {
             id: "3".into(),
             name: "fs.read".into(),
             arguments: json!({"path": "a.txt"}),
         };
-        let r = reg.execute(&read, dir.path(), false, None).await.unwrap();
+        let r = reg
+            .execute(&read, dir.path(), ApprovalMode::Auto, None)
+            .await
+            .unwrap();
         assert_eq!(r.output, "hi world");
+    }
+
+    #[tokio::test]
+    async fn read_supports_line_ranges() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("n.txt"), "one\ntwo\nthree\nfour").unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "fs.read".into(),
+            arguments: json!({"path": "n.txt", "start_line": 2, "max_lines": 2}),
+        };
+        let r = reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None)
+            .await
+            .unwrap();
+        assert_eq!(r.output, "[lines 2-3 of 4]\ntwo\nthree");
     }
 
     #[test]
@@ -683,7 +784,10 @@ mod tests {
             name: "shell.exec".into(),
             arguments: json!({ "command": "echo hello" }),
         };
-        let r = reg.execute(&call, dir.path(), false, None).await.unwrap();
+        let r = reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None)
+            .await
+            .unwrap();
         assert!(r.output.contains("hello"));
         assert!(r.output.contains("exit: 0"));
     }
@@ -698,9 +802,91 @@ mod tests {
             arguments: json!({ "command": "rm -rf ." }),
         };
         let err = reg
-            .execute(&call, dir.path(), true, None)
+            .execute(&call, dir.path(), ApprovalMode::Auto, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
+    }
+
+    /// The full gating matrix: which calls each approval mode stops to ask
+    /// about. `Some(_)` = asks, `None` = runs freely.
+    #[test]
+    fn approval_matrix() {
+        let call = |name: &str, args: Value| ToolCall {
+            id: "t".into(),
+            name: name.into(),
+            arguments: args,
+        };
+        let read = call("fs.read", json!({"path": "a.txt"}));
+        let search = call("fs.search", json!({"pattern": "x"}));
+        let write = call("fs.write", json!({"path": "a.txt", "content": "hi"}));
+        let patch = call("fs.apply_patch", json!({"path": "a.txt", "old_string": "a", "new_string": "b"}));
+        let sh = call("shell.exec", json!({"command": "cargo test"}));
+        let sh_destr = call("shell.exec", json!({"command": "rm -rf target"}));
+
+        use ApprovalMode::*;
+        // always approve: nothing asks, not even destructive shell.
+        for c in [&read, &search, &write, &patch, &sh, &sh_destr] {
+            assert!(approval_request(c, AlwaysApprove).is_none());
+        }
+        // auto: only destructive shell asks.
+        for c in [&read, &search, &write, &patch, &sh] {
+            assert!(approval_request(c, Auto).is_none());
+        }
+        let req = approval_request(&sh_destr, Auto).expect("destructive asks");
+        assert!(req.contains("rm -rf target") && req.contains("destructive"), "{req}");
+        // approve edits: mutations ask, reads don't.
+        for c in [&read, &search] {
+            assert!(approval_request(c, ApproveEdits).is_none());
+        }
+        for c in [&write, &patch, &sh, &sh_destr] {
+            assert!(approval_request(c, ApproveEdits).is_some());
+        }
+        assert!(approval_request(&write, ApproveEdits).unwrap().contains("a.txt"));
+        // ask permission: everything asks.
+        for c in [&read, &search, &write, &patch, &sh, &sh_destr] {
+            assert!(approval_request(c, AskPermission).is_some());
+        }
+    }
+
+    /// A gated call with no approver (headless) is refused, and an approver
+    /// that says yes lets it through — for edits, not just shell.
+    #[tokio::test]
+    async fn approve_edits_gates_writes() {
+        struct Yes;
+        #[async_trait]
+        impl ToolApprover for Yes {
+            async fn approve(&self, _d: &str) -> bool {
+                true
+            }
+        }
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        let write = ToolCall {
+            id: "1".into(),
+            name: "fs.write".into(),
+            arguments: json!({"path": "a.txt", "content": "hi"}),
+        };
+        let err = reg
+            .execute(&write, dir.path(), ApprovalMode::ApproveEdits, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert!(!dir.path().join("a.txt").exists(), "refused write must not land");
+
+        reg.execute(&write, dir.path(), ApprovalMode::ApproveEdits, Some(&Yes))
+            .await
+            .unwrap();
+        assert!(dir.path().join("a.txt").exists());
+
+        // Reads stay free in approve-edits mode even with no approver.
+        let read = ToolCall {
+            id: "2".into(),
+            name: "fs.read".into(),
+            arguments: json!({"path": "a.txt"}),
+        };
+        reg.execute(&read, dir.path(), ApprovalMode::ApproveEdits, None)
+            .await
+            .unwrap();
     }
 }

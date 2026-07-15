@@ -129,17 +129,23 @@ impl InferenceBackend for LlamaCppBackend {
             message: "Starting llama-server".into(),
         });
 
+        // Built as a Vec so the optional --n-gpu-layers flag can be appended.
+        let mut args: Vec<String> = vec![
+            "-m".into(),
+            model_path.clone(),
+            "--host".into(),
+            self.cfg.host.clone(),
+            "--port".into(),
+            port.to_string(),
+            "-c".into(),
+            spec.context_length.to_string(),
+        ];
+        if let Some(ngl) = spec.tuning.gpu_layers {
+            args.push("--n-gpu-layers".into());
+            args.push(ngl.to_string());
+        }
         let mut child = tokio::process::Command::new(&bin)
-            .args([
-                "-m",
-                &model_path,
-                "--host",
-                &self.cfg.host,
-                "--port",
-                &port.to_string(),
-                "-c",
-                &spec.context_length.to_string(),
-            ])
+            .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

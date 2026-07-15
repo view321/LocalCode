@@ -29,6 +29,11 @@ use localcode_core::events::EventBus;
 use localcode_core::runtime::{ActiveRuntime, RuntimeKind};
 use serde::{Deserialize, Serialize};
 
+/// Default deploy context length. Also the sentinel the Ollama backend uses to
+/// decide whether the user customized context (and so needs a derived model
+/// with an overridden `num_ctx`); the TUI seeds `deploy_ctx` from this too.
+pub const DEFAULT_DEPLOY_CTX: u32 = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
@@ -89,6 +94,23 @@ pub struct DetectReport {
     pub ready: bool,
 }
 
+/// Optional, backend-specific launch tuning chosen by the user at deploy time.
+/// Every field is optional; `None` means "use the backend's own default". Each
+/// backend maps the fields it understands onto concrete launch flags and
+/// ignores the rest (e.g. GPU-memory fraction is meaningless to llama.cpp).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct DeployTuning {
+    /// Fraction (0.0–1.0) of VRAM the server may use. vLLM
+    /// `--gpu-memory-utilization`, SGLang `--mem-fraction-static`.
+    pub gpu_memory_fraction: Option<f32>,
+    /// Number of GPUs to shard across. vLLM `--tensor-parallel-size`,
+    /// SGLang `--tp-size`.
+    pub tensor_parallel: Option<u32>,
+    /// Layers to offload to the GPU. llama.cpp `--n-gpu-layers`, Ollama
+    /// `num_gpu`. Negative (llama.cpp convention) offloads all layers.
+    pub gpu_layers: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDeploySpec {
     pub job_id: String,
@@ -100,6 +122,9 @@ pub struct ModelDeploySpec {
     pub port: Option<u16>,
     pub context_length: u32,
     pub force_oversize: bool,
+    /// Per-backend launch tuning (VRAM fraction, tensor-parallel, GPU layers).
+    #[serde(default)]
+    pub tuning: DeployTuning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

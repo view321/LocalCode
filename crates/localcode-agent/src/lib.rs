@@ -6,7 +6,7 @@ mod tools;
 
 pub use mcp::{McpConfig, McpManager, McpServerStatus};
 pub use skills::{Skill, SkillLoader};
-pub use tools::{ToolApprover, ToolCall, ToolRegistry, ToolResult};
+pub use tools::{approval_request, ToolApprover, ToolCall, ToolRegistry, ToolResult};
 
 use futures::StreamExt;
 use localcode_core::config::AgentConfig;
@@ -196,6 +196,11 @@ impl CodingAgent {
 
         let system = self.build_system_prompt(session);
         let mut final_text = String::new();
+        // Loop breaker: local models sometimes re-issue the exact same call
+        // forever. Track the last signature; the third identical call in a row
+        // is not executed — the model gets an error nudging it to change tack.
+        let mut last_sig: Option<String> = None;
+        let mut repeats = 0u32;
 
         for round in 0..self.config.max_tool_rounds {
             info!(round, "agent tool round");
@@ -229,15 +234,37 @@ impl CodingAgent {
                             args_preview: preview(&tc.arguments.to_string(), 60),
                         },
                     );
-                    let result = self
-                        .tools
-                        .execute(
-                            &tc,
-                            &session.workspace_root,
-                            self.config.confirm_destructive_tools,
-                            approver,
+
+                    let sig = format!("{}|{}", tc.name, tc.arguments);
+                    if last_sig.as_deref() == Some(sig.as_str()) {
+                        repeats += 1;
+                    } else {
+                        last_sig = Some(sig);
+                        repeats = 0;
+                    }
+
+                    let result = if repeats >= 2 {
+                        Err(LocalCodeError::new(
+                            ErrorCode::AgentToolFailed,
+                            format!(
+                                "Identical call to {} repeated {} times in a row — not executed",
+                                tc.name,
+                                repeats + 1
+                            ),
                         )
-                        .await;
+                        .with_hint(
+                            "Change the arguments or the approach, or give your final answer",
+                        ))
+                    } else {
+                        self.tools
+                            .execute(
+                                &tc,
+                                &session.workspace_root,
+                                self.config.approval(),
+                                approver,
+                            )
+                            .await
+                    };
 
                     let content = match &result {
                         Ok(r) => r.output.clone(),
@@ -286,12 +313,25 @@ impl CodingAgent {
         match self.config.system_prompt.as_deref().map(str::trim) {
             Some(custom) if !custom.is_empty() => parts.push(custom.to_string()),
             _ => {
+                // Kept deliberately short: local models run with small
+                // contexts, and every line here is paid on every request.
                 parts.push(
-                    "You are LocalCode coding agent. Work inside the user workspace.".into(),
+                    "You are LocalCode, a coding agent working inside the user's workspace.".into(),
                 );
                 parts.push(
-                    "Use tools to read/search/edit files. fs.apply_patch does exact string replacement."
+                    "Work in a loop: gather context (fs.read, fs.list, fs.search), then act \
+                     (fs.apply_patch, fs.write, shell.exec). Prefer fs.apply_patch for edits — \
+                     it replaces an exact old_string once; re-read a file before patching it again."
                         .into(),
+                );
+                parts.push(
+                    "Read only what you need (fs.read takes start_line/max_lines). Verify your \
+                     changes when possible, e.g. by building or running tests with shell.exec."
+                        .into(),
+                );
+                parts.push(
+                    "Some tool calls may need user approval; if one is refused, don't retry it — \
+                     adjust or ask. Never repeat an identical failing call.".into(),
                 );
                 parts.push("Be concise. When tools fail, explain causes and next steps.".into());
                 parts.push("Subagents are not available in this build; do the work yourself.".into());
@@ -338,9 +378,20 @@ impl CodingAgent {
             format!("{base}/v1/chat/completions")
         };
 
+        // Long sessions outgrow small local contexts: send only the newest
+        // turns that fit the budget. The session itself keeps everything.
+        let full_len = messages.len();
+        let messages = trimmed_tail(messages, self.config.max_history_chars);
+        let system_content = if messages.len() < full_len {
+            debug!(kept = messages.len(), of = full_len, "history trimmed for context budget");
+            format!("{system}\n\n(Older turns were dropped from this request to fit the model's context window.)")
+        } else {
+            system.to_string()
+        };
+
         let mut api_messages = vec![json!({
             "role": "system",
-            "content": system,
+            "content": system_content,
         })];
         for m in messages {
             let mut msg = json!({
@@ -689,6 +740,39 @@ struct LlmResponse {
     streamed: bool,
 }
 
+/// Approximate size of a message as sent to the model.
+fn approx_chars(m: &ChatMessage) -> usize {
+    m.content.chars().count()
+        + m.tool_calls
+            .as_ref()
+            .map(|v| v.to_string().chars().count())
+            .unwrap_or(0)
+}
+
+/// The newest suffix of `messages` that fits `budget` chars, cut only at a
+/// `user` message so an assistant `tool_calls` message is never separated from
+/// its tool replies (strict servers reject that). Always keeps at least the
+/// last user turn, even if that turn alone exceeds the budget. `budget = 0`
+/// disables trimming.
+fn trimmed_tail(messages: &[ChatMessage], budget: usize) -> &[ChatMessage] {
+    if budget == 0 || messages.is_empty() {
+        return messages;
+    }
+    let mut total = 0usize;
+    let mut start: Option<usize> = None;
+    for (i, m) in messages.iter().enumerate().rev() {
+        total += approx_chars(m);
+        let within = total <= budget;
+        if m.role == "user" && (within || start.is_none()) {
+            start = Some(i);
+        }
+        if !within && start.is_some() {
+            break;
+        }
+    }
+    &messages[start.unwrap_or(0)..]
+}
+
 /// Read a project `AGENTS.md` from the workspace root (or `.localcode/AGENTS.md`),
 /// truncated so a huge file can't blow a small local model's context window.
 fn read_agents_md(workspace: &std::path::Path) -> Option<String> {
@@ -806,6 +890,46 @@ mod tests {
         );
         // Invalid JSON must not silently execute with empty args.
         assert!(parse_pseudo_tool("tool:fs.read {not json}").is_none());
+    }
+
+    #[test]
+    fn history_trimming_cuts_at_user_turns() {
+        let user = |s: &str| ChatMessage::user(s);
+        let asst = |s: &str, tc: Option<Value>| ChatMessage::assistant(s, tc);
+        let tool = |s: &str| ChatMessage::tool(s, "c1".into(), "fs.read".into());
+
+        // Two turns; the second fits the budget on its own.
+        let msgs = vec![
+            user("first question"),                       // 14
+            asst("", Some(json!([{"id": "c1"}]))),        // tool_calls json
+            tool(&"x".repeat(200)),                       // 200
+            asst("first answer", None),
+            user("second question"),
+            asst("second answer", None),
+        ];
+        let t = trimmed_tail(&msgs, 60);
+        assert_eq!(t.len(), 2, "keeps only the last user turn");
+        assert_eq!(t[0].role, "user");
+        assert_eq!(t[0].content, "second question");
+
+        // A budget big enough for everything keeps everything.
+        assert_eq!(trimmed_tail(&msgs, 100_000).len(), msgs.len());
+        // Zero disables trimming.
+        assert_eq!(trimmed_tail(&msgs, 0).len(), msgs.len());
+
+        // Even when the last turn alone exceeds the budget, it is kept whole —
+        // and starts at its user message, not mid-exchange.
+        let big = vec![
+            user("old"),
+            asst("old answer", None),
+            user("new"),
+            asst("", Some(json!([{"id": "c9"}]))),
+            tool(&"y".repeat(5_000)),
+            asst("done", None),
+        ];
+        let t = trimmed_tail(&big, 100);
+        assert_eq!(t[0].content, "new");
+        assert_eq!(t.len(), 4);
     }
 
     #[test]

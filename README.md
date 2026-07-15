@@ -165,6 +165,7 @@ update badge; the middle is the conversation transcript; the bottom is the
 | `/` or `Ctrl+K` | Open the command menu |
 | `↑`/`↓` | Command menu / panel navigation (input history at home) |
 | `Ctrl+↑`/`Ctrl+↓` | Grow/shrink the omnibar |
+| `Shift+Tab` | Cycle agent approvals (always approve → auto → approve edits → ask permission) |
 | `Ctrl+S` | Save config &nbsp;·&nbsp; `Ctrl+C` quit |
 | `Esc` | Close panel / cancel task |
 
@@ -175,7 +176,19 @@ update badge; the middle is the conversation transcript; the bottom is the
 | `/backends` | Install & configure inference backends |
 | `/runtimes` | Active runtimes & system overview |
 | `/deploy` | Deploy the selected model |
-| `/bench` `/setup` `/doctor` `/settings` `/theme` `/alerts` `/new` `/assistant` `/update` `/logs` `/quit` | … |
+| `/mode [always\|auto\|edits\|ask]` | How much the agent asks before running tools |
+| `/bench` `/setup` `/doctor` `/settings` `/theme` `/new` `/assistant` `/update` `/logs` `/quit` | … |
+
+**Agent approvals** (`/mode`, `Shift+Tab`, or click `approvals` in the status
+bar): `always approve` runs everything unprompted; `auto` asks only for
+destructive shell commands; `approve edits` asks before file edits and any
+shell command; `ask permission` asks before every tool call. Headless runs
+(`localcode agent run`) have no prompt, so gated calls are refused there —
+pass `--approvals always` for unattended runs.
+
+**Themes**: `dark` (grayscale), `neon` (light blue), `pink` (hot pink), and
+`sage` (soft green on gray) — cycle with `/theme` or click a name in the
+status bar.
 
 Panels open as **popups** above the bar. **Model cards** render as formatted
 markdown with metadata chips and scroll independently; the focused pane has the

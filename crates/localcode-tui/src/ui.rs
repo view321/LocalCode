@@ -259,6 +259,24 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     left.push(sep(&th));
     left.push(Span::styled("ctx ", theme::muted(&th)));
     left.push(Span::styled(human_ctx(app.deploy_ctx), fg(&th)));
+    // Agent approval mode — always visible (it decides what runs unprompted),
+    // clickable to cycle. The region is registered after the width is known.
+    left.push(sep(&th));
+    let approval_x = inner.x + spans_width(&left);
+    let approval_label = "approvals ";
+    let approval_tag = app.config.agent.approval().tag();
+    left.push(Span::styled(approval_label, theme::muted(&th)));
+    left.push(Span::styled(approval_tag, fg(&th)));
+    click(
+        app,
+        Rect {
+            x: approval_x,
+            y: inner.y,
+            width: (approval_label.width() + approval_tag.width()) as u16,
+            height: 1,
+        },
+        ClickTarget::ApprovalCycle,
+    );
     // Transient status / feedback (set_status, raise_error). The redesign
     // dropped its dedicated row, orphaning `status_line` — so `/logs`, deploy
     // progress, "unknown command", etc. set text that nothing drew. Render it
@@ -457,9 +475,19 @@ fn draw_hint_bar(f: &mut Frame, area: Rect, app: &App) {
             "↑↓ move · ↵ toggle/edit · click a row · Esc back",
             theme::faint(&th),
         )]
+    } else if let Some(b) = app.busy.as_ref().filter(|b| b.kind == crate::app::BusyKind::Coding) {
+        // While the agent runs, the one key that matters is Esc.
+        vec![
+            Span::styled("Esc cancel", theme::faint(&th)),
+            sep(&th),
+            Span::styled(
+                format!("agent working {}s", b.started.elapsed().as_secs()),
+                theme::faint(&th),
+            ),
+        ]
     } else {
         let submit = if app.mode == Mode::Models { "↵ search" } else { "↵ send" };
-        vec![
+        let mut spans = vec![
             Span::styled(submit, theme::faint(&th)),
             sep(&th),
             Span::styled("⇧↵ newline", theme::faint(&th)),
@@ -470,7 +498,12 @@ fn draw_hint_bar(f: &mut Frame, area: Rect, app: &App) {
                 if app.mode == Mode::Chat { "↑↓ history" } else { "Esc back" },
                 theme::faint(&th),
             ),
-        ]
+        ];
+        if app.mode == Mode::Chat {
+            spans.push(sep(&th));
+            spans.push(Span::styled("⇧Tab approvals", theme::faint(&th)));
+        }
+        spans
     };
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
@@ -782,15 +815,40 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     }
     ctrl.push(Line::from(""));
 
-    // backend ⟳ · context
+    // backend ⟳ — click to cycle Ollama → llama.cpp → vLLM → SGLang.
     let backend_row = area.y + ctrl.len() as u16;
+    let backend_cell = format!("{} ⟳", app.deploy_backend.as_str());
+    let backend_w = ("backend ".len() + backend_cell.width()) as u16;
     ctrl.push(Line::from(vec![
         Span::styled("backend ", theme::muted(&th)),
-        Span::styled(format!("{} ⟳", app.deploy_backend.as_str()), theme::accent(&th)),
-        Span::styled("    context ", theme::muted(&th)),
-        Span::styled(app.deploy_ctx.to_string(), fg(&th)),
+        Span::styled(backend_cell, theme::accent(&th)),
     ]));
-    click(app, Rect { x: area.x, y: backend_row, width: 18, height: 1 }, ClickTarget::BackendCycle);
+    click(app, Rect { x: area.x, y: backend_row, width: backend_w, height: 1 }, ClickTarget::BackendCycle);
+
+    // Editable deploy parameters, filtered to what the current backend honors.
+    // Click a row to edit it inline (↵ save, Esc cancel, blank = default).
+    for field in app.deploy_fields() {
+        let row = area.y + ctrl.len() as u16;
+        let editing = app.deploy_editing_field() == Some(field);
+        let value = if editing {
+            // Live edit buffer with a block cursor.
+            Span::styled(
+                format!("{}\u{2588}", app.deploy_field_edit_buf()),
+                theme::accent(&th).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(app.deploy_field_display(field), fg(&th))
+        };
+        ctrl.push(Line::from(vec![
+            Span::styled(format!("{:<11}", field.label()), theme::muted(&th)),
+            value,
+        ]));
+        click(
+            app,
+            Rect { x: area.x, y: row, width: area.width, height: 1 },
+            ClickTarget::DeployField(field),
+        );
+    }
 
     // vram fit + a wide bar.
     if let Some(fit) = &app.last_fit {
@@ -811,7 +869,8 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     }
     ctrl.push(Line::from(""));
 
-    // Deploy button / progress.
+    // Deploy button, or — while deploying — a progress meter with a Cancel
+    // button on its own row (deploy is cancelled here, never with Esc).
     let deploy_row = area.y + ctrl.len() as u16;
     if app.deploy_busy.is_some() {
         let mut spans = vec![Span::styled(
@@ -820,6 +879,13 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         )];
         spans.extend(meter(&th, app.deploy_progress as f64 / 100.0, 16));
         ctrl.push(Line::from(spans));
+        let cancel_row = area.y + ctrl.len() as u16;
+        ctrl.push(Line::from(button(&th, "cancel", false)));
+        click(
+            app,
+            Rect { x: area.x, y: cancel_row, width: button_width("cancel"), height: 1 },
+            ClickTarget::DeployCancel,
+        );
     } else {
         ctrl.push(Line::from(button(&th, "deploy", true)));
         click(

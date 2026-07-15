@@ -144,14 +144,21 @@ impl InferenceBackend for OllamaBackend {
             }
         }
 
+        // Ollama has no launch-time flags (it's a shared server we don't spawn),
+        // so a requested context / GPU-offload is honored by baking it into a
+        // derived model. `effective` is that derived model (or `model_name`
+        // unchanged if creation was skipped or best-effort-failed).
+        let effective = self.apply_tuning(&model_name, &spec, cid).await;
+
         let base = self.cfg.base_url.clone();
+        // Display the model the user actually chose; serve the (possibly
+        // tuning-derived) model the OpenAI-compatible endpoint should call.
         let mut runtime = ActiveRuntime::new(
             format!("ollama:{model_name}"),
             BackendKind::Ollama.to_runtime_kind(),
             format!("{base}/v1"),
         );
-        // The OpenAI-compatible endpoint expects the *ollama* model name.
-        runtime.model_id = Some(model_name.clone());
+        runtime.model_id = Some(effective);
         runtime.quantization = spec.quantization.clone();
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
@@ -279,6 +286,59 @@ impl OllamaBackend {
         Ok(())
     }
 
+    /// Bake a customized context / GPU-offload into a derived Ollama model and
+    /// return its name. Ollama exposes these only as model PARAMETERs (there is
+    /// no serve flag), so `/api/create` with `FROM <base>` — which references the
+    /// existing blobs, no re-download — is the way to honor them. Best-effort:
+    /// on any failure we log and return the base model unchanged, so tuning can
+    /// never convert a working deploy into a broken one.
+    async fn apply_tuning(
+        &self,
+        base: &str,
+        spec: &ModelDeploySpec,
+        cid: localcode_core::CorrelationId,
+    ) -> String {
+        // Ollama's built-in default context is small (~2048) and the deploy
+        // panel always shows a concrete context, so honor whatever it shows —
+        // otherwise the served context would silently disagree with the UI (and
+        // with what vLLM/llama.cpp/SGLang do with the same value). Only skip when
+        // context is explicitly unset (0) and there is no GPU-layer override, in
+        // which case there's nothing to bake in.
+        if spec.context_length == 0 && spec.tuning.gpu_layers.is_none() {
+            return base.to_string();
+        }
+        let mut modelfile = format!("FROM {base}\n");
+        if spec.context_length > 0 {
+            modelfile.push_str(&format!("PARAMETER num_ctx {}\n", spec.context_length));
+        }
+        if let Some(n) = spec.tuning.gpu_layers {
+            modelfile.push_str(&format!("PARAMETER num_gpu {n}\n"));
+        }
+        let derived = derived_model_name(base, spec.context_length);
+        let body =
+            serde_json::json!({ "name": derived, "modelfile": modelfile, "stream": false });
+        match self
+            .pull_http
+            .post(format!("{}/api/create", self.cfg.base_url))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!(%cid, %derived, "ollama tuned model created (num_ctx/num_gpu)");
+                derived
+            }
+            Ok(r) => {
+                warn!(%cid, status = %r.status(), "ollama tuning create failed; using base model");
+                base.to_string()
+            }
+            Err(e) => {
+                warn!(%cid, error = %e, "ollama tuning create errored; using base model");
+                base.to_string()
+            }
+        }
+    }
+
     async fn create_from_gguf(
         &self,
         name: &str,
@@ -286,7 +346,15 @@ impl OllamaBackend {
         spec: &ModelDeploySpec,
         cid: localcode_core::CorrelationId,
     ) -> Result<RunningEndpoint, LocalCodeError> {
-        let modelfile = format!("FROM {path}\n");
+        // Bake context / GPU-offload straight into the Modelfile here (this path
+        // already creates a model), so a local-GGUF deploy honors tuning too.
+        let mut modelfile = format!("FROM {path}\n");
+        if spec.context_length > 0 {
+            modelfile.push_str(&format!("PARAMETER num_ctx {}\n", spec.context_length));
+        }
+        if let Some(n) = spec.tuning.gpu_layers {
+            modelfile.push_str(&format!("PARAMETER num_gpu {n}\n"));
+        }
         let body = serde_json::json!({ "name": name, "modelfile": modelfile });
         let resp = self
             .pull_http
@@ -358,6 +426,26 @@ fn ollama_model_name(spec: &ModelDeploySpec) -> String {
     lower.replace(' ', "-")
 }
 
+/// A valid Ollama name for a tuning-derived model. Ollama names allow only
+/// `[a-zA-Z0-9._-]` (plus one `:tag`), so the base's org/quant separators are
+/// flattened; the `ctx{n}` tag keeps distinct contexts as distinct models.
+fn derived_model_name(base: &str, ctx: u32) -> String {
+    let stem = base.rsplit('/').next().unwrap_or(base);
+    let safe: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let safe = safe.trim_matches('-');
+    let safe = if safe.is_empty() { "model" } else { safe };
+    format!("localcode-{safe}:ctx{ctx}")
+}
+
 trait NotesExt {
     fn with_causes_from_notes(self, notes: &[String]) -> Self;
 }
@@ -386,6 +474,7 @@ mod tests {
             port: None,
             context_length: 8192,
             force_oversize: false,
+            tuning: crate::DeployTuning::default(),
         }
     }
 
@@ -408,5 +497,18 @@ mod tests {
             "qwen2.5-coder:7b"
         );
         assert_eq!(ollama_model_name(&spec("codellama", None)), "codellama");
+    }
+
+    #[test]
+    fn derived_name_is_ollama_safe() {
+        // org/quant separators flattened, context encoded as the tag.
+        assert_eq!(
+            derived_model_name("hf.co/TheBloke/CodeLlama-7B-GGUF:Q4_K_M", 16384),
+            "localcode-CodeLlama-7B-GGUF-Q4_K_M:ctx16384"
+        );
+        assert_eq!(
+            derived_model_name("qwen2.5-coder:7b", 4096),
+            "localcode-qwen2.5-coder-7b:ctx4096"
+        );
     }
 }

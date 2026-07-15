@@ -254,6 +254,96 @@ impl Default for AssistantConfig {
     }
 }
 
+/// How much the agent asks before running tools. Ordered from most permissive
+/// to most careful; the TUI cycles through them in this order (Shift+Tab,
+/// `/mode`, or the status-bar indicator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Never ask — every tool call runs, destructive shell commands included.
+    #[serde(alias = "always", alias = "yolo")]
+    AlwaysApprove,
+    /// Ask only for destructive shell commands (rm -rf, git reset --hard, …).
+    #[default]
+    Auto,
+    /// Ask before anything that changes the workspace: file writes, patches,
+    /// and every shell command. Reads and searches run freely.
+    #[serde(alias = "edits")]
+    ApproveEdits,
+    /// Ask before every tool call, reads included.
+    #[serde(alias = "ask")]
+    AskPermission,
+}
+
+impl ApprovalMode {
+    /// Cycle order (most permissive → most careful).
+    pub const ALL: [ApprovalMode; 4] = [
+        ApprovalMode::AlwaysApprove,
+        ApprovalMode::Auto,
+        ApprovalMode::ApproveEdits,
+        ApprovalMode::AskPermission,
+    ];
+
+    /// Full name as the user asked for it ("always approve", "auto", …).
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalMode::AlwaysApprove => "always approve",
+            ApprovalMode::Auto => "auto",
+            ApprovalMode::ApproveEdits => "approve edits",
+            ApprovalMode::AskPermission => "ask permission",
+        }
+    }
+
+    /// Short tag for the status bar.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ApprovalMode::AlwaysApprove => "always",
+            ApprovalMode::Auto => "auto",
+            ApprovalMode::ApproveEdits => "edits",
+            ApprovalMode::AskPermission => "ask",
+        }
+    }
+
+    /// One-line explanation shown in Settings and the status line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ApprovalMode::AlwaysApprove => "everything runs without asking",
+            ApprovalMode::Auto => "asks only for destructive shell commands",
+            ApprovalMode::ApproveEdits => "asks before file edits & shell commands",
+            ApprovalMode::AskPermission => "asks before every tool call",
+        }
+    }
+
+    /// The next mode in the cycle.
+    pub fn next(self) -> Self {
+        let all = Self::ALL;
+        let i = all.iter().position(|m| *m == self).unwrap_or(1);
+        all[(i + 1) % all.len()]
+    }
+
+    /// Parse a user-typed mode name (`/mode edits`). Accepts the tag, the full
+    /// label (with spaces, dashes or underscores), and common synonyms.
+    pub fn parse(s: &str) -> Option<Self> {
+        let k: String = s
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        match k.as_str() {
+            "alwaysapprove" | "always" | "yolo" | "never" | "none" => {
+                Some(ApprovalMode::AlwaysApprove)
+            }
+            "auto" | "default" => Some(ApprovalMode::Auto),
+            "approveedits" | "edits" | "edit" => Some(ApprovalMode::ApproveEdits),
+            "askpermission" | "ask" | "askpermissions" | "all" => {
+                Some(ApprovalMode::AskPermission)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_true")]
@@ -262,6 +352,13 @@ pub struct AgentConfig {
     pub skills_dir: Option<String>,
     #[serde(default)]
     pub mcp_config: Option<String>,
+    /// How much the agent asks before running tools. See [`ApprovalMode`];
+    /// read it through [`AgentConfig::approval`], which honors the legacy
+    /// `confirm_destructive_tools` off-switch from older configs.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    /// Legacy switch superseded by `approval_mode`. Kept so old configs load:
+    /// `false` (with `approval_mode` unset) still means "never ask".
     #[serde(default = "default_true")]
     pub confirm_destructive_tools: bool,
     /// Allow the Coding tab to fall back to the (cloud) assistant provider
@@ -292,6 +389,26 @@ pub struct AgentConfig {
     /// Skill names to hide from the agent's system prompt.
     #[serde(default)]
     pub disabled_skills: Vec<String>,
+    /// Char budget for the message history sent to the model per request.
+    /// Local models often run with small context windows; when a session grows
+    /// past this, the oldest turns are dropped from the request (whole user
+    /// turns at a time, so tool-call exchanges are never split). The stored
+    /// session keeps everything. 0 disables trimming.
+    #[serde(default = "default_history_chars")]
+    pub max_history_chars: usize,
+}
+
+impl AgentConfig {
+    /// Effective approval mode. Old configs that set
+    /// `confirm_destructive_tools = false` (and never chose a mode) keep their
+    /// "never ask" behavior.
+    pub fn approval(&self) -> ApprovalMode {
+        if self.approval_mode == ApprovalMode::Auto && !self.confirm_destructive_tools {
+            ApprovalMode::AlwaysApprove
+        } else {
+            self.approval_mode
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -300,6 +417,7 @@ impl Default for AgentConfig {
             subagents_enabled: true,
             skills_dir: None,
             mcp_config: None,
+            approval_mode: ApprovalMode::default(),
             confirm_destructive_tools: true,
             allow_cloud_fallback: false,
             workspace_root: None,
@@ -309,6 +427,7 @@ impl Default for AgentConfig {
             use_agents_md: true,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
+            max_history_chars: default_history_chars(),
         }
     }
 }
@@ -549,6 +668,11 @@ fn default_assistant_key_env() -> String {
 fn default_max_tools() -> u32 {
     32
 }
+fn default_history_chars() -> usize {
+    // ≈12k tokens — comfortable for the 16k–32k contexts local coding models
+    // typically run with, while still leaving room for tool schemas + output.
+    48_000
+}
 fn default_composer_rows() -> u16 {
     3
 }
@@ -690,6 +814,48 @@ mod tests {
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.ui.theme, ThemeMode::Dark);
         assert_eq!(loaded.backends.default.kind, "ollama");
+    }
+
+    #[test]
+    fn approval_mode_parses_and_honors_legacy_switch() {
+        // Old config: no approval_mode key, confirms turned off → never ask.
+        let cfg: AgentConfig =
+            toml::from_str("confirm_destructive_tools = false").unwrap();
+        assert_eq!(cfg.approval(), ApprovalMode::AlwaysApprove);
+
+        // Old config default: confirms on → Auto.
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.approval(), ApprovalMode::Auto);
+
+        // An explicit mode wins over the legacy switch.
+        let cfg: AgentConfig = toml::from_str(
+            "approval_mode = \"ask_permission\"\nconfirm_destructive_tools = false",
+        )
+        .unwrap();
+        assert_eq!(cfg.approval(), ApprovalMode::AskPermission);
+
+        // Serde aliases keep short names loading.
+        let cfg: AgentConfig = toml::from_str("approval_mode = \"edits\"").unwrap();
+        assert_eq!(cfg.approval(), ApprovalMode::ApproveEdits);
+
+        // User-typed names (the /mode argument).
+        assert_eq!(ApprovalMode::parse("always approve"), Some(ApprovalMode::AlwaysApprove));
+        assert_eq!(ApprovalMode::parse("Approve-Edits"), Some(ApprovalMode::ApproveEdits));
+        assert_eq!(ApprovalMode::parse("ask"), Some(ApprovalMode::AskPermission));
+        assert_eq!(ApprovalMode::parse("auto"), Some(ApprovalMode::Auto));
+        assert_eq!(ApprovalMode::parse("bogus"), None);
+
+        // The cycle visits every mode and wraps.
+        let mut m = ApprovalMode::Auto;
+        let mut seen = vec![m];
+        for _ in 0..3 {
+            m = m.next();
+            seen.push(m);
+        }
+        assert_eq!(m.next(), ApprovalMode::Auto);
+        seen.sort_by_key(|m| m.tag());
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "cycle must visit all modes");
     }
 
     #[test]

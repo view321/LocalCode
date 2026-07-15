@@ -52,6 +52,23 @@ enum Commands {
         /// Local GGUF path (llama.cpp)
         #[arg(long)]
         path: Option<String>,
+        /// Max context length (vLLM --max-model-len, llama.cpp -c, SGLang
+        /// --context-length, Ollama num_ctx)
+        #[arg(long)]
+        context: Option<u32>,
+        /// Server port to bind (default: backend's configured port)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Fraction of VRAM to use, 0.0–1.0 (vLLM --gpu-memory-utilization,
+        /// SGLang --mem-fraction-static)
+        #[arg(long)]
+        gpu_memory_fraction: Option<f32>,
+        /// GPUs to shard across (vLLM --tensor-parallel-size, SGLang --tp-size)
+        #[arg(long)]
+        tensor_parallel: Option<u32>,
+        /// Layers to offload to GPU (llama.cpp --n-gpu-layers, Ollama num_gpu)
+        #[arg(long)]
+        gpu_layers: Option<i32>,
     },
     /// Run a benchmark suite
     Bench {
@@ -110,6 +127,11 @@ enum AgentCmd {
         endpoint: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Approval mode for this run: always, auto, edits or ask. Headless
+        /// runs have no interactive prompt, so gated calls are refused —
+        /// `--approvals always` runs everything unattended.
+        #[arg(long)]
+        approvals: Option<String>,
     },
 }
 
@@ -204,6 +226,11 @@ async fn real_main() -> Result<(), LocalCodeError> {
             backend,
             force,
             path,
+            context,
+            port,
+            gpu_memory_fraction,
+            tensor_parallel,
+            gpu_layers,
         } => {
             let kind = BackendKind::parse(&backend).ok_or_else(|| {
                 LocalCodeError::new(ErrorCode::BackendNotFound, format!("Unknown backend {backend}"))
@@ -276,8 +303,13 @@ async fn real_main() -> Result<(), LocalCodeError> {
                 download_urls,
                 local_path: path,
                 backend: kind,
-                port: None,
-                context_length: 8192,
+                port,
+                context_length: context.unwrap_or(localcode_backends::DEFAULT_DEPLOY_CTX),
+                tuning: localcode_backends::DeployTuning {
+                    gpu_memory_fraction,
+                    tensor_parallel,
+                    gpu_layers,
+                },
                 continue_despite_oversize: force,
             };
             let job = svc.deploy(req).await?;
@@ -321,6 +353,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
                 workspace,
                 endpoint,
                 model,
+                approvals,
             } => {
                 let workspace = workspace.unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -335,11 +368,24 @@ async fn real_main() -> Result<(), LocalCodeError> {
                     endpoint,
                 );
                 runtime.model_id = model;
+                let mut agent_cfg = config.agent.clone();
+                if let Some(raw) = approvals.as_deref() {
+                    let mode = localcode_core::config::ApprovalMode::parse(raw).ok_or_else(|| {
+                        LocalCodeError::new(
+                            ErrorCode::ConfigParseFailed,
+                            format!("Unknown approval mode: {raw}"),
+                        )
+                        .with_hint("Use one of: always, auto, edits, ask")
+                    })?;
+                    agent_cfg.approval_mode = mode;
+                    // An explicit choice overrides the legacy off-switch too.
+                    agent_cfg.confirm_destructive_tools = true;
+                }
                 let out = localcode_agent::run_headless(
                     &prompt,
                     workspace,
                     &runtime,
-                    config.agent.clone(),
+                    agent_cfg,
                     None,
                 )
                 .await?;

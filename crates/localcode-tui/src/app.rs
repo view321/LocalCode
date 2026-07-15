@@ -23,11 +23,11 @@ use localcode_api_client::ApiClient;
 use localcode_assistant::{Assistant, AssistantRequest};
 use localcode_backends::{
     can_elevate_noninteractively, diagnose, resolve_install_plan, resolve_repair, run_install,
-    run_repair, smoke_test, BackendKind, BackendRegistry, DeployRequest, DeployService, DetectReport,
-    Diagnosis, InstallPlan, RepairPlan, Repoint, SmokeReport,
+    run_repair, smoke_test, BackendKind, BackendRegistry, DeployRequest, DeployService, DeployTuning,
+    DetectReport, Diagnosis, InstallPlan, RepairPlan, Repoint, SmokeReport, DEFAULT_DEPLOY_CTX,
 };
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
-use localcode_core::config::Config;
+use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::{AppEvent, EventBus, Severity};
 use localcode_core::paths::AppPaths;
@@ -135,6 +135,8 @@ pub struct ClickRegion {
 pub enum ClickTarget {
     // Status bar
     Theme(ThemeMode),
+    /// The `approvals <tag>` cluster — click to cycle the agent approval mode.
+    ApprovalCycle,
     UpdateBadge,
     // Command list (shown while the omnibar starts with '/')
     CommandItem(usize),
@@ -147,6 +149,9 @@ pub enum ClickTarget {
     QuantList,
     BackendCycle,
     DeployButton,
+    DeployCancel,
+    /// Edit an inline deploy parameter (context, port, per-backend tuning).
+    DeployField(DeployField),
     // Runtimes
     RuntimeList,
     // Backends — index into BACKEND_ORDER
@@ -180,6 +185,39 @@ pub enum SettingField {
     Workspace,
 }
 
+/// A tunable deploy parameter, edited inline in the Models view before deploy.
+/// Which fields are shown depends on the selected backend (see
+/// [`App::deploy_fields`]); each maps to a concrete launch flag per backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployField {
+    /// Max context / KV-cache length. vLLM `--max-model-len`, llama.cpp `-c`,
+    /// SGLang `--context-length`, Ollama `num_ctx`.
+    Context,
+    /// Server port to bind (blank = backend default).
+    Port,
+    /// Fraction of VRAM the server may use. vLLM `--gpu-memory-utilization`,
+    /// SGLang `--mem-fraction-static`.
+    GpuMemFraction,
+    /// GPUs to shard the model across. vLLM `--tensor-parallel-size`,
+    /// SGLang `--tp-size`.
+    TensorParallel,
+    /// Layers to offload to GPU. llama.cpp `--n-gpu-layers`, Ollama `num_gpu`.
+    GpuLayers,
+}
+
+impl DeployField {
+    /// Left-column label shown in the deploy panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeployField::Context => "context",
+            DeployField::Port => "port",
+            DeployField::GpuMemFraction => "gpu mem",
+            DeployField::TensorParallel => "tensor par",
+            DeployField::GpuLayers => "gpu layers",
+        }
+    }
+}
+
 /// What activating a Settings row does. `Copy` so it can ride inside
 /// [`ClickTarget`]; index-carrying variants point into stable catalogs
 /// (`ToolRegistry::catalog()` / `App::skills`).
@@ -188,7 +226,7 @@ pub enum SettingAction {
     ThemeToggle,
     ToggleMouse,
     ToggleStream,
-    ToggleConfirmShell,
+    ApprovalCycle,
     ToggleCloudFallback,
     ToggleAgentsMd,
     ToggleCheckUpdates,
@@ -350,6 +388,9 @@ pub enum BgMsg {
     DoctorDone(String),
     DetectDone(Vec<DetectReport>),
     ApiHealth(bool),
+    /// Fresh GPU/VRAM inventory from the periodic background poll — keeps the
+    /// status-bar VRAM meter live instead of frozen at the startup snapshot.
+    GpuRefreshed(GpuInventory),
     RuntimeStopped {
         result: Result<(), LocalCodeError>,
     },
@@ -486,6 +527,14 @@ pub struct App {
     pub deploy_backend: BackendKind,
     pub deploy_ctx: u32,
     pub deploy_port: Option<u16>,
+    /// Per-backend deploy tuning (VRAM fraction, tensor-parallel, GPU layers).
+    /// `None` means "let the backend choose its default".
+    pub deploy_gpu_frac: Option<f32>,
+    pub deploy_tensor_parallel: Option<u32>,
+    pub deploy_gpu_layers: Option<i32>,
+    /// Which deploy parameter is being edited inline (Models view), if any.
+    deploy_editing: Option<DeployField>,
+    deploy_field_edit: String,
     pub deploy_progress: u8,
     pub last_fit: Option<FitPrediction>,
     pub pending_oversize_deploy: Option<DeployRequest>,
@@ -628,8 +677,13 @@ impl App {
             selected_quant: None,
             deploy_backend: BackendKind::parse(&config.backends.default.kind)
                 .unwrap_or(BackendKind::Ollama),
-            deploy_ctx: 8192,
+            deploy_ctx: DEFAULT_DEPLOY_CTX,
             deploy_port: None,
+            deploy_gpu_frac: None,
+            deploy_tensor_parallel: None,
+            deploy_gpu_layers: None,
+            deploy_editing: None,
+            deploy_field_edit: String::new(),
             deploy_progress: 0,
             last_fit: None,
             pending_oversize_deploy: None,
@@ -732,7 +786,9 @@ impl App {
         self.busy = None;
     }
 
-    /// Esc: cancel the foreground task, else a running deploy.
+    /// Esc: cancel the foreground task (search/coding/remote), or a running
+    /// install/repair/update. A deploy is intentionally excluded — it is
+    /// cancelled only via its on-screen Cancel button (see `cancel_deploy`).
     fn cancel_current(&mut self) {
         // A pending tool approval belongs to the running turn — deny it first.
         if matches!(
@@ -765,10 +821,6 @@ impl App {
                 }
             }
             self.set_status(format!("Cancelled: {}", b.label), false);
-        } else if let Some(b) = self.deploy_busy.take() {
-            b.handle.abort();
-            self.deploy_progress = 0;
-            self.set_status("Deploy cancelled", false);
         } else if let Some(b) = self.update_busy.take() {
             // Safe: the binary swap happens only in the final instant of the
             // update task; aborting mid-fetch/mid-build changes nothing.
@@ -836,16 +888,16 @@ impl App {
             AgentEvent::ToolStarted { name, args_preview } => {
                 self.coding_transcript.push(TranscriptEntry {
                     kind: EntryKind::Tool,
-                    text: format!("{name}  {args_preview}"),
+                    text: format!("⋯ {name}  {args_preview}"),
                     live: true,
                 });
                 self.coding_follow = true;
             }
             AgentEvent::ToolFinished { name, ok, summary } => {
                 let text = if ok {
-                    format!("{name}  {summary}")
+                    format!("✓ {name}  {summary}")
                 } else {
-                    format!("{name}  failed — {summary}")
+                    format!("✗ {name}  {summary}")
                 };
                 match self
                     .coding_transcript
@@ -937,6 +989,34 @@ impl App {
     // ------------------------------------------------------------------
     // Background task starters (all non-blocking)
     // ------------------------------------------------------------------
+
+    /// Poll GPU/VRAM in the background and stream it back to the UI. `discover()`
+    /// shells out to `nvidia-smi` (blocking, ~100-300ms), so it runs on the
+    /// blocking pool — never on the render thread — and the result arrives as a
+    /// `BgMsg`, mirroring how every other slow probe feeds the loop. Without this
+    /// the status-bar VRAM meter is frozen at whatever was free at startup.
+    pub fn start_gpu_refresh(&mut self) {
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            // Skip the immediate first tick: `new()` already seeded `app.gpu`.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match tokio::task::spawn_blocking(discover).await {
+                    Ok(Ok(inv)) => {
+                        // The receiver is dropped once the app exits; stop polling.
+                        if tx.send(BgMsg::GpuRefreshed(inv)).is_err() {
+                            break;
+                        }
+                    }
+                    // A failed probe (no nvidia-smi, driver hiccup) just means we
+                    // keep the last good inventory and try again next tick.
+                    _ => continue,
+                }
+            }
+        });
+    }
 
     pub fn start_detect(&mut self) {
         self.detecting = true;
@@ -1102,8 +1182,187 @@ impl App {
             backend: self.deploy_backend,
             port: self.deploy_port,
             context_length: self.deploy_ctx,
+            tuning: DeployTuning {
+                gpu_memory_fraction: self.deploy_gpu_frac,
+                tensor_parallel: self.deploy_tensor_parallel,
+                gpu_layers: self.deploy_gpu_layers,
+            },
             continue_despite_oversize: continue_oversize,
         })
+    }
+
+    /// Deploy parameters shown (and editable) for the current backend, in
+    /// display order. Only the fields a backend actually honors are listed, so
+    /// the panel never offers a knob that would be silently ignored. Ollama is a
+    /// shared server we don't launch, so it exposes only the model-level knobs it
+    /// supports via a derived model (context, GPU layers) — not host/port or the
+    /// launch-only vLLM/SGLang flags.
+    pub fn deploy_fields(&self) -> Vec<DeployField> {
+        match self.deploy_backend {
+            BackendKind::Vllm | BackendKind::Sglang => vec![
+                DeployField::Context,
+                DeployField::Port,
+                DeployField::GpuMemFraction,
+                DeployField::TensorParallel,
+            ],
+            BackendKind::LlamaCpp => {
+                vec![DeployField::Context, DeployField::Port, DeployField::GpuLayers]
+            }
+            BackendKind::Ollama => vec![DeployField::Context, DeployField::GpuLayers],
+        }
+    }
+
+    /// Which deploy field is being edited inline (for the renderer).
+    pub fn deploy_editing_field(&self) -> Option<DeployField> {
+        self.deploy_editing
+    }
+
+    /// The in-progress deploy-field edit buffer (for the renderer).
+    pub fn deploy_field_edit_buf(&self) -> &str {
+        &self.deploy_field_edit
+    }
+
+    /// Current value of a deploy field as display text (`auto` when unset).
+    pub fn deploy_field_display(&self, field: DeployField) -> String {
+        match field {
+            DeployField::Context => self.deploy_ctx.to_string(),
+            DeployField::Port => self
+                .deploy_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "auto".into()),
+            DeployField::GpuMemFraction => self
+                .deploy_gpu_frac
+                .map(|f| format!("{f:.2}"))
+                .unwrap_or_else(|| "auto".into()),
+            DeployField::TensorParallel => self
+                .deploy_tensor_parallel
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "auto".into()),
+            DeployField::GpuLayers => self
+                .deploy_gpu_layers
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "auto".into()),
+        }
+    }
+
+    /// Enter inline edit for a deploy parameter, seeding the buffer with the
+    /// current value (blank when unset so the user types fresh).
+    fn begin_deploy_edit(&mut self, field: DeployField) {
+        self.deploy_field_edit = match field {
+            DeployField::Context => self.deploy_ctx.to_string(),
+            DeployField::Port => self.deploy_port.map(|p| p.to_string()).unwrap_or_default(),
+            DeployField::GpuMemFraction => {
+                self.deploy_gpu_frac.map(|f| format!("{f}")).unwrap_or_default()
+            }
+            DeployField::TensorParallel => self
+                .deploy_tensor_parallel
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            DeployField::GpuLayers => {
+                self.deploy_gpu_layers.map(|n| n.to_string()).unwrap_or_default()
+            }
+        };
+        self.deploy_editing = Some(field);
+        self.set_status(
+            format!("Editing {} — ↵ save, Esc cancel (blank = default)", field.label()),
+            false,
+        );
+    }
+
+    /// Key handling while a deploy parameter is being edited inline.
+    fn handle_deploy_field_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.commit_deploy_field(),
+            KeyCode::Esc => {
+                self.deploy_editing = None;
+                self.set_status("Edit cancelled", false);
+            }
+            KeyCode::Backspace => {
+                self.deploy_field_edit.pop();
+            }
+            KeyCode::Char(c) => self.deploy_field_edit.push(c),
+            _ => {}
+        }
+    }
+
+    /// Parse and store the edited deploy parameter. A blank value resets the
+    /// field to its default (`auto`); an unparseable value is rejected with a
+    /// message and leaves the field unchanged.
+    fn commit_deploy_field(&mut self) {
+        let Some(field) = self.deploy_editing.take() else {
+            return;
+        };
+        let raw = self.deploy_field_edit.trim().to_string();
+        let blank = raw.is_empty();
+        let mut ok = true;
+        match field {
+            DeployField::Context => {
+                if blank {
+                    self.deploy_ctx = DEFAULT_DEPLOY_CTX;
+                } else if let Ok(v) = raw.parse::<u32>() {
+                    self.deploy_ctx = v.clamp(512, 1_048_576);
+                } else {
+                    ok = false;
+                }
+            }
+            DeployField::Port => {
+                if blank {
+                    self.deploy_port = None;
+                } else if let Ok(v) = raw.parse::<u16>() {
+                    self.deploy_port = Some(v);
+                } else {
+                    ok = false;
+                }
+            }
+            DeployField::GpuMemFraction => {
+                if blank {
+                    self.deploy_gpu_frac = None;
+                } else if let Ok(v) = raw.parse::<f32>() {
+                    if (0.0..=1.0).contains(&v) {
+                        self.deploy_gpu_frac = Some(v);
+                    } else {
+                        ok = false;
+                    }
+                } else {
+                    ok = false;
+                }
+            }
+            DeployField::TensorParallel => {
+                if blank {
+                    self.deploy_tensor_parallel = None;
+                } else if let Ok(v) = raw.parse::<u32>() {
+                    self.deploy_tensor_parallel = (v >= 1).then_some(v);
+                } else {
+                    ok = false;
+                }
+            }
+            DeployField::GpuLayers => {
+                if blank {
+                    self.deploy_gpu_layers = None;
+                } else if let Ok(v) = raw.parse::<i32>() {
+                    self.deploy_gpu_layers = Some(v);
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            self.refresh_fit();
+            self.set_status(format!("{} set", field.label()), false);
+        } else {
+            self.set_status(format!("Invalid {} value", field.label()), true);
+        }
+    }
+
+    /// Cancel an in-progress deploy. Triggered by the on-screen Cancel button
+    /// (deploy is deliberately *not* cancellable with Esc). Aborting the task
+    /// drops its `Command`, and `kill_on_drop` stops any child already spawned.
+    fn cancel_deploy(&mut self) {
+        if let Some(b) = self.deploy_busy.take() {
+            b.handle.abort();
+            self.deploy_progress = 0;
+            self.set_status("Deploy cancelled", false);
+        }
     }
 
     fn start_deploy(&mut self, continue_oversize: bool) {
@@ -1115,7 +1374,7 @@ impl App {
 
     fn spawn_deploy(&mut self, req: DeployRequest) {
         if self.deploy_busy.is_some() {
-            self.set_status("A deploy is already running (Esc to cancel it)", false);
+            self.set_status("A deploy is already running (click Cancel to stop it)", false);
             return;
         }
         let svc = DeployService::new(
@@ -2093,6 +2352,14 @@ impl App {
                 }
                 BgMsg::CodingEvent(ev) => self.apply_agent_event(ev),
                 BgMsg::CodingDone(result) => {
+                    // Turn stats for the status line: duration from the busy
+                    // marker (grabbed before finish_busy clears it) + tool
+                    // calls made since the user's message.
+                    let took = self
+                        .busy
+                        .as_ref()
+                        .filter(|b| b.kind == BusyKind::Coding)
+                        .map(|b| b.started.elapsed());
                     self.finish_busy();
                     match result {
                         Ok(reply) => {
@@ -2111,7 +2378,24 @@ impl App {
                                     .push(TranscriptEntry::new(EntryKind::Agent, reply));
                             }
                             self.coding_follow = true;
-                            self.set_status("Agent replied", false);
+                            let tools = self
+                                .coding_transcript
+                                .iter()
+                                .rev()
+                                .take_while(|e| e.kind != EntryKind::You)
+                                .filter(|e| e.kind == EntryKind::Tool)
+                                .count();
+                            let mut status = String::from("Agent replied");
+                            if let Some(d) = took {
+                                status.push_str(&format!(" · {:.1}s", d.as_secs_f64()));
+                            }
+                            if tools > 0 {
+                                status.push_str(&format!(
+                                    " · {tools} tool{}",
+                                    if tools == 1 { "" } else { "s" }
+                                ));
+                            }
+                            self.set_status(status, false);
                         }
                         Err(e) => {
                             self.finalize_transcript_live();
@@ -2130,9 +2414,13 @@ impl App {
                 } => {
                     self.respond_tool_confirm(false); // supersede any stale one
                     self.pending_tool_confirm = Some(respond);
+                    let mode = self.config.agent.approval();
                     self.modal = Some(ModalState::confirm(
-                        "Agent wants to run a risky command",
-                        format!("{description}\n\nConfirm to run it in the workspace, Cancel to refuse."),
+                        "Agent asks for approval",
+                        format!(
+                            "{description}\n\nConfirm to run it in the workspace, Cancel to refuse.\n(approvals: {} — Shift+Tab or /mode to change)",
+                            mode.label()
+                        ),
                         ConfirmAction::ToolApproval,
                     ));
                 }
@@ -2180,6 +2468,14 @@ impl App {
                 }
                 BgMsg::ApiHealth(healthy) => {
                     self.api_healthy = Some(healthy);
+                }
+                BgMsg::GpuRefreshed(inv) => {
+                    // Ignore an empty inventory from a transient probe failure so
+                    // a live GPU doesn't blink to "no GPU" mid-session; a real
+                    // GPU-less machine was already empty from startup discovery.
+                    if !inv.devices.is_empty() {
+                        self.gpu = inv;
+                    }
                 }
                 BgMsg::RuntimeStopped { result } => match result {
                     Ok(()) => self.set_status("Runtime stopped", false),
@@ -2422,7 +2718,8 @@ impl App {
             ("/bench", "", "run the sample benchmark suite"),
             ("/setup", "", "first-run setup & doctor"),
             ("/settings", "", "preferences & config file"),
-            ("/theme", "", "cycle dark / neon / pink"),
+            ("/mode", "[always|auto|edits|ask]", "how much the agent asks before running tools"),
+            ("/theme", "", "cycle dark / neon / pink / sage"),
             ("/select", "", "release mouse to select & copy text (F2)"),
             ("/chat", "", "back to the conversation"),
             ("/new", "", "start a new conversation"),
@@ -2436,7 +2733,11 @@ impl App {
         ]
     }
 
-    /// Menu items filtered by whatever follows the leading slash in the omnibar.
+    /// Menu items filtered by whatever follows the leading slash in the
+    /// omnibar, best match first: an exact command name beats a prefix match
+    /// beats a substring beats a description hit. Enter runs the first item,
+    /// so typing a full command name always runs that command (e.g. `/mode`
+    /// must not run `/models`).
     pub fn palette_items(&self) -> Vec<String> {
         let q = self
             .coding_input
@@ -2445,21 +2746,32 @@ impl App {
             .next()
             .unwrap_or("")
             .to_lowercase();
-        Self::slash_catalog()
+        let mut scored: Vec<(u8, String)> = Self::slash_catalog()
             .iter()
-            .filter(|(name, _, desc)| {
-                q.is_empty()
-                    || name[1..].to_lowercase().contains(&q)
-                    || desc.to_lowercase().contains(&q)
-            })
-            .map(|(name, args, desc)| {
-                if args.is_empty() {
+            .filter_map(|(name, args, desc)| {
+                let n = name[1..].to_lowercase();
+                let rank = if q.is_empty() || n == q {
+                    0
+                } else if n.starts_with(&q) {
+                    1
+                } else if n.contains(&q) {
+                    2
+                } else if desc.to_lowercase().contains(&q) {
+                    3
+                } else {
+                    return None;
+                };
+                let display = if args.is_empty() {
                     format!("{name}  —  {desc}")
                 } else {
                     format!("{name} {args}  —  {desc}")
-                }
+                };
+                Some((rank, display))
             })
-            .collect()
+            .collect();
+        // Stable sort: equal ranks keep catalog order.
+        scored.sort_by_key(|(rank, _)| *rank);
+        scored.into_iter().map(|(_, display)| display).collect()
     }
 
     /// Is the omnibar currently a slash-command entry?
@@ -2553,6 +2865,16 @@ impl App {
                 self.start_doctor();
             }
             "settings" => self.set_mode(Mode::Settings),
+            "mode" | "approvals" | "approve" => match args.first() {
+                None => self.cycle_approval_mode(),
+                Some(name) => match ApprovalMode::parse(&rest) {
+                    Some(m) => self.set_approval_mode(m),
+                    None => self.set_status(
+                        format!("Unknown approval mode: {name} — use always, auto, edits or ask"),
+                        true,
+                    ),
+                },
+            },
             "theme" => self.toggle_theme(),
             "select" => self.toggle_select_mode(),
             "chat" => self.set_mode(Mode::Chat),
@@ -2614,9 +2936,30 @@ impl App {
         self.set_status(format!("Theme: {}", mode.label()), false);
     }
 
-    /// `/theme` cycles through the shipped themes (dark → neon → pink).
+    /// `/theme` cycles through the shipped themes (dark → neon → pink → sage).
     fn toggle_theme(&mut self) {
         self.set_theme(self.config.ui.theme.next());
+    }
+
+    /// Set the agent approval mode (status-bar click, Shift+Tab, `/mode`,
+    /// Settings) and persist it. Also neutralizes the legacy
+    /// `confirm_destructive_tools` off-switch so an explicit choice always
+    /// means what it says (see `AgentConfig::approval`).
+    pub(crate) fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.config.agent.approval_mode = mode;
+        self.config.agent.confirm_destructive_tools = true;
+        self.set_status(
+            format!("Approvals: {} — {}", mode.label(), mode.describe()),
+            false,
+        );
+        if let Err(e) = self.config.save(&self.paths) {
+            self.raise_error(e);
+        }
+    }
+
+    /// Shift+Tab / `/mode` with no argument: next mode in the cycle.
+    pub(crate) fn cycle_approval_mode(&mut self) {
+        self.set_approval_mode(self.config.agent.approval().next());
     }
 
     /// Toggle "select mode": release the mouse so the terminal's native
@@ -2675,11 +3018,13 @@ impl App {
             action: Some(SettingAction::ToggleMouse),
         });
         r.push(toggle("token streaming", self.config.agent.stream, SettingAction::ToggleStream));
-        r.push(toggle(
-            "confirm shell",
-            self.config.agent.confirm_destructive_tools,
-            SettingAction::ToggleConfirmShell,
-        ));
+        let approval = self.config.agent.approval();
+        r.push(SettingsRow {
+            label: "approvals".into(),
+            value: format!("{} — {}", approval.label(), approval.describe()),
+            kind: SettingsRowKind::Action("cycle"),
+            action: Some(SettingAction::ApprovalCycle),
+        });
         r.push(toggle(
             "cloud fallback",
             self.config.agent.allow_cloud_fallback,
@@ -2859,9 +3204,9 @@ impl App {
             SettingAction::ToggleStream => {
                 self.config.agent.stream = !self.config.agent.stream;
             }
-            SettingAction::ToggleConfirmShell => {
-                self.config.agent.confirm_destructive_tools =
-                    !self.config.agent.confirm_destructive_tools;
+            SettingAction::ApprovalCycle => {
+                self.cycle_approval_mode();
+                return; // cycle_approval_mode already saved
             }
             SettingAction::ToggleCloudFallback => {
                 self.config.agent.allow_cloud_fallback = !self.config.agent.allow_cloud_fallback;
@@ -3049,6 +3394,7 @@ The omnibar at the bottom is always active — just type.\n\
   Enter                    run command / search / submit / mode action\n\
   Esc                      cancel a running task, else return to chat\n\
   ↑/↓                      history in chat, selection in list modes\n\
+  Shift+Tab                cycle agent approvals (always/auto/edits/ask)\n\
   Ctrl+S save    Ctrl+K command entry    Ctrl+C quit\n\
 \n\
 Commands (type / to see them all):\n\
@@ -3056,6 +3402,7 @@ Commands (type / to see them all):\n\
   /runtimes     active runtimes & system overview\n\
   /remote       connect a GPU server over SSH (one-click)\n\
   /backends     install inference backends\n\
+  /mode [m]     how much the agent asks before running tools\n\
   /bench /setup /settings /theme /chat /new /deploy /update /logs /quit\n\
 \n\
 Everything renders inline in the working area — no popups. Rows, fields\n\
@@ -3078,6 +3425,22 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 ConfirmAction::Quit,
             ));
         }
+    }
+
+    /// Stop everything we spawned before the process exits. Runs on every quit
+    /// path — the quit dialog, `q`, and Ctrl+C — so model servers don't linger
+    /// as orphaned processes holding VRAM (the exact bug users hit on Ctrl+C).
+    /// A deploy still in flight owns its child directly, so aborting the task
+    /// drops the `Command` and `kill_on_drop` reaps it; already-registered
+    /// runtimes are killed through the backend `stop` path. Ollama is a shared
+    /// service (its stop is a deliberate no-op) and remote SSH runtimes live on
+    /// their own host, so both are correctly left untouched here.
+    pub async fn shutdown(&mut self) {
+        if let Some(b) = self.deploy_busy.take() {
+            b.handle.abort();
+        }
+        self.registry.stop_all().await;
+        self.runtimes.clear();
     }
 
     // ------------------------------------------------------------------
@@ -3167,10 +3530,17 @@ to select, click deploy. Remote: click a field to edit, then connect."
             return;
         }
 
+        // An in-place deploy-parameter edit captures input.
+        if self.mode == Mode::Models && self.deploy_editing.is_some() {
+            self.handle_deploy_field_key(key);
+            return;
+        }
+
         // Esc: cancel a running task; else leave a non-chat mode / clear input.
+        // A running deploy is deliberately NOT in this set — it is cancelled only
+        // via its Cancel button, so here Esc just leaves Models / clears input.
         if key.code == KeyCode::Esc {
             if self.fg_busy()
-                || self.deploy_busy.is_some()
                 || self.install_busy.is_some()
                 || self.repair_busy.is_some()
                 || self.update_busy.is_some()
@@ -3356,6 +3726,9 @@ to select, click deploy. Remote: click a field to edit, then connect."
         self.mode = mode;
         self.remote_editing = false;
         self.settings_editing = None;
+        // Leaving Models must also close any open deploy-parameter editor, so it
+        // can't reappear mid-edit with a stale buffer on return.
+        self.deploy_editing = None;
     }
 
     /// Selection / scroll keys for the active mode (arrows, page keys, Tab).
@@ -3364,6 +3737,8 @@ to select, click deploy. Remote: click a field to edit, then connect."
             Mode::Chat => match code {
                 KeyCode::PageDown => self.scroll_transcript(self.coding_view_height.max(1) as i64),
                 KeyCode::PageUp => self.scroll_transcript(-(self.coding_view_height.max(1) as i64)),
+                // Shift+Tab cycles the agent approval mode (like /mode).
+                KeyCode::BackTab => self.cycle_approval_mode(),
                 _ => {}
             },
             Mode::Models => match code {
@@ -3623,6 +3998,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
         match region.target {
             // Status bar.
             ClickTarget::Theme(m) => self.set_theme(m),
+            ClickTarget::ApprovalCycle => self.cycle_approval_mode(),
             ClickTarget::UpdateBadge => {
                 if self.update_available.is_some() {
                     self.open_update_modal();
@@ -3650,6 +4026,8 @@ to select, click deploy. Remote: click a field to edit, then connect."
             }
             ClickTarget::BackendCycle => self.cycle_deploy_backend(),
             ClickTarget::DeployButton => self.start_deploy(false),
+            ClickTarget::DeployCancel => self.cancel_deploy(),
+            ClickTarget::DeployField(field) => self.begin_deploy_edit(field),
             // Runtimes.
             ClickTarget::RuntimeList => {
                 let n = self.all_runtimes().len();
@@ -3735,6 +4113,9 @@ to select, click deploy. Remote: click a field to edit, then connect."
     }
 
     fn cycle_deploy_backend(&mut self) {
+        // Switching backends changes which params are shown; drop any in-progress
+        // edit so the editor can't get stuck on a now-hidden field.
+        self.deploy_editing = None;
         self.deploy_backend = match self.deploy_backend {
             BackendKind::Ollama => BackendKind::LlamaCpp,
             BackendKind::LlamaCpp => BackendKind::Vllm,
@@ -3863,11 +4244,17 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
 
     let mut app = App::new(paths, config);
     app.start_detect();
+    app.start_gpu_refresh();
     if app.config.updates.check_on_startup {
         app.start_update_check(false);
     }
     app.autoconnect_remotes();
     let result = run_loop(&mut terminal, &mut app).await;
+
+    // Kill managed model servers on EVERY exit path — including an early return
+    // from a terminal I/O error inside run_loop — while the tokio runtime is
+    // still alive to reap them. Idempotent, so the normal-quit call is harmless.
+    app.shutdown().await;
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -3918,7 +4305,8 @@ async fn run_loop(
             }
         }
     }
-    // Persist pane ratios etc.
+    // Persist pane ratios etc. Managed model servers are killed by the caller
+    // (`run_tui`) so cleanup also runs if this loop returns early on an error.
     let _ = app.config.save(&app.paths);
     Ok(())
 }
@@ -3999,7 +4387,89 @@ mod tests {
         app.toggle_theme();
         assert_eq!(app.config.ui.theme, ThemeMode::NeonPink);
         app.toggle_theme();
+        assert_eq!(app.config.ui.theme, ThemeMode::Sage);
+        app.toggle_theme();
         assert_eq!(app.config.ui.theme, ThemeMode::Dark);
+    }
+
+    #[test]
+    fn approval_mode_cycles_via_slash_backtab_and_statusbar_click() {
+        let mut app = test_app();
+        assert_eq!(app.config.agent.approval(), ApprovalMode::Auto);
+
+        // /mode with an argument sets the mode directly.
+        typ(&mut app, "/mode ask");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.config.agent.approval(), ApprovalMode::AskPermission);
+
+        // /mode with no argument cycles (ask → wraps to always).
+        typ(&mut app, "/mode");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.config.agent.approval(), ApprovalMode::AlwaysApprove);
+
+        // Shift+Tab cycles from chat.
+        assert_eq!(app.mode, Mode::Chat);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.config.agent.approval(), ApprovalMode::Auto);
+
+        // An explicit choice must persist — and survive a config reload.
+        let loaded = Config::load(&app.paths).unwrap();
+        assert_eq!(loaded.agent.approval(), ApprovalMode::Auto);
+
+        // The status bar registers a clickable `approvals` cluster; clicking
+        // it cycles too.
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let region = app
+            .click_regions
+            .iter()
+            .find(|r| r.target == ClickTarget::ApprovalCycle)
+            .copied()
+            .expect("status bar exposes the approvals cluster");
+        app.handle_left_click(region.rect.x, region.rect.y);
+        assert_eq!(app.config.agent.approval(), ApprovalMode::ApproveEdits);
+    }
+
+    #[test]
+    fn all_switcher_themes_render_and_sage_paints_its_background() {
+        use ratatui::style::Color;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app();
+        for m in ThemeMode::SWITCHER {
+            app.set_theme(m);
+            let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            if m == ThemeMode::Sage {
+                let buf = terminal.backend().buffer().clone();
+                let (r, g, b) = app.theme.token_rgb(localcode_core::theme::ThemeToken::Bg);
+                assert_eq!(buf[(0, 0)].bg, Color::Rgb(r, g, b), "sage bg fills the frame");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_command_name_outranks_prefix_collisions() {
+        let mut app = test_app();
+        // "/mode" collides with "/models" on substring; the exact name must
+        // rank first so Enter runs it.
+        typ(&mut app, "/mode");
+        let items = app.palette_items();
+        assert!(items[0].starts_with("/mode "), "exact match first: {items:?}");
+        // A pure prefix query keeps catalog order among equals.
+        app.clear_input();
+        typ(&mut app, "/mo");
+        let items = app.palette_items();
+        assert!(items[0].starts_with("/models"), "{items:?}");
+    }
+
+    #[test]
+    fn unknown_approval_mode_is_reported_not_applied() {
+        let mut app = test_app();
+        typ(&mut app, "/mode bogus");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.config.agent.approval(), ApprovalMode::Auto);
+        assert!(app.status_is_error);
     }
 
     #[test]
@@ -4380,5 +4850,83 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| matches!(r.kind, SettingsRowKind::Toggle(_)) && r.label == "fs.read"));
+    }
+
+    #[test]
+    fn deploy_fields_are_backend_aware() {
+        let mut app = test_app();
+        // Launched servers expose their launch flags; Ollama (shared server we
+        // don't spawn) exposes only its model-level knobs — no host/port.
+        app.deploy_backend = BackendKind::Vllm;
+        assert_eq!(
+            app.deploy_fields(),
+            vec![
+                DeployField::Context,
+                DeployField::Port,
+                DeployField::GpuMemFraction,
+                DeployField::TensorParallel
+            ]
+        );
+        app.deploy_backend = BackendKind::LlamaCpp;
+        assert_eq!(
+            app.deploy_fields(),
+            vec![DeployField::Context, DeployField::Port, DeployField::GpuLayers]
+        );
+        app.deploy_backend = BackendKind::Ollama;
+        assert_eq!(app.deploy_fields(), vec![DeployField::Context, DeployField::GpuLayers]);
+        assert!(!app.deploy_fields().contains(&DeployField::Port));
+    }
+
+    #[test]
+    fn editing_context_field_captures_keys_and_commits() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.begin_deploy_edit(DeployField::Context);
+        assert!(app.deploy_editing.is_some());
+        // While editing in Models mode, keys route to the field buffer (not the
+        // always-focused omnibar). Clear the seeded old value, then type a new one.
+        app.deploy_field_edit.clear();
+        for c in "16384".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.deploy_field_edit, "16384");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.deploy_editing.is_none());
+        assert_eq!(app.deploy_ctx, 16384);
+        // Typing into the field must not leak into the omnibar / model search.
+        assert!(app.coding_input.is_empty());
+    }
+
+    #[test]
+    fn blank_commit_resets_to_default_and_bad_value_is_rejected() {
+        let mut app = test_app();
+        app.deploy_ctx = 4096;
+        app.begin_deploy_edit(DeployField::Context);
+        app.deploy_field_edit.clear();
+        app.commit_deploy_field();
+        assert_eq!(app.deploy_ctx, DEFAULT_DEPLOY_CTX);
+
+        // Out-of-range GPU fraction is rejected and leaves the field unset.
+        app.begin_deploy_edit(DeployField::GpuMemFraction);
+        app.deploy_field_edit = "2.0".to_string();
+        app.commit_deploy_field();
+        assert!(app.deploy_gpu_frac.is_none());
+        assert!(app.status_is_error);
+
+        // A valid fraction is stored.
+        app.begin_deploy_edit(DeployField::GpuMemFraction);
+        app.deploy_field_edit = "0.85".to_string();
+        app.commit_deploy_field();
+        assert_eq!(app.deploy_gpu_frac, Some(0.85));
+    }
+
+    #[test]
+    fn esc_in_models_does_not_cancel_deploy_but_leaves_mode() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        // No deploy running and not editing: Esc leaves Models for Chat rather
+        // than being swallowed (deploy is cancelled only via its button).
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Chat);
     }
 }

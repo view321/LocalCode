@@ -96,4 +96,21 @@ impl BackendRegistry {
         self.remove_runtime(id).await;
         Ok(())
     }
+
+    /// Stop every managed runtime and deregister it. Called on app shutdown so
+    /// vLLM/llama.cpp/SGLang servers (and the VRAM they hold) don't outlive the
+    /// TUI — the quit dialog promises exactly this. A single backend failing to
+    /// stop must not abort the others, so per-runtime errors are swallowed.
+    pub async fn stop_all(&self) {
+        let ids: Vec<String> = self
+            .runtimes
+            .read()
+            .await
+            .iter()
+            .map(|r| r.id.to_string())
+            .collect();
+        for id in ids {
+            let _ = self.stop_runtime(&id).await;
+        }
+    }
 }

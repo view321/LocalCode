@@ -23,6 +23,9 @@ pub struct DeployRequest {
     pub backend: BackendKind,
     pub port: Option<u16>,
     pub context_length: u32,
+    /// Per-backend launch tuning (VRAM fraction, tensor-parallel, GPU layers).
+    #[serde(default)]
+    pub tuning: crate::DeployTuning,
     /// User acknowledged oversize warning.
     pub continue_despite_oversize: bool,
 }
@@ -180,6 +183,7 @@ impl DeployService {
             port: req.port,
             context_length: req.context_length,
             force_oversize: req.continue_despite_oversize,
+            tuning: req.tuning,
         };
 
         let endpoint = backend.deploy(spec, &self.events).await?;
@@ -525,6 +529,7 @@ mod tests {
             backend,
             port: None,
             context_length: 8192,
+            tuning: crate::DeployTuning::default(),
             continue_despite_oversize: false,
         }
     }

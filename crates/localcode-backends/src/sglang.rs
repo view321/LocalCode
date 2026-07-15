@@ -136,17 +136,33 @@ impl InferenceBackend for SglangBackend {
             message: "Starting SGLang".into(),
         });
 
+        // Built as a Vec so context / tuning flags can be appended. SGLang
+        // previously ignored context entirely (KV cache sized to the model's
+        // native max); --context-length bounds it like the other backends.
+        let mut args: Vec<String> = vec![
+            "-m".into(),
+            "sglang.launch_server".into(),
+            "--model-path".into(),
+            model.clone(),
+            "--host".into(),
+            self.cfg.host.clone(),
+            "--port".into(),
+            port.to_string(),
+        ];
+        if spec.context_length > 0 {
+            args.push("--context-length".into());
+            args.push(spec.context_length.to_string());
+        }
+        if let Some(frac) = spec.tuning.gpu_memory_fraction {
+            args.push("--mem-fraction-static".into());
+            args.push(format!("{frac}"));
+        }
+        if let Some(tp) = spec.tuning.tensor_parallel {
+            args.push("--tp-size".into());
+            args.push(tp.to_string());
+        }
         let mut child = tokio::process::Command::new(py)
-            .args([
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                &model,
-                "--host",
-                &self.cfg.host,
-                "--port",
-                &port.to_string(),
-            ])
+            .args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
