@@ -1,6 +1,6 @@
 use crate::{
-    BackendKind, DetectReport, InferenceBackend, LlamaCppBackend, OllamaBackend, SglangBackend,
-    VllmBackend,
+    BackendKind, DetectReport, InferenceBackend, LlamaCppBackend, ModelMonitors, OllamaBackend,
+    SglangBackend, VllmBackend,
 };
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -13,31 +13,45 @@ use tokio::sync::RwLock;
 pub struct BackendRegistry {
     backends: HashMap<BackendKind, Arc<dyn InferenceBackend>>,
     runtimes: RwLock<Vec<ActiveRuntime>>,
+    /// Live per-model process monitors backing the `/dash` view. One store,
+    /// shared (cloned) into every backend so each can register/refresh its own
+    /// spawned processes.
+    monitors: ModelMonitors,
 }
 
 impl BackendRegistry {
     pub fn from_config(cfg: &Config) -> Self {
+        let monitors = ModelMonitors::new();
         let mut backends: HashMap<BackendKind, Arc<dyn InferenceBackend>> = HashMap::new();
         backends.insert(
             BackendKind::Ollama,
-            Arc::new(OllamaBackend::new(cfg.backends.ollama.clone())),
+            Arc::new(OllamaBackend::new(cfg.backends.ollama.clone()).with_monitors(monitors.clone())),
         );
         backends.insert(
             BackendKind::LlamaCpp,
-            Arc::new(LlamaCppBackend::new(cfg.backends.llamacpp.clone())),
+            Arc::new(
+                LlamaCppBackend::new(cfg.backends.llamacpp.clone()).with_monitors(monitors.clone()),
+            ),
         );
         backends.insert(
             BackendKind::Vllm,
-            Arc::new(VllmBackend::new(cfg.backends.vllm.clone())),
+            Arc::new(VllmBackend::new(cfg.backends.vllm.clone()).with_monitors(monitors.clone())),
         );
         backends.insert(
             BackendKind::Sglang,
-            Arc::new(SglangBackend::new(cfg.backends.sglang.clone())),
+            Arc::new(SglangBackend::new(cfg.backends.sglang.clone()).with_monitors(monitors.clone())),
         );
         Self {
             backends,
             runtimes: RwLock::new(Vec::new()),
+            monitors,
         }
+    }
+
+    /// The shared model-monitor store (read by the `/dash` view, written to by
+    /// the deploy pipeline to attach VRAM estimates).
+    pub fn monitors(&self) -> ModelMonitors {
+        self.monitors.clone()
     }
 
     pub fn get(&self, kind: BackendKind) -> Result<Arc<dyn InferenceBackend>, LocalCodeError> {
@@ -75,6 +89,8 @@ impl BackendRegistry {
 
     pub async fn remove_runtime(&self, id: &str) {
         self.runtimes.write().await.retain(|r| r.id.to_string() != id);
+        // The dashboard card goes away with the runtime.
+        self.monitors.remove(id);
     }
 
     /// Stop a runtime's backing process (when we own one) and deregister it.

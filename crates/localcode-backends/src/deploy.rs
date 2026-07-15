@@ -126,7 +126,7 @@ impl DeployService {
             });
         }
 
-        match self.deploy_inner(&req, &job_id, &cid).await {
+        match self.deploy_inner(&req, &job_id, &cid, fit.estimated_vram_bytes).await {
             Ok(job) => Ok(job),
             Err(e) => {
                 self.events.publish(AppEvent::DeployFailed {
@@ -143,6 +143,7 @@ impl DeployService {
         req: &DeployRequest,
         job_id: &str,
         cid: &CorrelationId,
+        est_vram_bytes: u64,
     ) -> Result<DeployJob, LocalCodeError> {
         self.emit_progress(job_id, cid, 5, "Preflight checks");
 
@@ -190,6 +191,11 @@ impl DeployService {
         let endpoint = backend.deploy(spec, &self.events).await?;
 
         self.emit_progress(job_id, cid, 90, "Registering runtime");
+        // Attach the VRAM estimate to the dashboard monitor the backend just
+        // registered (keyed by the same runtime id).
+        self.registry
+            .monitors()
+            .set_vram(&endpoint.runtime.id.to_string(), est_vram_bytes);
         self.registry
             .register_runtime(endpoint.runtime.clone())
             .await;

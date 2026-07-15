@@ -1,6 +1,7 @@
 use crate::{
-    port_in_use, probe_client, spawn_io_capture, BackendKind, DeployTuning, DetectReport, Health,
-    InferenceBackend, ModelDeploySpec, RunningEndpoint,
+    capture_into_monitor, format_command, port_in_use, probe_client, spawn_exit_watch, BackendKind,
+    DeployTuning, DetectReport, Health, InferenceBackend, ModelDeploySpec, ModelMonitors, ProcState,
+    RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::VllmConfig;
@@ -10,13 +11,19 @@ use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
+use uuid::Uuid;
+
+/// A managed child held so both `stop()` and the exit watcher can reach it.
+type ChildHandle = Arc<Mutex<Option<tokio::process::Child>>>;
 
 pub struct VllmBackend {
     cfg: VllmConfig,
     http: reqwest::Client,
     /// Track children so stop() works and processes are reaped (previously
     /// they were mem::forget-ed: unstoppable and zombied on exit).
-    children: Arc<Mutex<Vec<(String, tokio::process::Child)>>>,
+    children: Arc<Mutex<Vec<(String, ChildHandle)>>>,
+    /// Shared dashboard monitors (`/dash`). Detached by default.
+    monitors: ModelMonitors,
 }
 
 impl VllmBackend {
@@ -25,7 +32,14 @@ impl VllmBackend {
             cfg,
             http: probe_client(),
             children: Arc::new(Mutex::new(Vec::new())),
+            monitors: ModelMonitors::new(),
         }
+    }
+
+    /// Attach the shared `/dash` monitor store (called by the registry).
+    pub fn with_monitors(mut self, monitors: ModelMonitors) -> Self {
+        self.monitors = monitors;
+        self
     }
 }
 
@@ -102,6 +116,10 @@ impl InferenceBackend for VllmBackend {
         });
 
         let args = serve_args(&model, &self.cfg.host, port, spec.context_length, &spec.tuning);
+        // Pre-generate the runtime id so its `/dash` monitor captures startup
+        // logs before the (potentially very long) health loop.
+        let runtime_id = Uuid::new_v4();
+        let command = format_command(&self.cfg.bin, &args);
         let mut child = tokio::process::Command::new(&self.cfg.bin)
             .args(&args)
             .kill_on_drop(true)
@@ -116,9 +134,19 @@ impl InferenceBackend for VllmBackend {
                     .with_hint("Check CUDA version compatibility")
                     .retryable(true)
             })?;
-        // Keep the tail of vLLM's own output so a failure below can explain
-        // itself instead of surfacing a bare exit code.
-        let logs = spawn_io_capture("vllm".into(), &mut child, 50);
+        // Capture vLLM's own output into the dashboard monitor so a failure below
+        // can explain itself instead of surfacing a bare exit code, and so the
+        // `/dash` card shows the newest lines live.
+        let monitor = self.monitors.register(
+            runtime_id.to_string(),
+            format!("vllm:{}", spec.model_id),
+            BackendKind::Vllm,
+            Some(spec.model_id.clone()),
+            command,
+            ProcState::Starting,
+        );
+        capture_into_monitor("vllm", &mut child, &monitor);
+        let logs = monitor.logs_handle();
         let tail = |n: usize| -> String {
             logs.lock()
                 .ok()
@@ -140,6 +168,7 @@ impl InferenceBackend for VllmBackend {
         loop {
             if tokio::time::Instant::now() > deadline {
                 let _ = child.kill().await;
+                self.monitors.remove(&runtime_id.to_string());
                 let mut err = LocalCodeError::new(
                     ErrorCode::BackendHealthTimeout,
                     "vLLM did not become healthy in time",
@@ -160,6 +189,7 @@ impl InferenceBackend for VllmBackend {
                 }
             }
             if let Ok(Some(st)) = child.try_wait() {
+                self.monitors.remove(&runtime_id.to_string());
                 let t = tail(12);
                 let mut err = LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
@@ -202,15 +232,21 @@ impl InferenceBackend for VllmBackend {
             BackendKind::Vllm.to_runtime_kind(),
             base_url,
         );
+        runtime.id = runtime_id;
         runtime.model_id = Some(spec.model_id);
         runtime.quantization = spec.quantization;
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
 
+        // Healthy: flip the card to Running and hand the child to a shared handle
+        // so both stop() and the exit watcher can reach it.
+        monitor.set_state(ProcState::Running);
+        let handle: ChildHandle = Arc::new(Mutex::new(Some(child)));
+        spawn_exit_watch(handle.clone(), monitor);
         self.children
             .lock()
             .await
-            .push((runtime.id.to_string(), child));
+            .push((runtime.id.to_string(), handle));
 
         Ok(RunningEndpoint { runtime })
     }
@@ -218,9 +254,15 @@ impl InferenceBackend for VllmBackend {
     async fn stop(&self, runtime_id: &str) -> Result<(), LocalCodeError> {
         let mut kids = self.children.lock().await;
         if let Some(pos) = kids.iter().position(|(id, _)| id == runtime_id) {
-            let (_, mut child) = kids.remove(pos);
-            let _ = child.kill().await;
+            let (_, handle) = kids.remove(pos);
+            // Bind the child out first so the MutexGuard is released before the
+            // block ends (it must not outlive the owned `handle`).
+            let child = handle.lock().await.take();
+            if let Some(mut child) = child {
+                let _ = child.kill().await;
+            }
         }
+        self.monitors.remove(runtime_id);
         Ok(())
     }
 

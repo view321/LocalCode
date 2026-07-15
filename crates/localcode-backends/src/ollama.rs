@@ -1,6 +1,6 @@
 use crate::{
     probe_client, spawn_io_drain, BackendKind, DetectReport, Health, InferenceBackend,
-    ModelDeploySpec, RunningEndpoint,
+    ModelDeploySpec, ModelMonitors, ProcState, RunningEndpoint,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -16,6 +16,8 @@ pub struct OllamaBackend {
     http: reqwest::Client,
     /// Connect-timeout-only client for long-running pulls.
     pull_http: reqwest::Client,
+    /// Shared dashboard monitors (`/dash`). Detached by default.
+    monitors: ModelMonitors,
 }
 
 impl OllamaBackend {
@@ -28,7 +30,14 @@ impl OllamaBackend {
             cfg,
             http: probe_client(),
             pull_http,
+            monitors: ModelMonitors::new(),
         }
+    }
+
+    /// Attach the shared `/dash` monitor store (called by the registry).
+    pub fn with_monitors(mut self, monitors: ModelMonitors) -> Self {
+        self.monitors = monitors;
+        self
     }
 }
 
@@ -158,10 +167,23 @@ impl InferenceBackend for OllamaBackend {
             BackendKind::Ollama.to_runtime_kind(),
             format!("{base}/v1"),
         );
-        runtime.model_id = Some(effective);
+        runtime.model_id = Some(effective.clone());
         runtime.quantization = spec.quantization.clone();
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
+
+        // Register a `/dash` card. Ollama runs in its own shared `ollama serve`
+        // process we don't own, so the card is External (no exit code / captured
+        // logs) and the command is the equivalent CLI invocation.
+        let monitor = self.monitors.register(
+            runtime.id.to_string(),
+            format!("ollama:{model_name}"),
+            BackendKind::Ollama,
+            Some(effective.clone()),
+            format!("ollama run {effective}"),
+            ProcState::External,
+        );
+        monitor.push_log(format!("served by `ollama serve` at {base} (logs via ollama)"));
 
         Ok(RunningEndpoint { runtime })
     }

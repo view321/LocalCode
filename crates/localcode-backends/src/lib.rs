@@ -3,6 +3,7 @@
 mod deploy;
 mod diagnose;
 mod install;
+mod monitor;
 mod ollama;
 mod llamacpp;
 mod smoke;
@@ -12,6 +13,10 @@ mod registry;
 
 pub use deploy::{DeployJob, DeployProgress, DeployRequest, DeployService};
 pub use diagnose::{classify, diagnose, Confidence, Diagnosis, FailureClass, RepairIntent};
+pub use monitor::{
+    capture_into_monitor, format_command, spawn_exit_watch, DashSnapshot, ModelMonitor,
+    ModelMonitors, ProcState, DASH_LOG_CAP,
+};
 pub use install::{
     can_elevate_noninteractively, ensure_llamacpp_installed, llamacpp_managed_dir,
     resolve_install_plan, resolve_llamacpp_bin, resolve_prism_llamacpp_bin, resolve_repair,
@@ -193,45 +198,9 @@ pub(crate) fn spawn_io_drain(tag: String, child: &mut tokio::process::Child) {
     }
 }
 
-/// Like [`spawn_io_drain`] but also retains the last `cap` combined output lines
-/// in a ring buffer. A failing server — vLLM especially — prints *why* it died
-/// (unsupported architecture, CUDA OOM, a too-large `--max-model-len`) to
-/// stderr; the plain drain buries that at debug level, leaving a deploy with
-/// only a bare exit status. Callers read this tail into the surfaced error.
-pub(crate) fn spawn_io_capture(
-    tag: String,
-    child: &mut tokio::process::Child,
-    cap: usize,
-) -> std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> {
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    capture_lines(child.stdout.take(), tag.clone(), buf.clone(), cap);
-    capture_lines(child.stderr.take(), tag, buf.clone(), cap);
-    buf
-}
-
-fn capture_lines<R>(
-    reader: Option<R>,
-    tag: String,
-    buf: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-    cap: usize,
-) where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let Some(reader) = reader else { return };
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "backend_io", backend = %tag, "{line}");
-            if let Ok(mut b) = buf.lock() {
-                if b.len() >= cap {
-                    b.pop_front();
-                }
-                b.push_back(line);
-            }
-        }
-    });
-}
+// The tail-retaining capture used by managed servers now lives in
+// `monitor::capture_into_monitor`, which drains into a model's dashboard log
+// ring instead of a throwaway buffer.
 
 /// Check whether a local TCP port is already bound.
 pub(crate) fn port_in_use(port: u16) -> bool {

@@ -33,6 +33,13 @@ pub struct LocalAssistantRuntime {
     base_url: String,
     port: u16,
     model_id: String,
+    /// The exact `llama-server …` command the server was launched with (for the
+    /// `/dash` card's click-to-copy). A short note for a reused running server.
+    command: String,
+    /// Captured stdout/stderr tail, shared with the drain task, so the dashboard
+    /// can show the newest server output. A std `Mutex` (not tokio's) so the
+    /// render thread can read it without an `.await`.
+    logs: Arc<std::sync::Mutex<String>>,
 }
 
 impl LocalAssistantRuntime {
@@ -42,6 +49,23 @@ impl LocalAssistantRuntime {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The launch command (click-to-copy on the dashboard).
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The newest `max_lines` of captured server output (newest last).
+    pub fn recent_logs(&self, max_lines: usize) -> Vec<String> {
+        self.logs
+            .lock()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                let start = lines.len().saturating_sub(max_lines);
+                lines[start..].iter().map(|l| l.to_string()).collect()
+            })
+            .unwrap_or_default()
     }
 
     /// OpenAI-compatible ActiveRuntime for the coding/assistant agent loop.
@@ -140,6 +164,12 @@ pub async fn ensure_running(
         base_url: base_url.clone(),
         port,
         model_id: ASSISTANT_MODEL_ID.into(),
+        command: format!(
+            "llama-server -m {} --host {host} --port {port} -ngl {} (reused running server)",
+            gguf.display(),
+            cfg.assistant.local_gpu_layers
+        ),
+        logs: Arc::new(std::sync::Mutex::new(String::new())),
     };
     if probe.is_healthy().await {
         info!(port, "reusing healthy local assistant server");
@@ -243,6 +273,8 @@ pub async fn ensure_running(
         base_url: base_url.clone(),
         port,
         model_id: ASSISTANT_MODEL_ID.into(),
+        command: cmd_display.clone(),
+        logs: io_tail.clone(),
     };
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(600);
@@ -369,9 +401,9 @@ fn prepend_lib_path(cmd: &mut tokio::process::Command, dir: &Path) {
 }
 
 /// Drain stdout/stderr to tracing + an in-memory buffer (and keep growing after exit).
-fn drain_child_io_capture(tag: &str, child: &mut Child) -> Arc<Mutex<String>> {
+fn drain_child_io_capture(tag: &str, child: &mut Child) -> Arc<std::sync::Mutex<String>> {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let acc = Arc::new(Mutex::new(String::new()));
+    let acc = Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(stdout) = child.stdout.take() {
         let tag = tag.to_string();
         let acc = acc.clone();
@@ -379,11 +411,12 @@ fn drain_child_io_capture(tag: &str, child: &mut Child) -> Arc<Mutex<String>> {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::info!(target: "assistant_io", backend = %tag, stream = "stdout", "{line}");
-                let mut g = acc.lock().await;
-                if g.len() < 48_000 {
-                    g.push_str("[out] ");
-                    g.push_str(&line);
-                    g.push('\n');
+                if let Ok(mut g) = acc.lock() {
+                    if g.len() < 48_000 {
+                        g.push_str("[out] ");
+                        g.push_str(&line);
+                        g.push('\n');
+                    }
                 }
             }
         });
@@ -395,10 +428,11 @@ fn drain_child_io_capture(tag: &str, child: &mut Child) -> Arc<Mutex<String>> {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::info!(target: "assistant_io", backend = %tag, stream = "stderr", "{line}");
-                let mut g = acc.lock().await;
-                if g.len() < 48_000 {
-                    g.push_str(&line);
-                    g.push('\n');
+                if let Ok(mut g) = acc.lock() {
+                    if g.len() < 48_000 {
+                        g.push_str(&line);
+                        g.push('\n');
+                    }
                 }
             }
         });
@@ -407,11 +441,11 @@ fn drain_child_io_capture(tag: &str, child: &mut Child) -> Arc<Mutex<String>> {
 }
 
 /// After the child exits, wait briefly so drain tasks can finish reading pipes.
-async fn flush_io_tail(acc: &Arc<Mutex<String>>) -> String {
+async fn flush_io_tail(acc: &Arc<std::sync::Mutex<String>>) -> String {
     let mut last = 0usize;
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let len = acc.lock().await.len();
+        let len = acc.lock().map(|g| g.len()).unwrap_or(0);
         if len > 0 && len == last {
             break;
         }
@@ -419,7 +453,7 @@ async fn flush_io_tail(acc: &Arc<Mutex<String>>) -> String {
     }
     // One more beat for a final partial line.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    acc.lock().await.clone()
+    acc.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 fn tail_chars(s: &str, max: usize) -> String {

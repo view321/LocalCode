@@ -11,7 +11,9 @@
 //! coding turn it sits next to the user message (with a 3-line backend log
 //! tail) until the agent starts speaking, then moves onto the live stream line.
 
-use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode, SettingAction, SettingsRowKind};
+use crate::app::{
+    App, ClickRegion, ClickTarget, DashCard, EntryKind, Mode, SettingAction, SettingsRowKind,
+};
 use crate::markdown;
 use crate::theme;
 use crate::widgets::{banner_height, button, button_width, draw_inline_banner};
@@ -273,6 +275,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &mut App) {
         Mode::Chat => draw_chat(f, area, app),
         Mode::Models => draw_models(f, area, app),
         Mode::Runtimes => draw_runtimes(f, area, app),
+        Mode::Dash => draw_dash(f, area, app),
         Mode::Remote => draw_remote(f, area, app),
         Mode::Backends => draw_backends(f, area, app),
         Mode::Bench => draw_bench(f, area, app),
@@ -1348,7 +1351,7 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
 // Runtimes (§7.4)
 // ---------------------------------------------------------------------------
 
-fn status_word(s: RuntimeStatus) -> &'static str {
+pub(crate) fn status_word(s: RuntimeStatus) -> &'static str {
     match s {
         RuntimeStatus::Healthy => "healthy",
         RuntimeStatus::Starting => "starting",
@@ -1424,6 +1427,273 @@ fn draw_runtimes(f: &mut Frame, area: Rect, app: &mut App) {
     ]));
     // No wrap: runtime rows stay one-per-line for the RuntimeList click region.
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Dash — multi-model manager (/dash)
+//
+// One card per running model, in `all_runtimes()` order (so a card's index
+// selects that runtime). Each card is DASH_CARD_H content lines + a gap:
+//   1  ● name    backend · status · vram · tok/s · ctx        ★ active
+//   2    $ launch command                                     [ copy ]
+//   3    log  newest backend output
+//   4    ! error (if the process exited non-zero)             [ copy error ]
+//   5    [ stop ]  [ use ]
+// The header carries a [ + new model ] button, and the whole thing scrolls by
+// card when there are more models than fit.
+// ---------------------------------------------------------------------------
+
+/// Content lines per card (excludes the one-line gap between cards).
+const DASH_CARD_H: u16 = 5;
+/// Card stride including the trailing gap.
+const DASH_CARD_STRIDE: u16 = DASH_CARD_H + 1;
+
+fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
+    let th = app.theme;
+    let inner = pad(area);
+    if inner.height == 0 || inner.width < 8 {
+        return;
+    }
+
+    let cards = app.dash_cards();
+
+    // --- Header row: title · [ + new model ] · gpu summary ---
+    let header = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+    let title = format!("running models ({})", cards.len());
+    let mut hspans = vec![Span::styled(title, theme::muted(&th).add_modifier(Modifier::BOLD))];
+    hspans.push(Span::raw("  "));
+    let new_label = "+ new model";
+    let new_w = button_width(new_label);
+    hspans.extend(button(&th, new_label, false));
+    f.render_widget(Paragraph::new(Line::from(hspans)), header);
+    // Button click rect (title width is stable, so recompute its x).
+    let new_x = inner.x + (format!("running models ({})  ", cards.len()).width() as u16);
+    click(
+        app,
+        Rect { x: new_x, y: header.y, width: new_w, height: 1 },
+        ClickTarget::DashStartNew,
+    );
+    // GPU summary right-aligned when there's room.
+    if !app.gpu.devices.is_empty() {
+        let total = app.gpu.total_vram();
+        let used = total.saturating_sub(app.gpu.free_vram());
+        let gtext = format!("gpu {:.1}/{:.0}G", gib_f(used), gib_f(total));
+        let gw = gtext.width() as u16;
+        if inner.width > new_x - inner.x + new_w + gw + 4 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(gtext, theme::muted(&th)))),
+                Rect { x: inner.x + inner.width - gw, y: header.y, width: gw, height: 1 },
+            );
+        }
+    }
+
+    // Empty state: no models running yet.
+    let cards_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(2),
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
+    };
+    if cards.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "no models running.",
+                    theme::muted(&th),
+                )),
+                Line::from(Span::styled(
+                    "the local Bonsai assistant starts automatically once accepted; \
+                     click [ + new model ] or run /models to deploy another.",
+                    theme::faint(&th),
+                )),
+            ])
+            .wrap(Wrap { trim: false }),
+            cards_area,
+        );
+        return;
+    }
+
+    // --- Scroll so the selected card is visible ---
+    let visible = (cards_area.height / DASH_CARD_STRIDE).max(1) as usize;
+    let sel = app.runtime_selected.min(cards.len().saturating_sub(1));
+    let max_scroll = cards.len().saturating_sub(visible);
+    if app.dash_scroll > max_scroll {
+        app.dash_scroll = max_scroll;
+    }
+    if sel < app.dash_scroll {
+        app.dash_scroll = sel;
+    } else if sel >= app.dash_scroll + visible {
+        app.dash_scroll = sel + 1 - visible;
+    }
+    let start = app.dash_scroll;
+
+    for (row, (i, card)) in cards
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let y = cards_area.y + (row as u16) * DASH_CARD_STRIDE;
+        if y + DASH_CARD_H > cards_area.y + cards_area.height {
+            break;
+        }
+        let card_rect = Rect { x: inner.x, y, width: inner.width, height: DASH_CARD_H };
+        draw_dash_card(f, card_rect, app, i, card, i == sel);
+    }
+
+    // Scroll hint when more cards exist off-screen.
+    if cards.len() > visible {
+        let hint = format!("  {}–{} of {} · scroll / PgUp-PgDn", start + 1, (start + visible).min(cards.len()), cards.len());
+        let hy = cards_area.y + cards_area.height.saturating_sub(1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, theme::faint(&th)))),
+            Rect { x: inner.x, y: hy, width: inner.width, height: 1 },
+        );
+    }
+}
+
+/// Render one dashboard card and register its click regions. `idx` is the
+/// `all_runtimes()` index (what the buttons act on); `selected` highlights it.
+fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &DashCard, selected: bool) {
+    let th = app.theme;
+    let w = rect.width as usize;
+
+    // The whole card is clickable to select the model; buttons registered later
+    // win the reverse hit-test.
+    click(app, rect, ClickTarget::DashCard(idx));
+
+    // Line 1: glyph · name · backend · status · metrics · active marker.
+    let glyph_style = if card.status_is_error {
+        fg(&th).add_modifier(Modifier::BOLD)
+    } else if selected {
+        theme::accent(&th).add_modifier(Modifier::BOLD)
+    } else {
+        theme::muted(&th)
+    };
+    let name_style = if selected {
+        theme::accent(&th).add_modifier(Modifier::BOLD)
+    } else {
+        fg(&th)
+    };
+    let mut l1: Vec<Span> = vec![
+        Span::styled(format!("{} ", card.glyph), glyph_style),
+        Span::styled(card.name.clone(), name_style),
+        sep(&th),
+        Span::styled(card.backend_label.clone(), theme::muted(&th)),
+        sep(&th),
+        Span::styled(
+            card.status_label.clone(),
+            if card.status_is_error {
+                fg(&th).add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted(&th)
+            },
+        ),
+    ];
+    if let Some(v) = card.vram_bytes {
+        l1.push(sep(&th));
+        l1.push(Span::styled(format!("vram ~{:.1}G", gib_f(v)), fg(&th)));
+    }
+    if let Some(t) = card.tok_per_sec {
+        l1.push(sep(&th));
+        l1.push(Span::styled(format!("{t:.0} tok/s"), fg(&th)));
+    }
+    if let Some(u) = card.ctx_used {
+        l1.push(sep(&th));
+        l1.push(Span::styled(
+            format!("ctx {}/{}", human_ctx(u), human_ctx(card.ctx_max)),
+            fg(&th),
+        ));
+    }
+    if card.is_active {
+        l1.push(Span::styled("  ★ next request", theme::accent(&th)));
+    }
+    f.render_widget(
+        Paragraph::new(sel_line(&th, l1, rect.width, selected)),
+        Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
+    );
+
+    // Line 2: launch command + [ copy ] button (right).
+    let copy_label = "copy";
+    let copy_w = button_width(copy_label);
+    let cmd_w = w.saturating_sub(copy_w as usize + 5);
+    let cmd_text = if card.command.is_empty() {
+        "(command unavailable)".to_string()
+    } else {
+        format!("$ {}", card.command)
+    };
+    let l2 = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(clip(&cmd_text, cmd_w), theme::faint(&th)),
+    ]);
+    f.render_widget(Paragraph::new(l2), Rect { x: rect.x, y: rect.y + 1, width: rect.width, height: 1 });
+    if !card.command.is_empty() {
+        let cx = rect.x + rect.width.saturating_sub(copy_w + 1);
+        let crect = Rect { x: cx, y: rect.y + 1, width: copy_w, height: 1 };
+        f.render_widget(Paragraph::new(Line::from(button(&th, copy_label, false))), crect);
+        click(app, crect, ClickTarget::DashCopyCmd(idx));
+    }
+
+    // Line 3: newest log line.
+    let log_line = card.logs.last().cloned().unwrap_or_else(|| "(no logs yet)".into());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  log  ", theme::faint(&th)),
+            Span::styled(clip(&log_line, w.saturating_sub(8)), theme::muted(&th)),
+        ])),
+        Rect { x: rect.x, y: rect.y + 2, width: rect.width, height: 1 },
+    );
+
+    // Line 4: either the error (+ copy-error button) or a 2nd log line.
+    let row4 = Rect { x: rect.x, y: rect.y + 3, width: rect.width, height: 1 };
+    if let Some(err) = &card.error_text {
+        let ce_label = "copy error";
+        let ce_w = button_width(ce_label);
+        let first = err.lines().next().unwrap_or("");
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ! ", fg(&th).add_modifier(Modifier::BOLD)),
+                Span::styled(clip(first, w.saturating_sub(ce_w as usize + 6)), fg(&th).add_modifier(Modifier::BOLD)),
+            ])),
+            row4,
+        );
+        let ex = rect.x + rect.width.saturating_sub(ce_w + 1);
+        let erect = Rect { x: ex, y: row4.y, width: ce_w, height: 1 };
+        f.render_widget(Paragraph::new(Line::from(button(&th, ce_label, true))), erect);
+        click(app, erect, ClickTarget::DashCopyErr(idx));
+    } else {
+        let second = if card.logs.len() >= 2 {
+            card.logs[card.logs.len() - 2].clone()
+        } else {
+            String::new()
+        };
+        if !second.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  log  ", theme::faint(&th)),
+                    Span::styled(clip(&second, w.saturating_sub(8)), theme::faint(&th)),
+                ])),
+                row4,
+            );
+        }
+    }
+
+    // Line 5: action buttons [ stop ] [ use ].
+    let row5 = Rect { x: rect.x, y: rect.y + 4, width: rect.width, height: 1 };
+    let mut bx = rect.x + 2;
+    let mut bspans: Vec<Span> = vec![Span::raw("  ")];
+    if card.can_stop {
+        let stop_w = button_width("stop");
+        bspans.extend(button(&th, "stop", false));
+        bspans.push(Span::raw(" "));
+        click(app, Rect { x: bx, y: row5.y, width: stop_w, height: 1 }, ClickTarget::DashStop(idx));
+        bx += stop_w + 1;
+    }
+    let use_w = button_width("use");
+    bspans.extend(button(&th, "use", card.is_active));
+    click(app, Rect { x: bx, y: row5.y, width: use_w, height: 1 }, ClickTarget::DashUse(idx));
+    f.render_widget(Paragraph::new(Line::from(bspans)), row5);
 }
 
 // ---------------------------------------------------------------------------

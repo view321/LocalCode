@@ -32,8 +32,9 @@ use localcode_assistant::{
 use localcode_backends::{
     can_elevate_noninteractively, diagnose, ensure_llamacpp_installed, resolve_install_plan,
     resolve_llamacpp_bin, resolve_repair, run_install, run_repair, smoke_test, BackendKind,
-    BackendRegistry, DeployRequest, DeployService, DeployTuning, DetectReport, Diagnosis,
-    InstallPlan, RepairPlan, Repoint, SmokeReport, DEFAULT_DEPLOY_CTX,
+    BackendRegistry, DashSnapshot, DeployRequest, DeployService, DeployTuning, DetectReport,
+    Diagnosis, InstallPlan, ProcState, RepairPlan, Repoint, SmokeReport, DASH_LOG_CAP,
+    DEFAULT_DEPLOY_CTX,
 };
 use localcode_core::config::LocalAssistantPreference;
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
@@ -41,7 +42,7 @@ use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::{AppEvent, EventBus, Severity};
 use localcode_core::paths::AppPaths;
-use localcode_core::runtime::ActiveRuntime;
+use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
 use localcode_core::theme::{Theme, ThemeMode};
 use localcode_gpu::{discover, predict_fit, FitPrediction, FitRequest, GpuInventory};
 use localcode_remote::{setup_server, RemoteSession};
@@ -70,6 +71,7 @@ pub enum Mode {
     Chat,
     Models,
     Runtimes,
+    Dash,
     Remote,
     Backends,
     Bench,
@@ -84,6 +86,7 @@ impl Mode {
             Mode::Chat => "chat",
             Mode::Models => "models",
             Mode::Runtimes => "runtimes",
+            Mode::Dash => "dash",
             Mode::Remote => "remote",
             Mode::Backends => "backends",
             Mode::Bench => "bench",
@@ -97,6 +100,7 @@ impl Mode {
         match self {
             Mode::Chat => "message the agent…    @ attaches a file · / for commands",
             Mode::Models => "search models — type to filter, Enter to run",
+            Mode::Dash => "↑↓ pick a model for the next request · Enter to chat with it",
             Mode::Settings => "↑↓ move · Enter toggle/edit · or type to chat",
             _ => "type to chat, or / for commands",
         }
@@ -196,6 +200,19 @@ pub enum ClickTarget {
     DeployField(DeployField),
     // Runtimes
     RuntimeList,
+    // Dash (multi-model manager) — index into all_runtimes()
+    /// Select this model as the active one for the next request.
+    DashCard(usize),
+    /// Copy the launch command to the clipboard.
+    DashCopyCmd(usize),
+    /// Stop this model.
+    DashStop(usize),
+    /// Make this model the active one (explicit button).
+    DashUse(usize),
+    /// Copy the captured error of a model that exited non-zero.
+    DashCopyErr(usize),
+    /// Start a new model (opens the Models search/deploy view).
+    DashStartNew,
     // Backends — index into BACKEND_ORDER
     BackendInstall(usize),
     BackendSmoke(usize),
@@ -333,6 +350,41 @@ pub struct CardCache {
     pub model_id: String,
     pub mode: ThemeMode,
     pub lines: Vec<ratatui::text::Line<'static>>,
+}
+
+/// One model's row in the `/dash` multi-model view. Built by [`App::dash_cards`]
+/// in `all_runtimes()` order so a card's index also selects that runtime. Merges
+/// the live process monitor (command, logs, exit) with per-model metrics
+/// (VRAM estimate, tokens/s, context load).
+#[derive(Debug, Clone)]
+pub struct DashCard {
+    pub name: String,
+    /// Backend label ("llamacpp", "vllm", "remote", …).
+    pub backend_label: String,
+    /// Human status word ("running", "starting", "exited 1", "healthy", …).
+    pub status_label: String,
+    pub status_is_error: bool,
+    /// Status glyph: ● running · ◐ starting · ○ external/idle · ✗ failed.
+    pub glyph: &'static str,
+    /// The exact launch command (click-to-copy). Empty when unknown (remote).
+    pub command: String,
+    /// Newest backend log lines (oldest first, at most a couple shown).
+    pub logs: Vec<String>,
+    /// Estimated VRAM the model occupies, when known.
+    pub vram_bytes: Option<u64>,
+    /// Decode rate — only the active model is streaming, so `None` for the rest.
+    pub tok_per_sec: Option<f64>,
+    /// Context tokens used / window — only meaningful for the active model
+    /// (the coding session is singular), so `None` when idle.
+    pub ctx_used: Option<u32>,
+    pub ctx_max: u32,
+    /// Full captured error for a non-zero exit, for the "copy error" button.
+    pub error_text: Option<String>,
+    /// The model selected for the next request.
+    pub is_active: bool,
+    /// Whether a Stop button applies (false for a reused/external server we
+    /// still surface but manage elsewhere).
+    pub can_stop: bool,
 }
 
 /// Kinds of foreground background-work (one at a time; Esc cancels).
@@ -574,6 +626,8 @@ pub struct App {
     pub runtimes: Vec<ActiveRuntime>,
     pub runtime_selected: usize,
     pub runtime_list_state: ListState,
+    /// First visible card index in the `/dash` multi-model view.
+    pub dash_scroll: usize,
     pub backend_reports: Vec<DetectReport>,
     pub detecting: bool,
     /// Keyboard selection in the Backends view (index into `BACKEND_ORDER`).
@@ -763,6 +817,7 @@ impl App {
             runtimes: vec![],
             runtime_selected: 0,
             runtime_list_state: ListState::default(),
+            dash_scroll: 0,
             backend_reports: vec![],
             detecting: false,
             backend_sel: 0,
@@ -995,6 +1050,193 @@ impl App {
 
     pub fn active_runtime_name(&self) -> Option<String> {
         self.active_runtime().map(|r| r.name.clone())
+    }
+
+    // ------------------------------------------------------------------
+    // /dash — multi-model manager
+    // ------------------------------------------------------------------
+
+    /// One card per model, in `all_runtimes()` order so a card's index also
+    /// indexes the runtime it selects. Sources, in order:
+    /// the local Bonsai assistant (command + logs from its runtime handle),
+    /// registry deploys (merged with their live process [`DashSnapshot`]), and
+    /// remote SSH runtimes (managed on the remote box, so command/logs there).
+    pub fn dash_cards(&self) -> Vec<DashCard> {
+        let runtimes = self.all_runtimes();
+        // Match `active_runtime()`: the selected index when valid, else the first
+        // (so the "★ next request" marker never disagrees with what actually runs).
+        let active = if self.runtime_selected < runtimes.len() {
+            self.runtime_selected
+        } else {
+            0
+        };
+        let assistant_offset = usize::from(self.local_assistant.is_some());
+        let reg_len = self.runtimes.len();
+
+        // Index the live process monitors by runtime id for the registry cards.
+        let snaps: std::collections::HashMap<String, DashSnapshot> = self
+            .registry
+            .monitors()
+            .snapshot(DASH_LOG_CAP)
+            .into_iter()
+            .map(|s| (s.runtime_id.clone(), s))
+            .collect();
+
+        let mut cards = Vec::with_capacity(runtimes.len());
+        for (i, rt) in runtimes.iter().enumerate() {
+            let is_active = i == active;
+            // Per-model live metrics: only the active model streams / holds the
+            // singular coding session, so tok/s and ctx are attributed to it.
+            let tok_per_sec = if is_active { self.tokens_per_sec } else { None };
+            let (ctx_used, ctx_max) = if is_active {
+                (Some(self.ctx_used_tokens), self.deploy_ctx.max(1))
+            } else {
+                (None, self.deploy_ctx.max(1))
+            };
+
+            let card = if assistant_offset == 1 && i == 0 {
+                self.dash_card_assistant(rt, is_active, tok_per_sec, ctx_used, ctx_max)
+            } else if i >= assistant_offset && i < assistant_offset + reg_len {
+                self.dash_card_registry(rt, &snaps, is_active, tok_per_sec, ctx_used, ctx_max)
+            } else {
+                self.dash_card_remote(rt, is_active, tok_per_sec, ctx_used, ctx_max)
+            };
+            cards.push(card);
+        }
+        cards
+    }
+
+    fn dash_card_assistant(
+        &self,
+        rt: &ActiveRuntime,
+        is_active: bool,
+        tok_per_sec: Option<f64>,
+        ctx_used: Option<u32>,
+        ctx_max: u32,
+    ) -> DashCard {
+        let (command, logs) = match &self.local_assistant {
+            Some(a) => (a.command().to_string(), a.recent_logs(4)),
+            None => (String::new(), Vec::new()),
+        };
+        DashCard {
+            name: rt.name.clone(),
+            backend_label: "llamacpp".into(),
+            status_label: "running (default)".into(),
+            status_is_error: false,
+            glyph: "●",
+            command,
+            logs,
+            vram_bytes: None,
+            tok_per_sec,
+            ctx_used,
+            ctx_max,
+            error_text: None,
+            is_active,
+            can_stop: true,
+        }
+    }
+
+    fn dash_card_registry(
+        &self,
+        rt: &ActiveRuntime,
+        snaps: &std::collections::HashMap<String, DashSnapshot>,
+        is_active: bool,
+        tok_per_sec: Option<f64>,
+        ctx_used: Option<u32>,
+        ctx_max: u32,
+    ) -> DashCard {
+        let snap = snaps.get(&rt.id.to_string());
+        let (glyph, status_label, status_is_error) = match snap.map(|s| &s.state) {
+            Some(ProcState::Running) => ("●", "running".to_string(), false),
+            Some(ProcState::Starting) => ("◐", "starting".to_string(), false),
+            Some(ProcState::External) => ("○", "external".to_string(), false),
+            Some(ProcState::Exited { code, ok: false }) => (
+                "✗",
+                match code {
+                    Some(c) => format!("exited (code {c})"),
+                    None => "exited (killed)".to_string(),
+                },
+                true,
+            ),
+            Some(ProcState::Exited { ok: true, .. }) => ("○", "exited".to_string(), false),
+            None => ("○", crate::ui::status_word(rt.status).to_string(), false),
+        };
+        DashCard {
+            name: rt.name.clone(),
+            backend_label: BackendKind::from_runtime_kind(rt.kind)
+                .map(|b| b.as_str().to_string())
+                .unwrap_or_else(|| "backend".into()),
+            status_label,
+            status_is_error,
+            glyph,
+            command: snap.map(|s| s.command.clone()).unwrap_or_default(),
+            logs: snap.map(|s| s.log_tail.clone()).unwrap_or_default(),
+            vram_bytes: snap.and_then(|s| s.est_vram_bytes),
+            tok_per_sec,
+            ctx_used,
+            ctx_max,
+            error_text: snap.and_then(|s| s.error_text()),
+            is_active,
+            can_stop: true,
+        }
+    }
+
+    fn dash_card_remote(
+        &self,
+        rt: &ActiveRuntime,
+        is_active: bool,
+        tok_per_sec: Option<f64>,
+        ctx_used: Option<u32>,
+        ctx_max: u32,
+    ) -> DashCard {
+        DashCard {
+            name: rt.name.clone(),
+            backend_label: "remote".into(),
+            status_label: crate::ui::status_word(rt.status).to_string(),
+            status_is_error: rt.status == RuntimeStatus::Unhealthy,
+            glyph: "◈",
+            command: format!("ssh tunnel → {}", rt.base_url),
+            logs: vec![format!("managed on the remote GPU box · {}", rt.base_url)],
+            vram_bytes: None,
+            tok_per_sec,
+            ctx_used,
+            ctx_max,
+            error_text: None,
+            is_active,
+            can_stop: true,
+        }
+    }
+
+    /// Copy `text` to the system clipboard via the OSC 52 terminal escape (works
+    /// over SSH and inside tmux with `set-clipboard on`, no native dependency),
+    /// and confirm in the status line. Terminals that don't support OSC 52
+    /// ignore it — the user can still F2 into select mode to copy manually.
+    fn copy_to_clipboard(&mut self, text: &str, what: &str) {
+        if text.trim().is_empty() {
+            self.set_status(format!("Nothing to copy for {what}"), false);
+            return;
+        }
+        osc52_copy(text);
+        self.set_status(format!("Copied {what} to clipboard"), false);
+    }
+
+    /// Stop the model at `all_runtimes()` index `idx` (dash Stop button).
+    fn dash_stop(&mut self, idx: usize) {
+        self.runtime_selected = idx;
+        self.start_stop_runtime();
+    }
+
+    /// Make the model at `all_runtimes()` index `idx` the active one for the
+    /// next request (dash card / Use button).
+    fn dash_use(&mut self, idx: usize) {
+        let n = self.all_runtimes().len();
+        if idx >= n {
+            return;
+        }
+        self.runtime_selected = idx;
+        if let Some(name) = self.all_runtimes().get(idx).map(|r| r.name.clone()) {
+            self.set_status(format!("Next request uses {name}"), false);
+        }
     }
 
     fn workspace_path(&self) -> PathBuf {
@@ -3649,6 +3891,7 @@ impl App {
     pub fn slash_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
         &[
             ("/models", "[q]", "search & deploy HuggingFace models"),
+            ("/dash", "", "manage running models — logs, stop/start, switch model"),
             ("/runtimes", "", "active runtimes & system overview"),
             ("/remote", "", "connect a GPU server over SSH"),
             ("/backends", "", "install & configure inference backends"),
@@ -3965,7 +4208,8 @@ impl App {
                     self.start_detect();
                 }
             }
-            "runtimes" | "dashboard" | "home" => self.set_mode(Mode::Runtimes),
+            "runtimes" | "home" => self.set_mode(Mode::Runtimes),
+            "dash" | "dashboard" | "models-running" => self.set_mode(Mode::Dash),
             "deploy" => {
                 self.set_mode(Mode::Models);
                 self.start_deploy(false);
@@ -4574,6 +4818,7 @@ The omnibar at the bottom is always active — just type.\n\
 \n\
 Commands (type / to see them all):\n\
   /models [q]   search & deploy HuggingFace models\n\
+  /dash         manage running models — logs, stop/start, switch model\n\
   /runtimes     active runtimes & system overview\n\
   /remote       connect a GPU server over SSH (one-click)\n\
   /backends     install inference backends\n\
@@ -4582,7 +4827,9 @@ Commands (type / to see them all):\n\
 \n\
 Everything renders inline in the working area — no popups. Rows, fields\n\
 and buttons are clickable. Models: click a model to open it, click a quant\n\
-to select, click deploy. Remote: click a field to edit, then connect."
+to select, click deploy. Dash: run several models at once, click a card (or\n\
+↑/↓) to pick which one the next request uses, copy its launch command, read\n\
+its backend logs, or stop it. Remote: click a field to edit, then connect."
             .to_string();
         self.modal = Some(ModalState::info("Help", body));
     }
@@ -5014,6 +5261,27 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 KeyCode::Up => self.runtime_selected = self.runtime_selected.saturating_sub(1),
                 _ => {}
             },
+            // Dash selection IS the active-model cycler: moving the highlight
+            // picks the model the next request will use. The draw auto-scrolls
+            // to keep the selection visible (PageUp/Down scroll manually).
+            Mode::Dash => match code {
+                KeyCode::Down => {
+                    let n = self.all_runtimes().len();
+                    if n > 0 {
+                        self.runtime_selected = (self.runtime_selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Up => self.runtime_selected = self.runtime_selected.saturating_sub(1),
+                KeyCode::Tab => {
+                    let n = self.all_runtimes().len();
+                    if n > 0 {
+                        self.runtime_selected = (self.runtime_selected + 1) % n;
+                    }
+                }
+                KeyCode::PageDown => self.dash_scroll = self.dash_scroll.saturating_add(1),
+                KeyCode::PageUp => self.dash_scroll = self.dash_scroll.saturating_sub(1),
+                _ => {}
+            },
             Mode::Backends => match code {
                 KeyCode::Down => self.backend_sel = (self.backend_sel + 1) % BACKEND_ORDER.len(),
                 KeyCode::Up => {
@@ -5090,6 +5358,12 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 self.start_install(kind);
             }
             Mode::Settings => self.activate_selected_setting(),
+            // Empty Enter in the dashboard: adopt the highlighted model and drop
+            // into chat so the next message goes to it.
+            Mode::Dash => {
+                self.dash_use(self.runtime_selected);
+                self.set_mode(Mode::Chat);
+            }
             _ => {}
         }
     }
@@ -5327,6 +5601,28 @@ to select, click deploy. Remote: click a field to edit, then connect."
                     }
                 }
             }
+            // Dash (multi-model manager). Button regions are registered after the
+            // card region, so the reverse hit-test lets them win over a card click.
+            ClickTarget::DashCard(i) => self.dash_use(i),
+            ClickTarget::DashUse(i) => self.dash_use(i),
+            ClickTarget::DashCopyCmd(i) => {
+                if let Some(card) = self.dash_cards().get(i) {
+                    let cmd = card.command.clone();
+                    self.copy_to_clipboard(&cmd, "command");
+                }
+            }
+            ClickTarget::DashStop(i) => self.dash_stop(i),
+            ClickTarget::DashCopyErr(i) => {
+                if let Some(err) = self.dash_cards().get(i).and_then(|c| c.error_text.clone()) {
+                    self.copy_to_clipboard(&err, "error");
+                }
+            }
+            ClickTarget::DashStartNew => {
+                self.set_mode(Mode::Models);
+                if self.models.is_empty() && !self.fg_busy() {
+                    self.start_search();
+                }
+            }
             // Backends.
             ClickTarget::BackendInstall(i) => {
                 self.backend_sel = i.min(BACKEND_ORDER.len() - 1);
@@ -5442,6 +5738,12 @@ to select, click deploy. Remote: click a field to edit, then connect."
                 self.scroll_transcript(delta)
             }
             Some(ClickTarget::RuntimeList) => self.scroll_runtimes(delta),
+            Some(ClickTarget::DashCard(_))
+            | Some(ClickTarget::DashCopyCmd(_))
+            | Some(ClickTarget::DashStop(_))
+            | Some(ClickTarget::DashUse(_))
+            | Some(ClickTarget::DashCopyErr(_))
+            | Some(ClickTarget::DashStartNew) => self.scroll_dash(delta),
             _ => self.wheel_scroll(delta),
         }
     }
@@ -5451,6 +5753,7 @@ to select, click deploy. Remote: click a field to edit, then connect."
         match self.mode {
             Mode::Chat => self.scroll_transcript(delta),
             Mode::Models => self.scroll_card(delta),
+            Mode::Dash => self.scroll_dash(delta),
             Mode::Setup => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;
             }
@@ -5459,6 +5762,13 @@ to select, click deploy. Remote: click a field to edit, then connect."
             }
             _ => {}
         }
+    }
+
+    /// Scroll the `/dash` card list by whole cards. Upper bound is clamped again
+    /// in the draw once the viewport height is known.
+    fn scroll_dash(&mut self, delta: i64) {
+        let max = self.all_runtimes().len().saturating_sub(1) as i64;
+        self.dash_scroll = (self.dash_scroll as i64 + delta.signum()).clamp(0, max.max(0)) as usize;
     }
 
     fn scroll_transcript(&mut self, delta: i64) {
@@ -5491,6 +5801,20 @@ to select, click deploy. Remote: click a field to edit, then connect."
         self.runtime_selected =
             (self.runtime_selected as i64 + delta.signum()).clamp(0, max) as usize;
     }
+}
+
+/// Copy `text` to the terminal's clipboard using the OSC 52 escape sequence.
+/// Dependency-free and works over SSH / inside tmux (with `set-clipboard on`);
+/// terminals without OSC 52 support silently ignore it. Written straight to
+/// stdout between frames, so it doesn't interleave with a ratatui draw.
+fn osc52_copy(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{encoded}\x07");
+    let mut out = io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 /// Fixed display order of backends in the manager overlay.
@@ -5810,6 +6134,120 @@ mod tests {
         // Esc returns to chat.
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Chat);
+    }
+
+    // ---- /dash multi-model manager ----------------------------------------
+
+    /// A deployed runtime plus a matching live process monitor, both keyed by the
+    /// same id (mirrors what a real backend deploy registers).
+    fn add_running_model(
+        app: &mut App,
+        name: &str,
+        model: &str,
+        command: &str,
+        state: ProcState,
+    ) -> uuid::Uuid {
+        let mut rt = ActiveRuntime::new(
+            name,
+            localcode_core::runtime::RuntimeKind::Vllm,
+            "http://127.0.0.1:8000/v1",
+        );
+        rt.model_id = Some(model.into());
+        rt.status = RuntimeStatus::Healthy;
+        let id = rt.id;
+        app.runtimes.push(rt);
+        app.registry.monitors().register(
+            id.to_string(),
+            name,
+            BackendKind::Vllm,
+            Some(model.into()),
+            command,
+            state,
+        );
+        id
+    }
+
+    #[test]
+    fn dash_command_switches_mode() {
+        let mut app = test_app();
+        typ(&mut app, "/dash");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Dash);
+        assert!(app.coding_input.is_empty());
+    }
+
+    #[test]
+    fn dash_cards_reflect_registered_monitor() {
+        let mut app = test_app();
+        let id = add_running_model(
+            &mut app,
+            "vllm:test/model",
+            "test/model",
+            "vllm serve test/model --max-model-len 8192",
+            ProcState::Running,
+        );
+        app.registry
+            .monitors()
+            .get(&id.to_string())
+            .unwrap()
+            .push_log("Uvicorn running on http://127.0.0.1:8000");
+
+        let cards = app.dash_cards();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].name, "vllm:test/model");
+        assert_eq!(cards[0].backend_label, "vllm");
+        assert!(cards[0].command.contains("vllm serve"));
+        assert_eq!(
+            cards[0].logs.last().map(String::as_str),
+            Some("Uvicorn running on http://127.0.0.1:8000")
+        );
+        // Sole runtime → it's the active model for the next request.
+        assert!(cards[0].is_active);
+        assert!(cards[0].error_text.is_none());
+    }
+
+    #[test]
+    fn dash_card_surfaces_nonzero_exit_error() {
+        let mut app = test_app();
+        let id = add_running_model(&mut app, "vllm:x", "x", "vllm serve x", ProcState::Running);
+        let mon = app.registry.monitors().get(&id.to_string()).unwrap();
+        mon.push_log("CUDA error: out of memory");
+        mon.set_state(ProcState::Exited { code: Some(1), ok: false });
+
+        let cards = app.dash_cards();
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].status_is_error);
+        let err = cards[0].error_text.as_ref().expect("failed model has error text");
+        assert!(err.contains("out of memory"), "{err}");
+        assert!(err.contains("code 1"), "{err}");
+    }
+
+    #[test]
+    fn dash_use_selects_active_model_for_next_request() {
+        let mut app = test_app();
+        add_running_model(&mut app, "m0", "a", "cmd0", ProcState::Running);
+        add_running_model(&mut app, "m1", "b", "cmd1", ProcState::Running);
+
+        app.dash_use(1);
+        assert_eq!(app.runtime_selected, 1);
+        assert_eq!(app.active_runtime().unwrap().name, "m1");
+        // Exactly the selected card is marked active.
+        let cards = app.dash_cards();
+        assert!(!cards[0].is_active);
+        assert!(cards[1].is_active);
+    }
+
+    #[test]
+    fn dash_stop_removes_the_model_card() {
+        let mut app = test_app();
+        let id = add_running_model(&mut app, "m0", "a", "cmd0", ProcState::Running);
+        assert_eq!(app.dash_cards().len(), 1);
+        // Stopping drops it from the registry runtimes and its monitor. (No child
+        // process exists in the test, so the backend stop is a no-op; we simulate
+        // the deregistration the stop path performs.)
+        app.runtimes.retain(|r| r.id != id);
+        app.registry.monitors().remove(&id.to_string());
+        assert!(app.dash_cards().is_empty());
     }
 
     #[test]

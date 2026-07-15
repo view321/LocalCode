@@ -1,6 +1,7 @@
 use crate::{
-    port_in_use, probe_client, resolve_llamacpp_bin, spawn_io_drain, BackendKind, DetectReport,
-    Health, InferenceBackend, ModelDeploySpec, RunningEndpoint,
+    capture_into_monitor, format_command, port_in_use, probe_client, resolve_llamacpp_bin,
+    spawn_exit_watch, BackendKind, DetectReport, Health, InferenceBackend, ModelDeploySpec,
+    ModelMonitors, ProcState, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::LlamaCppConfig;
@@ -11,13 +12,20 @@ use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
+use uuid::Uuid;
+
+/// A managed child held so both `stop()` and the exit watcher can reach it. The
+/// `Option` is emptied by whichever takes the child first.
+type ChildHandle = Arc<Mutex<Option<tokio::process::Child>>>;
 
 pub struct LlamaCppBackend {
     cfg: LlamaCppConfig,
     http: reqwest::Client,
     /// Track child processes by runtime id. kill_on_drop: managed runtimes
     /// stop when LocalCode exits (the quit dialog says so).
-    children: Arc<Mutex<Vec<(String, tokio::process::Child)>>>,
+    children: Arc<Mutex<Vec<(String, ChildHandle)>>>,
+    /// Shared dashboard monitors (`/dash`). Detached by default.
+    monitors: ModelMonitors,
 }
 
 impl LlamaCppBackend {
@@ -26,7 +34,14 @@ impl LlamaCppBackend {
             cfg,
             http: probe_client(),
             children: Arc::new(Mutex::new(Vec::new())),
+            monitors: ModelMonitors::new(),
         }
+    }
+
+    /// Attach the shared `/dash` monitor store (called by the registry).
+    pub fn with_monitors(mut self, monitors: ModelMonitors) -> Self {
+        self.monitors = monitors;
+        self
     }
 
     /// Configured path / PATH / managed install (same rules as the assistant).
@@ -153,6 +168,10 @@ impl InferenceBackend for LlamaCppBackend {
                 args.push(a.clone());
             }
         }
+        // Pre-generate the runtime id so its `/dash` monitor exists (and captures
+        // startup logs) before the health loop.
+        let runtime_id = Uuid::new_v4();
+        let command = format_command(&bin.display().to_string(), &args);
         let mut child = tokio::process::Command::new(&bin)
             .args(&args)
             .kill_on_drop(true)
@@ -167,9 +186,17 @@ impl InferenceBackend for LlamaCppBackend {
                     .with_hint("Check CUDA/driver compatibility if using GPU build")
                     .retryable(true)
             })?;
-        // Drain output into tracing; llama-server logs every request and an
-        // undrained pipe would eventually block the whole server.
-        spawn_io_drain("llama-server".into(), &mut child);
+        // Capture output into the dashboard monitor (and tracing); llama-server
+        // logs every request and an undrained pipe would eventually block it.
+        let monitor = self.monitors.register(
+            runtime_id.to_string(),
+            format!("llamacpp:{}", spec.model_id),
+            BackendKind::LlamaCpp,
+            Some(spec.model_id.clone()),
+            command,
+            ProcState::Starting,
+        );
+        capture_into_monitor("llama-server", &mut child, &monitor);
 
         let base_url = format!("http://{}:{}", self.cfg.host, port);
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
@@ -177,6 +204,7 @@ impl InferenceBackend for LlamaCppBackend {
         loop {
             if tokio::time::Instant::now() > deadline {
                 let _ = child.kill().await;
+                self.monitors.remove(&runtime_id.to_string());
                 return Err(LocalCodeError::new(
                     ErrorCode::BackendHealthTimeout,
                     "llama-server did not become healthy in time",
@@ -193,6 +221,7 @@ impl InferenceBackend for LlamaCppBackend {
                 }
             }
             if let Ok(Some(status)) = child.try_wait() {
+                self.monitors.remove(&runtime_id.to_string());
                 return Err(LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
                     format!("llama-server exited early: {status}"),
@@ -217,15 +246,21 @@ impl InferenceBackend for LlamaCppBackend {
             BackendKind::LlamaCpp.to_runtime_kind(),
             format!("{base_url}/v1"),
         );
+        runtime.id = runtime_id;
         runtime.model_id = Some(spec.model_id.clone());
         runtime.quantization = spec.quantization.clone();
         runtime.status = RuntimeStatus::Healthy;
         runtime.correlation_id = cid.to_string();
 
+        // Healthy: flip the card to Running and hand the child to a shared handle
+        // so both stop() and the exit watcher can reach it.
+        monitor.set_state(ProcState::Running);
+        let handle: ChildHandle = Arc::new(Mutex::new(Some(child)));
+        spawn_exit_watch(handle.clone(), monitor);
         self.children
             .lock()
             .await
-            .push((runtime.id.to_string(), child));
+            .push((runtime.id.to_string(), handle));
 
         Ok(RunningEndpoint { runtime })
     }
@@ -233,9 +268,15 @@ impl InferenceBackend for LlamaCppBackend {
     async fn stop(&self, runtime_id: &str) -> Result<(), LocalCodeError> {
         let mut kids = self.children.lock().await;
         if let Some(pos) = kids.iter().position(|(id, _)| id == runtime_id) {
-            let (_, mut child) = kids.remove(pos);
-            let _ = child.kill().await;
+            let (_, handle) = kids.remove(pos);
+            // Bind the child out first so the MutexGuard is released before the
+            // block ends (it must not outlive the owned `handle`).
+            let child = handle.lock().await.take();
+            if let Some(mut child) = child {
+                let _ = child.kill().await;
+            }
         }
+        self.monitors.remove(runtime_id);
         Ok(())
     }
 
