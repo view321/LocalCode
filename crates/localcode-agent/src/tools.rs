@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::info;
@@ -16,8 +18,14 @@ use walkdir::WalkDir;
 const MAX_READ_CHARS: usize = 24_000;
 /// Max characters of shell/grep output returned to the model.
 const MAX_EXEC_CHARS: usize = 16_000;
-/// Max wall-clock time for a shell command.
-const EXEC_TIMEOUT_SECS: u64 = 120;
+/// Default wall-clock cap for a shell command when the config doesn't set one.
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
+/// After the child exits, how long to keep draining its pipes before giving up
+/// (a leaked background grandchild can hold them open forever).
+const DRAIN_GRACE_SECS: u64 = 5;
+/// Longest single line `grep` returns before it is clipped (keeps a match in a
+/// minified/lockfile line from flooding the model context).
+const MAX_GREP_LINE_CHARS: usize = 400;
 /// Max directory entries returned by `ls`.
 const MAX_LIST_ENTRIES: usize = 200;
 /// Directories that `grep` never descends into.
@@ -75,15 +83,37 @@ pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
             format!("Run shell command{flag}:\n\n  {cmd}")
         }
         "write" => {
-            let n = call
+            // Note: workspace isn't available here, so we can't reliably tell
+            // "new file" from "overwrite" — say the honest thing and let the
+            // content preview show exactly what would be written.
+            let content = call
                 .arguments
                 .get("content")
                 .and_then(|v| v.as_str())
-                .map(|c| c.chars().count())
-                .unwrap_or(0);
+                .unwrap_or("");
+            let n = content.chars().count();
             format!(
-                "Write file: {} ({n} chars, replaces existing content)",
-                arg("path")
+                "Write file (replaces any existing content): {} ({n} chars)\n\n{}",
+                arg("path"),
+                content_preview(content)
+            )
+        }
+        "edit" => {
+            let old = call
+                .arguments
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = call
+                .arguments
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "Edit file: {}\n\n- remove:\n{}\n\n+ insert:\n{}",
+                arg("path"),
+                content_preview(old),
+                content_preview(new)
             )
         }
         "read" => format!("Read file: {}", arg("path")),
@@ -104,7 +134,7 @@ pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
                     .unwrap_or(false)
         }
         ApprovalMode::ApproveEdits => {
-            matches!(call.name.as_str(), "write" | "bash")
+            matches!(call.name.as_str(), "write" | "edit" | "bash")
         }
         ApprovalMode::AskPermission => true,
     };
@@ -115,6 +145,8 @@ pub struct ToolRegistry {
     disabled: std::collections::HashSet<String>,
     /// When true, shell stays confined to the workspace (cwd + path checks).
     shell_sandbox: bool,
+    /// Wall-clock cap for a single `bash` command.
+    exec_timeout: Duration,
 }
 
 impl ToolRegistry {
@@ -122,13 +154,24 @@ impl ToolRegistry {
         Self {
             disabled: std::collections::HashSet::new(),
             shell_sandbox: true,
+            exec_timeout: Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECS),
         }
     }
 
-    pub fn new(disabled: impl IntoIterator<Item = String>, shell_sandbox: bool) -> Self {
+    pub fn new(
+        disabled: impl IntoIterator<Item = String>,
+        shell_sandbox: bool,
+        exec_timeout_secs: u64,
+    ) -> Self {
+        let secs = if exec_timeout_secs == 0 {
+            DEFAULT_EXEC_TIMEOUT_SECS
+        } else {
+            exec_timeout_secs
+        };
         Self {
             disabled: disabled.into_iter().collect(),
             shell_sandbox,
+            exec_timeout: Duration::from_secs(secs),
         }
     }
 
@@ -137,6 +180,7 @@ impl ToolRegistry {
         &[
             ("read", "Read a file"),
             ("write", "Write full file contents"),
+            ("edit", "Replace an exact string in a file"),
             ("bash", "Run a shell command in the workspace"),
             ("ls", "List a directory"),
             ("grep", "Search files by regex"),
@@ -167,7 +211,7 @@ impl ToolRegistry {
             ),
             tool_schema(
                 "write",
-                "Write full file contents (creates parent directories). Prefer this over shell redirects for file edits.",
+                "Write full file contents (creates parent directories). Best for new files or full rewrites; to change part of an existing file prefer `edit`, which cannot silently drop unseen content.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -175,6 +219,20 @@ impl ToolRegistry {
                         "content": { "type": "string" }
                     },
                     "required": ["path", "content"]
+                }),
+            ),
+            tool_schema(
+                "edit",
+                "Replace an exact substring in an existing file. `old_string` must occur exactly once (include surrounding lines to disambiguate) unless replace_all is true. Prefer this over `write` for edits to large files so untouched content is never lost.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_string": { "type": "string", "description": "Exact text to replace (must match verbatim, including indentation)" },
+                        "new_string": { "type": "string", "description": "Replacement text" },
+                        "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring a unique match" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 }),
             ),
             tool_schema(
@@ -237,11 +295,12 @@ impl ToolRegistry {
             ),
             tool_schema(
                 "hf.search",
-                "Search the Hugging Face model catalogue by free-text query. Returns top matches with download counts and tags.",
+                "Search the Hugging Face model catalogue by free-text query. Biased toward coding / text-generation models by default; pass coding_only=false for the full catalogue (embeddings, vision, TTS, …). Returns top matches with download counts and tags.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Search query, e.g. coding, gguf, 7B instruct" }
+                        "query": { "type": "string", "description": "Search query, e.g. coding, gguf, 7B instruct" },
+                        "coding_only": { "type": "boolean", "description": "Restrict to coding/text-generation models (default true)" }
                     },
                     "required": ["query"]
                 }),
@@ -296,6 +355,7 @@ impl ToolRegistry {
         match call.name.as_str() {
             "read" => self.tool_read(call, workspace),
             "write" => self.tool_write(call, workspace),
+            "edit" => self.tool_edit(call, workspace),
             "bash" => self.tool_bash(call, workspace).await,
             "ls" => self.tool_ls(call, workspace),
             "grep" => self.tool_grep(call, workspace),
@@ -407,8 +467,106 @@ impl ToolRegistry {
         })
     }
 
+    /// Exact-string replacement in an existing file. Unlike `write`, this can
+    /// only ever touch the matched region, so it never drops content the model
+    /// hasn't seen (e.g. the tail of a file too large to read in full).
+    fn tool_edit(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
+        let path = arg_path(call, workspace, "path")?;
+        let old = call
+            .arguments
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, "edit requires old_string")
+            })?;
+        let new = call
+            .arguments
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, "edit requires new_string")
+            })?;
+        let replace_all = call
+            .arguments
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if old == new {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                "edit old_string and new_string are identical — nothing to do",
+            ));
+        }
+        if old.is_empty() {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                "edit old_string is empty — use write to create a file",
+            ));
+        }
+        let meta = std::fs::metadata(&path).map_err(|e| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
+                .with_cause(format!("Cannot stat {}", path.display()))
+        })?;
+        if !meta.is_file() {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("Not a file: {}", path.display()),
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
+                .with_cause(format!("Cannot read {}", path.display()))
+        })?;
+        if is_binary(&bytes) {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("Binary file — refusing to edit as text: {}", path.display()),
+            ));
+        }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                "edit old_string not found in the file",
+            )
+            .with_hint("Read the file and copy the exact text, including whitespace"));
+        }
+        if count > 1 && !replace_all {
+            return Err(LocalCodeError::new(
+                ErrorCode::AgentToolFailed,
+                format!("edit old_string matches {count} places — not unique"),
+            )
+            .with_hint("Add surrounding lines to make it unique, or pass replace_all=true"));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        std::fs::write(&path, &updated).map_err(|e| {
+            LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
+                .with_cause(format!("Cannot write {}", path.display()))
+        })?;
+        let replaced = if replace_all { count } else { 1 };
+        Ok(ToolResult {
+            output: format!(
+                "edited {} ({replaced} replacement{})",
+                path.display(),
+                if replaced == 1 { "" } else { "s" }
+            ),
+            risk: ToolRisk::Medium,
+        })
+    }
+
     fn tool_ls(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
-        let path = arg_path(call, workspace, "path").unwrap_or_else(|_| workspace.to_path_buf());
+        // A missing path lists the workspace root, but a *supplied* path that is
+        // invalid or escapes the workspace must surface an error rather than
+        // silently listing the root (the model would trust a wrong result).
+        let path = match call.arguments.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() && p != "." => resolve_path(workspace, p)?,
+            _ => workspace.to_path_buf(),
+        };
         let mut entries = vec![];
         for e in std::fs::read_dir(&path)
             .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?
@@ -489,7 +647,7 @@ impl ToolRegistry {
                         "{}:{}:{}",
                         entry.path().display(),
                         i + 1,
-                        line.trim_end()
+                        clip_line(line.trim_end(), MAX_GREP_LINE_CHARS)
                     ));
                     if hits.len() >= 50 {
                         hits.push("…(more matches truncated at 50)".into());
@@ -499,7 +657,9 @@ impl ToolRegistry {
             }
         }
         Ok(ToolResult {
-            output: hits.join("\n"),
+            // Cap total size too: 50 matched lines from minified/lockfiles can
+            // still blow a small local-model context even after per-line clipping.
+            output: truncate_output(&hits.join("\n"), MAX_EXEC_CHARS),
             risk: ToolRisk::Low,
         })
     }
@@ -535,7 +695,7 @@ impl ToolRegistry {
         if self.shell_sandbox {
             sandbox_check_command(command, workspace)?;
         }
-        run_shell(command, &cwd, workspace, self.shell_sandbox).await
+        run_shell(command, &cwd, workspace, self.shell_sandbox, self.exec_timeout).await
     }
 }
 
@@ -568,93 +728,138 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
     )
 }
 
+/// Clip a single line to `max` chars (char-safe), marking the elision.
+fn clip_line(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max).collect();
+    format!("{head}… [line clipped]")
+}
+
+/// A short, bounded preview of proposed file content for an approval prompt, so
+/// the user sees *what* is being written, not just a byte count.
+fn content_preview(s: &str) -> String {
+    const MAX_LINES: usize = 20;
+    const MAX_CHARS: usize = 800;
+    let mut out: String = s.chars().take(MAX_CHARS).collect();
+    let char_trunc = s.chars().count() > MAX_CHARS;
+    let line_trunc = out.lines().count() > MAX_LINES;
+    if line_trunc {
+        out = out.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
+    }
+    if char_trunc || line_trunc {
+        out.push_str("\n… (preview truncated)");
+    }
+    out
+}
+
+/// Read a child pipe into a shared buffer in chunks. Chunked (rather than
+/// `read_to_end`) so that if a leaked background process holds the pipe open,
+/// we can still recover whatever was captured before giving up on the drain.
+fn spawn_pipe_reader<R>(reader: Option<R>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = buf.clone();
+    let handle = tokio::spawn(async move {
+        if let Some(mut r) = reader {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match r.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut b) = sink.lock() {
+                            b.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (buf, handle)
+}
+
 async fn run_shell(
     command: &str,
     cwd: &Path,
     workspace: &Path,
     sandbox: bool,
+    exec_timeout: Duration,
 ) -> Result<ToolResult, LocalCodeError> {
-    let mut child = if cfg!(windows) {
+    let mut cmd = if cfg!(windows) {
         // PowerShell handles quoting and pipelines more reliably than cmd /C.
+        // Confinement is the cwd + the pre-flight sandbox check; Set-Location
+        // just anchors the session at the workspace.
         let ws = powershell_single_quote(&cwd.display().to_string());
-        let body = if sandbox {
-            // Stay in the workspace; refuse to leave via Set-Location to
-            // absolute paths outside is best-effort via the pre-check.
-            format!("Set-Location -LiteralPath {ws}; {command}")
-        } else {
-            format!("Set-Location -LiteralPath {ws}; {command}")
-        };
-        Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &body])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+        let body = format!("Set-Location -LiteralPath {ws}; {command}");
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &body]);
+        c
     } else {
         let mut c = Command::new("sh");
         c.args(["-c", command]);
-        c.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env("PWD", cwd);
-        if sandbox {
-            // Hint for tools that respect it; real confinement is cwd + checks.
-            c.env("LOCALCODE_WORKSPACE", workspace);
-        }
-        c.spawn()
+        c.env("PWD", cwd);
+        c
+    };
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if sandbox {
+        // Hint for tools that respect it; real confinement is cwd + checks.
+        cmd.env("LOCALCODE_WORKSPACE", workspace);
     }
-    .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(ref mut s) = stdout {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let err_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(ref mut s) = stderr {
-            let _ = s.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
+    let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
 
-    let status = match tokio::time::timeout(
-        std::time::Duration::from_secs(EXEC_TIMEOUT_SECS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(res) => res
-            .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?,
+    let (status, timed_out) = match tokio::time::timeout(exec_timeout, child.wait()).await {
+        Ok(res) => (res.ok(), false),
         Err(_) => {
             let _ = child.kill().await;
-            return Err(LocalCodeError::new(
-                ErrorCode::AgentToolFailed,
-                format!(
-                    "Command timed out after {EXEC_TIMEOUT_SECS}s and was killed: {command}"
-                ),
-            )
-            .with_hint("Run long-lived processes outside the agent"));
+            // Reap the killed child so it doesn't linger as a zombie.
+            (child.wait().await.ok(), true)
         }
     };
+    let status_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
-    let stdout = out_task.await.unwrap_or_default();
-    let stderr = err_task.await.unwrap_or_default();
+    // Drain the readers, but cap it: the child may have exited while a leaked
+    // grandchild still holds the pipes open (e.g. `foo &`), which would
+    // otherwise hang the turn forever. Whatever was captured so far survives.
+    let drained = tokio::time::timeout(Duration::from_secs(DRAIN_GRACE_SECS), async {
+        let _ = (&mut out_task).await;
+        let _ = (&mut err_task).await;
+    })
+    .await
+    .is_ok();
+    out_task.abort();
+    err_task.abort();
+
+    let stdout = out_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let stderr = err_buf.lock().map(|b| b.clone()).unwrap_or_default();
     let mut text = String::from_utf8_lossy(&stdout).to_string();
     let err = String::from_utf8_lossy(&stderr);
     if !err.is_empty() {
         text.push_str("\nSTDERR:\n");
         text.push_str(&err);
     }
-    text.push_str(&format!("\nexit: {}", status.code().unwrap_or(-1)));
+    if timed_out {
+        text.push_str(&format!(
+            "\n[command timed out after {}s and was killed; output may be partial]",
+            exec_timeout.as_secs()
+        ));
+    } else if !drained {
+        text.push_str(
+            "\n[a background process kept output open; captured what was available]",
+        );
+    }
+    text.push_str(&format!("\nexit: {status_code}"));
     Ok(ToolResult {
         output: truncate_output(&text, MAX_EXEC_CHARS),
         risk: ToolRisk::High,
@@ -752,52 +957,93 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Normalize a path-ish string for substring matching: drop the Windows `\\?\`
+/// verbatim prefix `std::fs::canonicalize` adds, unify slashes, and lowercase
+/// on Windows (its paths are case-insensitive). Without this the workspace
+/// allow-check could never match — `canonicalize` returns `\\?\C:\proj` while
+/// the model writes `C:\proj`, so every in-workspace absolute path was blocked.
+fn norm_path_str(s: &str) -> String {
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let s = s.replace('\\', "/");
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
 /// Best-effort: reject obvious workspace escapes in sandboxed shell commands.
+/// Text-based and deliberately conservative — real confinement is the child's
+/// cwd plus the per-path checks; this just stops the model from casually
+/// reaching outside via absolute paths, `..`, or `~`.
 fn sandbox_check_command(cmd: &str, workspace: &Path) -> Result<(), LocalCodeError> {
     let ws = std::fs::canonicalize(workspace)
         .map_err(|e| LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string()))?;
+    let ws_s = norm_path_str(&ws.display().to_string());
+    let cmd_n = norm_path_str(cmd);
+    // A flagged path is allowed only if the (normalized) command still points
+    // inside the workspace path string.
+    let outside = |flagged: bool| flagged && !cmd_n.contains(&ws_s);
 
-    // Absolute paths (Unix / Windows) that are not under the workspace.
-    let re = regex::Regex::new(
-        r#"(?x)
-        (?:^|[\s"'`=])
-        (
-            /(?:bin|boot|dev|etc|home|lib|mnt|opt|proc|root|run|sbin|sys|tmp|usr|var)(?:/|\s|$)|
-            [A-Za-z]:\\(?:Windows|Users|Program\sFiles)(?:\\|\s|$)|
-            ~(?:/|\\)
+    let block = |what: &str, hint: &'static str| -> Result<(), LocalCodeError> {
+        Err(LocalCodeError::new(
+            ErrorCode::AgentToolFailed,
+            format!("Shell sandbox: {what}"),
         )
-        "#,
-    )
-    .unwrap_or_else(|_| regex::Regex::new(r"a^").expect("fallback"));
+        .with_cause("Safety confinement")
+        .with_hint(hint))
+    };
 
-    if re.is_match(cmd) {
-        // Allow if the match is clearly still under the workspace path string.
-        let ws_s = ws.display().to_string();
-        if !cmd.contains(&ws_s) {
-            return Err(LocalCodeError::new(
-                ErrorCode::AgentToolFailed,
-                "Shell sandbox: command references a path outside the workspace",
-            )
-            .with_cause("Safety confinement")
-            .with_hint(
-                "Use relative paths under the workspace, or disable agent.shell_sandbox in config",
-            ));
-        }
+    let matches = |pattern: &str| {
+        regex::Regex::new(pattern)
+            .map(|re| re.is_match(cmd))
+            .unwrap_or(false)
+    };
+
+    // Parent-directory traversal climbs out of the workspace wherever cwd is.
+    // (`a..b` git ranges aren't matched — `..` must follow a path separator.)
+    if matches(r#"(?:^|[\s"'`=(;|&/\\])\.\.(?:[/\\]|\s|$)"#) {
+        return block(
+            "parent-directory (`..`) traversal is blocked",
+            "Use relative paths under the workspace, or disable agent.shell_sandbox in config",
+        );
     }
 
-    // `cd` to absolute locations outside workspace.
-    let cd_re = regex::Regex::new(r"(?i)\bcd\s+(/|[A-Za-z]:\\|~)").ok();
-    if let Some(re) = cd_re {
-        if re.is_match(cmd) {
-            let ws_s = ws.display().to_string();
-            if !cmd.contains(&ws_s) {
-                return Err(LocalCodeError::new(
-                    ErrorCode::AgentToolFailed,
-                    "Shell sandbox: cd outside the workspace is blocked",
-                )
-                .with_hint("Use working_directory for a workspace subfolder instead"));
-            }
-        }
+    // Home-directory references resolve outside the workspace.
+    if matches(
+        r#"(?i)(?:^|[\s"'`=(;|&])~[/\\]|\$home\b|\$\{home\}|\$env:userprofile|\$env:home|%userprofile%|%homepath%"#,
+    ) {
+        return block(
+            "home-directory references (~ / $HOME / %USERPROFILE%) are blocked",
+            "Use paths under the workspace instead",
+        );
+    }
+
+    // Absolute paths: Unix system roots, any Windows drive, or a UNC share.
+    if outside(matches(
+        r#"(?xi)
+        (?:^|[\s"'`=(;|&])
+        (
+            /(?:bin|boot|dev|etc|home|lib|mnt|opt|proc|root|run|sbin|sys|tmp|usr|var)(?:/|\s|$)|
+            [a-z]:[/\\]|
+            \\\\[a-z0-9._-]+\\
+        )
+        "#,
+    )) {
+        return block(
+            "command references a path outside the workspace",
+            "Use relative paths under the workspace, or disable agent.shell_sandbox in config",
+        );
+    }
+
+    // `cd`/`pushd`/`Set-Location` to an absolute, parent, or UNC location.
+    if outside(matches(
+        r#"(?i)\b(?:cd|chdir|pushd|set-location|push-location)\s+["'`]?(/|[a-z]:[/\\]|~|\.\.|\\\\)"#,
+    )) {
+        return block(
+            "changing directory outside the workspace is blocked",
+            "Use working_directory for a workspace subfolder instead",
+        );
     }
 
     Ok(())
@@ -837,10 +1083,10 @@ fn is_destructive(cmd: &str) -> bool {
         r"\bmkfs\.",
         r"\bdiskpart\b",
         r"\bformat-volume\b",
-        r"\bci\s+\{", // PowerShell destructive script blocks often in ci - skip
-        r"remove-item\b",
         r"\btruncate\b.*-s\s*0",
-        r":\s*>\s*",
+        // `: > file` / `:>file` truncation, anchored so it doesn't fire on an
+        // innocent `foo:>bar` substring.
+        r"(?:^|[\s;&|(])\s*:\s*>",
     ];
     patterns.iter().any(|p| {
         regex::Regex::new(p)
@@ -1104,5 +1350,116 @@ mod tests {
         reg.execute(&read, dir.path(), ApprovalMode::ApproveEdits, None, None)
             .await
             .unwrap();
+    }
+
+    fn edit_call(path: &str, old: &str, new: &str, all: bool) -> ToolCall {
+        ToolCall {
+            id: "e".into(),
+            name: "edit".into(),
+            arguments: json!({
+                "path": path, "old_string": old, "new_string": new, "replace_all": all
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_unique_string() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("f.txt"), "alpha beta gamma").unwrap();
+        reg.execute(
+            &edit_call("f.txt", "beta", "DELTA", false),
+            dir.path(),
+            ApprovalMode::Auto,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let got = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+        assert_eq!(got, "alpha DELTA gamma");
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_ambiguous_and_missing() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("f.txt"), "x x x").unwrap();
+        // Not unique without replace_all.
+        let err = reg
+            .execute(&edit_call("f.txt", "x", "y", false), dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not unique"), "{}", err.message);
+        // replace_all touches every occurrence and leaves the rest intact.
+        reg.execute(&edit_call("f.txt", "x", "y", true), dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "y y y");
+        // Missing text errors rather than silently doing nothing.
+        let err = reg
+            .execute(&edit_call("f.txt", "zzz", "q", false), dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not found"), "{}", err.message);
+    }
+
+    #[test]
+    fn edit_is_gated_like_write() {
+        let e = edit_call("a.txt", "a", "b", false);
+        // Auto: only destructive bash gates, edits run freely.
+        assert!(approval_request(&e, ApprovalMode::Auto).is_none());
+        // ApproveEdits + AskPermission both gate an edit.
+        assert!(approval_request(&e, ApprovalMode::ApproveEdits).is_some());
+        assert!(approval_request(&e, ApprovalMode::AskPermission).is_some());
+        assert!(approval_request(&e, ApprovalMode::AlwaysApprove).is_none());
+    }
+
+    #[test]
+    fn sandbox_allows_absolute_path_inside_workspace() {
+        // The bug: canonicalize() returns a `\\?\` verbatim path on Windows, so
+        // the allow-check never matched and in-workspace absolute paths were
+        // wrongly blocked. An absolute path under the workspace must pass.
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let inside = ws.join("src").display().to_string();
+        let cmd = format!("cat {inside}/main.rs");
+        assert!(
+            sandbox_check_command(&cmd, &ws).is_ok(),
+            "in-workspace absolute path should be allowed: {cmd}"
+        );
+    }
+
+    #[test]
+    fn sandbox_blocks_traversal_home_and_outside() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(sandbox_check_command("cat ../../etc/passwd", &ws).is_err());
+        assert!(sandbox_check_command("cat ~/secrets", &ws).is_err());
+        assert!(sandbox_check_command("type $env:USERPROFILE\\x", &ws).is_err());
+        // A git revision range (`a..b`) is not path traversal.
+        assert!(sandbox_check_command("git log main..HEAD", &ws).is_ok());
+        // A plain relative command is fine.
+        assert!(sandbox_check_command("cargo build", &ws).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ls_rejects_escaping_path() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let reg = ToolRegistry::default_tools();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "ls".into(),
+            arguments: json!({"path": "../"}),
+        };
+        // Previously this silently listed the workspace root; now it errors.
+        assert!(reg
+            .execute(&call, &ws, ApprovalMode::Auto, None, None)
+            .await
+            .is_err());
     }
 }

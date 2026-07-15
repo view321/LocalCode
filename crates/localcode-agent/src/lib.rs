@@ -285,7 +285,11 @@ impl CodingAgent {
             .unwrap_or_default();
 
         Self {
-            tools: ToolRegistry::new(config.disabled_tools.clone(), config.shell_sandbox),
+            tools: ToolRegistry::new(
+                config.disabled_tools.clone(),
+                config.shell_sandbox,
+                config.bash_timeout_secs,
+            ),
             skills: SkillLoader::new(skills_dir),
             config,
             http,
@@ -296,6 +300,14 @@ impl CodingAgent {
     /// Attach a Hugging Face client so the agent can search models and read cards.
     pub fn with_hf(mut self, hf: Arc<HfClient>) -> Self {
         self.hf = Some(hf);
+        self
+    }
+
+    /// Reuse a shared HTTP client instead of the per-agent one built in `new`.
+    /// The agent is reconstructed each turn, so sharing keeps the connection
+    /// pool warm rather than discarding it every turn.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
         self
     }
 
@@ -335,23 +347,44 @@ impl CodingAgent {
             debug!(healed, "dropped incomplete trailing tool exchange from history");
         }
 
-        session.messages.push(ChatMessage::user(user_text));
+        // If the previous turn failed before the model replied, the identical
+        // user message is still the tail — a retry must not duplicate it.
+        let is_retry = session
+            .messages
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == user_text);
+        if !is_retry {
+            session.messages.push(ChatMessage::user(user_text));
+        }
 
         // Compact older history before this turn if over budget.
         self.maybe_auto_compact(session, runtime, api_key).await;
 
         let system = self.build_system_prompt(session);
         let mut final_text = String::new();
-        // Loop breaker: track recent signatures; block exact repeats and
-        // short alternating loops so local models cannot thrash forever.
-        let mut recent_sigs: Vec<String> = Vec::new();
-        let mut blocked_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Loop breaker: count how often each call signature has *failed*. A
+        // signature that already failed `MAX_SIG_FAILURES` times is blocked on
+        // its next attempt. Successful calls never accumulate, so a legitimate
+        // repeat (re-reading a file just written, a verify/edit/verify loop)
+        // is never blocked — only genuine thrashing on a failing call is.
+        let mut failed_sig_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        // Once a runtime has emitted a real (native) tool call, never scrape
+        // `tool:name {…}` lines out of its prose again — otherwise a final
+        // answer that merely *documents* the pseudo-syntax would execute.
+        let mut saw_native_tool_calls = false;
 
         for round in 0..self.config.max_tool_rounds {
             info!(round, "agent tool round");
-            let response = self
+            let mut response = self
                 .chat_completion(runtime, api_key, &system, session, events)
                 .await?;
+            if response.tool_calls.is_some() {
+                saw_native_tool_calls = true;
+            } else if !saw_native_tool_calls {
+                // Fallback for models without native tool-call support.
+                apply_pseudo_tool_fallback(&mut response);
+            }
 
             if !response.streamed {
                 if let Some(t) = response.thinking.as_deref().filter(|c| !c.is_empty()) {
@@ -381,14 +414,9 @@ impl CodingAgent {
                     );
 
                     let sig = format!("{}|{}", tc.name, tc.arguments);
-                    let block = should_block_tool_sig(&sig, &recent_sigs, &blocked_sigs);
-                    if block {
-                        blocked_sigs.insert(sig.clone());
-                    }
-                    recent_sigs.push(sig.clone());
-                    if recent_sigs.len() > 12 {
-                        recent_sigs.remove(0);
-                    }
+                    const MAX_SIG_FAILURES: u32 = 2;
+                    let block =
+                        failed_sig_counts.get(&sig).copied().unwrap_or(0) >= MAX_SIG_FAILURES;
 
                     let skill_body = if tc.name == "skill" {
                         self.skill_body_for_call(&tc)
@@ -400,7 +428,7 @@ impl CodingAgent {
                         Err(LocalCodeError::new(
                             ErrorCode::AgentToolFailed,
                             format!(
-                                "Tool call loop detected for {} — not executed",
+                                "Tool call to {} failed repeatedly with the same arguments — not retried",
                                 tc.name
                             ),
                         )
@@ -416,6 +444,11 @@ impl CodingAgent {
                         )
                         .await
                     };
+
+                    // Only failures count toward the loop breaker.
+                    if !block && result.is_err() {
+                        *failed_sig_counts.entry(sig).or_insert(0) += 1;
+                    }
 
                     let content = match &result {
                         Ok(r) => r.output.clone(),
@@ -464,10 +497,10 @@ impl CodingAgent {
                 .unwrap_or(false);
             if last_is_tool || last_is_assistant_with_tools || session.messages.last().map(|m| m.role == "user").unwrap_or(false) {
                 // Only append if we didn't already push a final assistant text message.
-                let needs = match session.messages.last() {
-                    Some(m) if m.role == "assistant" && m.tool_calls.is_none() => false,
-                    _ => true,
-                };
+                let needs = !matches!(
+                    session.messages.last(),
+                    Some(m) if m.role == "assistant" && m.tool_calls.is_none()
+                );
                 if needs {
                     session
                         .messages
@@ -497,6 +530,13 @@ impl CodingAgent {
 
     /// Summarize older turns when over budget; fall back to leaving compaction
     /// unset (trimmed_tail still applies).
+    ///
+    /// Measures the *live* request view (prior summary + messages after the last
+    /// compaction point), not the whole stored history — otherwise, once a
+    /// session crossed the budget, first_kept would advance nearly every turn
+    /// and each turn would pay a fresh summarization round-trip. Each pass folds
+    /// the prior summary and only the newly-dropped slice, so nothing between an
+    /// old cut and the new one silently vanishes.
     async fn maybe_auto_compact(
         &self,
         session: &mut AgentSession,
@@ -506,37 +546,49 @@ impl CodingAgent {
         if !self.config.auto_compact || self.config.max_history_chars == 0 {
             return;
         }
-        let total: usize = session.messages.iter().map(approx_chars).sum();
-        if total <= self.config.max_history_chars {
+        let prior = session.compaction.clone();
+        let base = prior
+            .as_ref()
+            .map(|c| c.first_kept_index.min(session.messages.len()))
+            .unwrap_or(0);
+        let summary_len = prior
+            .as_ref()
+            .map(|c| c.summary.chars().count())
+            .unwrap_or(0);
+        let live: usize =
+            summary_len + session.messages[base..].iter().map(approx_chars).sum::<usize>();
+        if live <= self.config.max_history_chars {
             return;
         }
         let keep = self.config.compact_keep_recent_chars.max(1);
         let first_kept = first_kept_index(&session.messages, keep);
-        if first_kept == 0 {
+        // Only compact when the cut actually advances past what's already
+        // summarized (avoids re-summarizing the same span every turn).
+        if first_kept <= base {
             return;
         }
-        // Don't re-compact the same cut point.
-        if session
-            .compaction
-            .as_ref()
-            .is_some_and(|c| c.first_kept_index == first_kept)
+        let to_sum = &session.messages[base..first_kept];
+        if to_sum.is_empty() {
+            return;
+        }
+        let prior_summary = prior.as_ref().map(|c| c.summary.as_str());
+        let summary = match self
+            .summarize_history(runtime, api_key, prior_summary, to_sum)
+            .await
         {
-            return;
-        }
-        let to_sum = &session.messages[..first_kept];
-        let summary = match self.summarize_history(runtime, api_key, to_sum).await {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => fallback_summary(to_sum),
+            _ => fallback_summary(prior_summary, to_sum),
         };
         info!(
             first_kept,
-            chars_before = total,
+            base,
+            chars_live = live,
             "auto-compacted session history"
         );
         session.compaction = Some(SessionCompaction {
             first_kept_index: first_kept,
             summary,
-            chars_before: total,
+            chars_before: live,
         });
     }
 
@@ -544,26 +596,42 @@ impl CodingAgent {
         &self,
         runtime: &ActiveRuntime,
         api_key: Option<&str>,
+        prior_summary: Option<&str>,
         messages: &[ChatMessage],
     ) -> Result<String, LocalCodeError> {
-        let mut transcript = String::new();
-        for m in messages.iter().take(80) {
-            let role = &m.role;
-            let content = preview(&m.content, 400);
-            transcript.push_str(&format!("{role}: {content}\n"));
+        // Build the transcript from the end backward under a char budget, then
+        // restore chronological order: this keeps the summary contiguous with
+        // the kept tail even when the dropped slice is very large (the old
+        // `take(80)` silently dropped everything past the 80th message).
+        const TRANSCRIPT_BUDGET: usize = 24_000;
+        let mut lines: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        for m in messages.iter().rev() {
+            let mut line = format!("{}: {}", m.role, preview(&m.content, 400));
             if let Some(t) = &m.thinking {
-                transcript.push_str(&format!("  (thinking: {})\n", preview(t, 200)));
+                line.push_str(&format!("\n  (thinking: {})", preview(t, 200)));
+            }
+            used += line.chars().count() + 1;
+            lines.push(line);
+            if used >= TRANSCRIPT_BUDGET {
+                break;
             }
         }
+        lines.reverse();
+        let transcript = lines.join("\n");
         let system = "Summarize the earlier coding-agent conversation for continuity. \
+Fold any prior summary together with the newer turns into a single summary. \
 Keep goals, decisions, file paths touched, and unfinished work. Be concise (under 600 words). \
 No tools — reply with the summary only.";
+        let user = match prior_summary {
+            Some(prev) => format!(
+                "Summary so far:\n{prev}\n\nNewer turns to fold in:\n\n{transcript}"
+            ),
+            None => format!("Conversation to summarize:\n\n{transcript}"),
+        };
         let body_msgs = vec![
             json!({"role": "system", "content": system}),
-            json!({
-                "role": "user",
-                "content": format!("Conversation to summarize:\n\n{transcript}")
-            }),
+            json!({"role": "user", "content": user}),
         ];
         let text = self
             .simple_completion(runtime, api_key, body_msgs, false)
@@ -630,10 +698,34 @@ No tools — reply with the summary only.";
         approver: Option<&dyn ToolApprover>,
         skill_body: Option<String>,
     ) -> Result<ToolResult, LocalCodeError> {
-        match call.name.as_str() {
-            "hf.model_card" => return self.tool_hf_model_card(call).await,
-            "hf.search" => return self.tool_hf_search(call).await,
-            _ => {}
+        // HF catalogue tools are served here rather than by the registry, so
+        // they must honor the same enable + approval gate the registry applies
+        // to everything else (previously they bypassed both).
+        if matches!(call.name.as_str(), "hf.model_card" | "hf.search") {
+            if !self.tools.is_enabled(&call.name) {
+                return Err(LocalCodeError::new(
+                    ErrorCode::AgentToolFailed,
+                    format!("Tool '{}' is disabled in LocalCode settings", call.name),
+                )
+                .with_hint("Enable it in Settings → tools if you want the agent to use it"));
+            }
+            if let Some(request) = approval_request(call, self.config.approval()) {
+                let approved = match approver {
+                    Some(a) => a.approve(&request).await,
+                    None => false,
+                };
+                if !approved {
+                    return Err(LocalCodeError::new(
+                        ErrorCode::Cancelled,
+                        format!("Tool call not approved: {}", call.name),
+                    )
+                    .with_hint("The user declined (or no interactive approval is available)"));
+                }
+            }
+            return match call.name.as_str() {
+                "hf.model_card" => self.tool_hf_model_card(call).await,
+                _ => self.tool_hf_search(call).await,
+            };
         }
         self.tools
             .execute(
@@ -691,7 +783,14 @@ No tools — reply with the summary only.";
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("coding");
-        let results = hf.search(query, true, 8, "downloads").await?;
+        // Default to the coding-biased filter (this is a coding tool), but let
+        // the model opt into the full catalogue for embeddings/vision/etc.
+        let coding_only = call
+            .arguments
+            .get("coding_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let results = hf.search(query, coding_only, 8, "downloads").await?;
         let lines: Vec<String> = results
             .iter()
             .map(|m| {
@@ -894,7 +993,7 @@ Never repeat an identical failing call or alternate between two failing calls."
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("text/event-stream"));
 
-        let mut response = if stream && is_event_stream {
+        let response = if stream && is_event_stream {
             self.read_sse_response(resp, events).await?
         } else {
             let v: Value = resp
@@ -903,31 +1002,6 @@ Never repeat an identical failing call or alternate between two failing calls."
                 .map_err(|e| LocalCodeError::new(ErrorCode::Internal, e.to_string()))?;
             parse_full_response(&v)?
         };
-
-        // Fallback for models without native tool-call support: lines of the
-        // form `tool:read {"path": "..."}` (all matching lines).
-        if response.tool_calls.is_none() {
-            if let Some(ref c) = response.content {
-                let tcs = parse_pseudo_tools(c);
-                if !tcs.is_empty() {
-                    let raw: Vec<Value> = tcs
-                        .iter()
-                        .map(|tc| {
-                            json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.arguments.to_string(),
-                                }
-                            })
-                        })
-                        .collect();
-                    response.raw_tool_calls = Some(Value::Array(raw));
-                    response.tool_calls = Some(tcs);
-                }
-            }
-        }
 
         Ok(response)
     }
@@ -1185,13 +1259,10 @@ impl ThinkTagFilter {
             }
             let lower = self.hold.to_ascii_lowercase();
             if self.in_think {
-                let close = if let Some(i) = lower.find("</think>") {
-                    Some((i, 8))
-                } else if let Some(i) = lower.find("</thinking>") {
-                    Some((i, 11))
-                } else {
-                    None
-                };
+                let close = lower
+                    .find("</think>")
+                    .map(|i| (i, 8))
+                    .or_else(|| lower.find("</thinking>").map(|i| (i, 11)));
                 if let Some((i, n)) = close {
                     let body = self.hold[..i].to_string();
                     if !body.is_empty() {
@@ -1210,13 +1281,10 @@ impl ThinkTagFilter {
                 }
                 break;
             } else {
-                let open = if let Some(i) = lower.find("<think>") {
-                    Some((i, 7))
-                } else if let Some(i) = lower.find("<thinking>") {
-                    Some((i, 10))
-                } else {
-                    None
-                };
+                let open = lower
+                    .find("<think>")
+                    .map(|i| (i, 7))
+                    .or_else(|| lower.find("<thinking>").map(|i| (i, 10)));
                 if let Some((i, n)) = open {
                     let body = self.hold[..i].to_string();
                     if !body.is_empty() {
@@ -1253,11 +1321,21 @@ impl ThinkTagFilter {
 }
 
 /// Bytes at the end of `lower` that could still grow into one of `tags`.
+///
+/// `keep` is a byte count, but a streamed chunk can end mid-character (a
+/// multi-byte char split across SSE frames), so we must only slice at char
+/// boundaries — indexing inside a `char` panics. Tags are ASCII, so a suffix
+/// starting inside a multi-byte char can never prefix one; skipping non-boundary
+/// offsets is both safe and correct.
 fn partial_tag_suffix(lower: &str, tags: &[&str]) -> usize {
     let max = tags.iter().map(|t| t.len()).max().unwrap_or(0);
     let n = lower.len().min(max.saturating_sub(1));
     for keep in (1..=n).rev() {
-        let suffix = &lower[lower.len() - keep..];
+        let idx = lower.len() - keep;
+        if !lower.is_char_boundary(idx) {
+            continue;
+        }
+        let suffix = &lower[idx..];
         if tags.iter().any(|t| t.starts_with(suffix)) {
             return keep;
         }
@@ -1298,11 +1376,19 @@ impl SseAccumulator {
                     self.tool_calls.resize(idx + 1, PartialToolCall::default());
                 }
                 let slot = &mut self.tool_calls[idx];
-                if let Some(id) = tc["id"].as_str() {
-                    slot.id.push_str(id);
+                // id and name are sent once (first delta) per the OpenAI spec;
+                // take the first non-empty value. Some servers resend the full
+                // id/name on every chunk — appending would corrupt them (e.g.
+                // `call_9call_9`). Only `arguments` is a genuine fragment stream.
+                if slot.id.is_empty() {
+                    if let Some(id) = tc["id"].as_str() {
+                        slot.id.push_str(id);
+                    }
                 }
-                if let Some(name) = tc["function"]["name"].as_str() {
-                    slot.name.push_str(name);
+                if slot.name.is_empty() {
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        slot.name.push_str(name);
+                    }
                 }
                 if let Some(args) = tc["function"]["arguments"].as_str() {
                     slot.arguments.push_str(args);
@@ -1498,46 +1584,16 @@ fn first_kept_index(messages: &[ChatMessage], keep: usize) -> usize {
     start
 }
 
-fn fallback_summary(messages: &[ChatMessage]) -> String {
+fn fallback_summary(prior_summary: Option<&str>, messages: &[ChatMessage]) -> String {
     let mut lines = vec!["Earlier conversation (auto-summary fallback):".to_string()];
+    if let Some(prev) = prior_summary {
+        lines.push(prev.to_string());
+        lines.push("--- newer turns ---".to_string());
+    }
     for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant").take(20) {
         lines.push(format!("{}: {}", m.role, preview(&m.content, 160)));
     }
     lines.join("\n")
-}
-
-/// Block exact 3-in-a-row repeats and 2-signature alternating thrash.
-fn should_block_tool_sig(
-    sig: &str,
-    recent: &[String],
-    blocked: &std::collections::HashSet<String>,
-) -> bool {
-    if blocked.contains(sig) {
-        return true;
-    }
-    // Three identical in a row (including this one).
-    let n = recent.len();
-    if n >= 2 && recent[n - 1] == sig && recent[n - 2] == sig {
-        return true;
-    }
-    // Alternating A B A B A with this as the next A or B.
-    if n >= 4 {
-        let a = &recent[n - 2];
-        let b = &recent[n - 1];
-        if a != b
-            && recent[n - 4] == *a
-            && recent[n - 3] == *b
-            && ((sig == a.as_str() && b.as_str() != sig) || (sig == b.as_str() && a.as_str() != sig))
-        {
-            // Pattern A B A B + next is A or B again
-            if sig == a.as_str() || sig == b.as_str() {
-                return true;
-            }
-        }
-    }
-    // Count occurrences of this sig in recent window.
-    let count = recent.iter().filter(|s| s.as_str() == sig).count();
-    count >= 3
 }
 
 fn resolve_skills_dir(config: &AgentConfig) -> PathBuf {
@@ -1587,13 +1643,57 @@ fn read_agents_md(workspace: &std::path::Path) -> Option<String> {
     None
 }
 
-/// Parse all pseudo tool-call lines: `tool:name {...}` at line start.
+/// Turn `tool:name {…}` lines in `response.content` into tool calls, for
+/// runtimes that can't emit native tool calls. Only used until the runtime
+/// proves it can (see `saw_native_tool_calls`).
+fn apply_pseudo_tool_fallback(response: &mut LlmResponse) {
+    if response.tool_calls.is_some() {
+        return;
+    }
+    let Some(content) = response.content.as_deref() else {
+        return;
+    };
+    let tcs = parse_pseudo_tools(content);
+    if tcs.is_empty() {
+        return;
+    }
+    let raw: Vec<Value> = tcs
+        .iter()
+        .map(|tc| {
+            json!({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": tc.arguments.to_string(),
+                }
+            })
+        })
+        .collect();
+    response.raw_tool_calls = Some(Value::Array(raw));
+    response.tool_calls = Some(tcs);
+}
+
+/// Parse all pseudo tool-call lines: `tool:name {...}` at line start. Lines
+/// inside fenced code blocks (```) are ignored so a model documenting the
+/// syntax in its answer doesn't accidentally trigger a tool call.
 fn parse_pseudo_tools(text: &str) -> Vec<ToolCall> {
-    let Ok(re) = regex::Regex::new(r"(?m)^\s*tool:([\w.]+)\s+(\{.*\})\s*$") else {
+    let Ok(re) = regex::Regex::new(r"^\s*tool:([\w.]+)\s+(\{.*\})\s*$") else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for caps in re.captures_iter(text) {
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
         let Ok(arguments) = serde_json::from_str::<Value>(&caps[2]) else {
             continue;
         };
@@ -1883,5 +1983,85 @@ mod tests {
         assert!(err.message.contains("model exploded"));
         // Garbage payloads are skipped, not fatal.
         assert!(acc.feed("not json").unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_tag_suffix_is_char_boundary_safe() {
+        // Regression: slicing at a raw byte offset inside a multi-byte char
+        // used to panic. A chunk ending mid-character must not.
+        let tags = ["<think>", "<thinking>"];
+        assert_eq!(partial_tag_suffix("café", &tags), 0);
+        assert_eq!(partial_tag_suffix("plan —", &tags), 0);
+        assert_eq!(partial_tag_suffix("日本語", &tags), 0);
+        // ASCII partial tags still match.
+        assert_eq!(partial_tag_suffix("answer <thi", &tags), 4);
+    }
+
+    #[test]
+    fn streamed_multibyte_think_content_does_not_panic() {
+        // Multi-byte content flowing through the incremental think-tag filter
+        // (which was the site of the char-boundary panic). Must split cleanly.
+        let mut acc = SseAccumulator::default();
+        for payload in [
+            r#"{"choices":[{"delta":{"content":"<think>café"}}]}"#,
+            r#"{"choices":[{"delta":{"content":" 日本語</think>done—"}}]}"#,
+        ] {
+            acc.feed(payload).unwrap();
+        }
+        let resp = acc.finish();
+        assert_eq!(resp.content.as_deref(), Some("done—"));
+        assert!(resp.thinking.as_deref().unwrap().contains("café"));
+    }
+
+    #[test]
+    fn pseudo_tools_ignore_fenced_code() {
+        // A real directive at line start parses…
+        assert_eq!(parse_pseudo_tools("tool:ls {\"path\": \".\"}").len(), 1);
+        // …but the same text inside a code fence (e.g. the model documenting
+        // the syntax in its final answer) must not.
+        let fenced = "Here's how it works:\n```\ntool:bash {\"command\": \"rm -rf /\"}\n```\ndone";
+        assert!(parse_pseudo_tools(fenced).is_empty());
+    }
+
+    #[test]
+    fn pseudo_fallback_skipped_once_native_seen() {
+        // Simulates the run_turn gate: after a native tool call, prose that
+        // merely mentions the pseudo-syntax is left alone.
+        let mut resp = LlmResponse {
+            content: Some("tool:bash {\"command\": \"echo hi\"}".into()),
+            thinking: None,
+            tool_calls: None,
+            raw_tool_calls: None,
+            streamed: false,
+        };
+        // With the gate "off" (no native seen), the fallback would fire:
+        apply_pseudo_tool_fallback(&mut resp);
+        assert!(resp.tool_calls.is_some());
+    }
+
+    #[test]
+    fn sse_tool_call_id_not_duplicated_when_resent() {
+        // Some servers resend the full id/name on every chunk; appending would
+        // yield "call_9call_9". Set-once keeps them intact.
+        let mut acc = SseAccumulator::default();
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"read","arguments":"{\"p"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"read","arguments":"\":1}"}}]}}]}"#,
+        ] {
+            acc.feed(payload).unwrap();
+        }
+        let resp = acc.finish();
+        let calls = resp.tool_calls.unwrap();
+        assert_eq!(calls[0].id, "call_9");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["p"], 1);
+    }
+
+    #[test]
+    fn fallback_summary_folds_prior() {
+        let msgs = vec![ChatMessage::user("newer question")];
+        let s = fallback_summary(Some("PRIOR SUMMARY TEXT"), &msgs);
+        assert!(s.contains("PRIOR SUMMARY TEXT"));
+        assert!(s.contains("newer question"));
     }
 }

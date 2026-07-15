@@ -668,6 +668,9 @@ pub struct App {
     session: Arc<AsyncMutex<AgentSession>>,
     /// Append-only JSONL store when sessions_enabled; None if persistence off.
     session_store: Arc<AsyncMutex<Option<SessionStore>>>,
+    /// Shared HTTP client for coding turns, so the connection pool survives the
+    /// per-turn agent rebuild.
+    coding_http: reqwest::Client,
     bg_tx: mpsc::UnboundedSender<BgMsg>,
     bg_rx: mpsc::UnboundedReceiver<BgMsg>,
     pub busy: Option<Busy>,
@@ -719,6 +722,11 @@ impl App {
             bootstrap_session(&config.agent, &paths, workspace);
 
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+
+        let coding_http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
 
         let mut app = Self {
             theme: Theme::new(config.ui.theme),
@@ -837,6 +845,7 @@ impl App {
             hf,
             session,
             session_store,
+            coding_http,
             bg_tx,
             bg_rx,
             busy: None,
@@ -1044,6 +1053,20 @@ impl App {
                 self.coding_transcript
                     .push(TranscriptEntry::new(EntryKind::System, "turn cancelled"));
                 self.coding_follow = true;
+                // Persist whatever the aborted turn produced. Aborting drops the
+                // turn task's session lock, so this sync can acquire it; without
+                // it, a cancelled turn is lost from the session file (the only
+                // sync call lived at the end of the turn task, past the abort).
+                let session = self.session.clone();
+                let store = self.session_store.clone();
+                tokio::spawn(async move {
+                    let session = session.lock().await;
+                    if let Some(store) = store.lock().await.as_mut() {
+                        if let Err(e) = store.sync(&session) {
+                            tracing::warn!(error = %e, "failed to persist cancelled coding turn");
+                        }
+                    }
+                });
             }
             if b.kind == BusyKind::Remote {
                 self.remote_connecting = None;
@@ -2240,6 +2263,7 @@ impl App {
         let session_store = self.session_store.clone();
         let tx = self.bg_tx.clone();
         let approver_tx = self.bg_tx.clone();
+        let coding_http = self.coding_http.clone();
         let hf_arc = self.hf.clone().map(std::sync::Arc::new);
         let paths = self.paths.clone();
         let config = self.config.clone();
@@ -2279,7 +2303,7 @@ impl App {
                 r
             };
 
-            let mut agent = CodingAgent::new(agent_cfg);
+            let mut agent = CodingAgent::new(agent_cfg).with_http_client(coding_http);
             if let Some(hf) = hf_arc {
                 agent = agent.with_hf(hf);
             }
@@ -3817,8 +3841,18 @@ impl App {
     /// text plus each referenced file's contents in a fenced block. Returns the
     /// expanded prompt and the list of attached paths (for transcript feedback).
     fn expand_at_context(&mut self, input: &str) -> (String, Vec<String>) {
-        const PER_FILE_CHARS: usize = 24_000;
-        const TOTAL_CHARS: usize = 96_000;
+        // Keep attachments within the model's history budget. `trimmed_tail`
+        // never splits a single user message, so an attachment larger than the
+        // budget would guarantee context overflow on the small local models
+        // this targets. Reserve ~3/4 of the budget for attachments, leaving room
+        // for the prompt, system, and tool schemas.
+        let budget = self.config.agent.max_history_chars;
+        let total_chars = if budget == 0 {
+            96_000
+        } else {
+            (budget.saturating_mul(3) / 4).min(96_000)
+        };
+        let per_file_chars = 24_000.min(total_chars);
         let root = self.workspace_path();
         let mut attached: Vec<String> = Vec::new();
         let mut blocks = String::new();
@@ -3833,15 +3867,15 @@ impl App {
             let Ok(mut content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if content.len() > PER_FILE_CHARS {
-                let mut cut = PER_FILE_CHARS;
+            if content.len() > per_file_chars {
+                let mut cut = per_file_chars;
                 while !content.is_char_boundary(cut) {
                     cut -= 1;
                 }
                 content.truncate(cut);
                 content.push_str("\n… (truncated)");
             }
-            if blocks.len() + content.len() > TOTAL_CHARS {
+            if blocks.len() + content.len() > total_chars {
                 break;
             }
             blocks.push_str(&format!("\n--- {frag} ---\n{content}\n"));

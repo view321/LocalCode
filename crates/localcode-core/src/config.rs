@@ -465,6 +465,11 @@ pub struct AgentConfig {
     /// Confine `bash` to the workspace (cwd + path checks). On by default.
     #[serde(default = "default_true")]
     pub shell_sandbox: bool,
+    /// Wall-clock cap for a single `bash` tool command, in seconds. Builds and
+    /// test suites routinely need more than a couple of minutes; 0 uses the
+    /// built-in default.
+    #[serde(default = "default_bash_timeout_secs")]
+    pub bash_timeout_secs: u64,
 }
 
 impl AgentConfig {
@@ -500,6 +505,7 @@ impl Default for AgentConfig {
             auto_compact: true,
             compact_keep_recent_chars: default_compact_keep_chars(),
             shell_sandbox: true,
+            bash_timeout_secs: default_bash_timeout_secs(),
         }
     }
 }
@@ -756,6 +762,12 @@ fn default_history_chars() -> usize {
     // typically run with, while still leaving room for tool schemas + output.
     48_000
 }
+fn default_bash_timeout_secs() -> u64 {
+    // 5 minutes: long enough for a cold `cargo build`/test run without letting a
+    // genuinely hung command tie up the agent forever.
+    300
+}
+
 fn default_compact_keep_chars() -> usize {
     // Recent tail kept verbatim through a compaction — enough for the current
     // task's tool exchanges without re-triggering compaction immediately.

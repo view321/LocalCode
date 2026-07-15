@@ -106,6 +106,7 @@ impl AssistantAgent {
         let tools = ToolRegistry::new(
             cfg.agent.disabled_tools.clone(),
             cfg.agent.shell_sandbox,
+            cfg.agent.bash_timeout_secs,
         );
         let context_blob = format_context_pack(context);
 
@@ -222,9 +223,19 @@ impl AssistantAgent {
 
         // Single approval path via ToolRegistry (no double-gate).
         // Background auto-repair passes `approver = None`: gated calls are
-        // refused by the registry instead of silently elevated.
+        // refused by the registry instead of silently elevated. But refusal
+        // only happens for *gated* calls, and `AlwaysApprove` gates nothing —
+        // so an unattended run must never use it, or destructive shell would
+        // execute with no human in the loop. Clamp to `Auto` in that case:
+        // destructive commands stay gated (and thus refused) while safe reads
+        // and builds still run.
+        let approval = if approver.is_none() && self.approval == ApprovalMode::AlwaysApprove {
+            ApprovalMode::Auto
+        } else {
+            self.approval
+        };
         self.tools
-            .execute(call, &self.workspace, self.approval, approver, None)
+            .execute(call, &self.workspace, approval, approver, None)
             .await
     }
 
