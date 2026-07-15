@@ -300,6 +300,106 @@ pub fn llamacpp_managed_dir(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("backends").join("llamacpp")
 }
 
+/// Locate `llama-server`: explicit path → configured name on PATH →
+/// `llama-server` on PATH → managed `backends/llamacpp` install tree.
+///
+/// Used by the assistant runtime, CLI `setup`, and install scripts so a
+/// managed binary works even when it is not on PATH.
+pub fn resolve_llamacpp_bin(configured: &str, paths: &AppPaths) -> Option<PathBuf> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return resolve_llamacpp_bin("llama-server", paths);
+    }
+
+    // Absolute or relative path the user already pointed at.
+    let as_path = Path::new(configured);
+    if as_path.is_file() {
+        return Some(as_path.to_path_buf());
+    }
+    if let Ok(p) = which::which(configured) {
+        return Some(p);
+    }
+    // Fall back to the canonical binary name when config has a stale path.
+    if configured != "llama-server" && configured != "llama-server.exe" {
+        if let Ok(p) = which::which("llama-server") {
+            return Some(p);
+        }
+        if cfg!(windows) {
+            if let Ok(p) = which::which("llama-server.exe") {
+                return Some(p);
+            }
+        }
+    }
+
+    let managed = paths.llamacpp_dir();
+    let primary = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    find_file(&managed, primary).or_else(|| find_file(&managed, "llama-server"))
+}
+
+/// Ensure a usable `llama-server` exists: reuse PATH / managed install, or run
+/// the platform install plan (Homebrew or in-app FetchLlamaCpp).
+///
+/// Returns the absolute path to the binary. Callers should persist it as
+/// `backends.llamacpp.bin` so later runs do not depend on PATH.
+pub async fn ensure_llamacpp_installed(
+    paths: &AppPaths,
+    progress: UnboundedSender<String>,
+) -> Result<PathBuf, LocalCodeError> {
+    paths.ensure_dirs()?;
+
+    if let Some(p) = resolve_llamacpp_bin("llama-server", paths) {
+        let _ = progress.send(format!(
+            "llama-server already available at {}",
+            p.display()
+        ));
+        return Ok(p);
+    }
+
+    let plan = resolve_install_plan(BackendKind::LlamaCpp, paths);
+    match &plan {
+        InstallPlan::Automated { display, .. } => {
+            let _ = progress.send(format!("Installing llama.cpp…\n{display}"));
+        }
+        InstallPlan::Manual {
+            summary,
+            steps,
+            url,
+        } => {
+            return Err(LocalCodeError::new(
+                ErrorCode::BackendInstallFailed,
+                summary.clone(),
+            )
+            .with_cause(steps.join("\n"))
+            .with_hint(format!("See {url}"))
+            .with_hint(
+                "Install llama-server manually, then set backends.llamacpp.bin in config.toml",
+            ));
+        }
+    }
+
+    let repoint = run_install(&plan, None, progress.clone()).await?;
+    if let Some(r) = repoint {
+        return Ok(PathBuf::from(r.bin));
+    }
+
+    // Package-manager installs (e.g. brew) leave the binary on PATH without a repoint.
+    if let Some(p) = resolve_llamacpp_bin("llama-server", paths) {
+        let _ = progress.send(format!("llama-server ready at {}", p.display()));
+        return Ok(p);
+    }
+
+    Err(LocalCodeError::new(
+        ErrorCode::BackendBinaryMissing,
+        "llama-server not found after install",
+    )
+    .with_hint("Install llama.cpp from the Backends panel or set backends.llamacpp.bin")
+    .retryable(true))
+}
+
 /// Resolve an install plan against the real environment.
 pub fn resolve_install_plan(kind: BackendKind, paths: &AppPaths) -> InstallPlan {
     let has = |b: &str| which::which(b).is_ok();
@@ -1351,6 +1451,34 @@ mod tests {
             ("llama-b100-bin-win-vulkan-x64.zip".to_string(), "v".to_string()),
         ];
         assert!(pick_llamacpp_asset(&assets, "windows", "x86_64").is_none());
+    }
+
+    #[test]
+    fn resolve_finds_managed_binary_without_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let managed = paths.llamacpp_dir();
+        std::fs::create_dir_all(managed.join("build/bin")).unwrap();
+        let server = if cfg!(windows) {
+            managed.join("build/bin/llama-server.exe")
+        } else {
+            managed.join("build/bin/llama-server")
+        };
+        std::fs::write(&server, b"x").unwrap();
+        let found = resolve_llamacpp_bin("llama-server", &paths).unwrap();
+        assert_eq!(found, server);
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("my-llama-server");
+        std::fs::write(&custom, b"x").unwrap();
+        let paths = AppPaths::from_home(dir.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let found = resolve_llamacpp_bin(custom.to_str().unwrap(), &paths).unwrap();
+        assert_eq!(found, custom);
     }
 
     #[test]

@@ -79,6 +79,12 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Install runtime dependencies (llama-server) and write config paths
+    Setup {
+        /// Skip installing llama-server even if missing
+        #[arg(long)]
+        skip_llama: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -324,7 +330,44 @@ async fn real_main() -> Result<(), LocalCodeError> {
             }
         },
         Commands::Update { check } => run_update(&config, check).await,
+        Commands::Setup { skip_llama } => run_setup(paths, config, skip_llama).await,
     }
+}
+
+/// Headless post-install setup: ensure `llama-server` exists and persist its path.
+async fn run_setup(
+    paths: AppPaths,
+    mut config: Config,
+    skip_llama: bool,
+) -> Result<(), LocalCodeError> {
+    if skip_llama {
+        println!("Skipping llama-server install (--skip-llama).");
+        return Ok(());
+    }
+
+    println!("Ensuring llama-server is installed…");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let printer = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            for part in line.lines() {
+                eprintln!("==> {part}");
+            }
+        }
+    });
+
+    let bin = localcode_backends::ensure_llamacpp_installed(&paths, tx).await?;
+    let _ = printer.await;
+
+    let bin_str = bin.display().to_string();
+    if config.backends.llamacpp.bin != bin_str {
+        config.backends.llamacpp.bin = bin_str.clone();
+        config.save(&paths)?;
+        println!("Wrote backends.llamacpp.bin = {bin_str}");
+    } else {
+        println!("backends.llamacpp.bin already points at {bin_str}");
+    }
+    println!("llama-server ready: {bin_str}");
+    Ok(())
 }
 
 async fn run_update(config: &Config, check_only: bool) -> Result<(), LocalCodeError> {

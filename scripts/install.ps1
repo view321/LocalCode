@@ -146,9 +146,38 @@ function Verify-Install {
     }
 }
 
+# Download/install llama-server into LocalCode's managed data dir and write
+# backends.llamacpp.bin in config.toml. Non-fatal: the app can still start
+# without it (Backends panel / `localcode setup` later).
+function Setup-Llama {
+    if ($env:LOCALCODE_SKIP_LLAMA -eq "1") {
+        Write-Warn "Skipping llama-server setup (LOCALCODE_SKIP_LLAMA=1)"
+        return
+    }
+
+    $bin = Join-Path $BinDir $BinaryName
+    if (-not (Test-Path $bin)) {
+        return
+    }
+
+    Write-Info "Installing llama-server (required for local deploys and the Bonsai assistant)"
+    try {
+        & $bin setup
+        if ($LASTEXITCODE -ne 0) {
+            throw "localcode setup exited with code $LASTEXITCODE"
+        }
+        Write-Info "llama-server ready"
+    }
+    catch {
+        Write-Warn "llama-server setup failed — run: localcode setup"
+        Write-Warn "Or install manually: https://github.com/ggml-org/llama.cpp/releases"
+    }
+}
+
 Write-Info "LocalCode installer"
 Ensure-Rust
 Clone-OrUpdate
 Build-AndInstall
 Ensure-Path
 Verify-Install
+Setup-Llama

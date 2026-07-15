@@ -30,9 +30,10 @@ use localcode_assistant::{
     AssistantContext, LocalAssistantRuntime, ASSISTANT_DISPLAY_NAME, BONSAI_HF_REF, InstallNeed,
 };
 use localcode_backends::{
-    can_elevate_noninteractively, diagnose, resolve_install_plan, resolve_repair, run_install,
-    run_repair, smoke_test, BackendKind, BackendRegistry, DeployRequest, DeployService, DeployTuning,
-    DetectReport, Diagnosis, InstallPlan, RepairPlan, Repoint, SmokeReport, DEFAULT_DEPLOY_CTX,
+    can_elevate_noninteractively, diagnose, ensure_llamacpp_installed, resolve_install_plan,
+    resolve_llamacpp_bin, resolve_repair, run_install, run_repair, smoke_test, BackendKind,
+    BackendRegistry, DeployRequest, DeployService, DeployTuning, DetectReport, Diagnosis,
+    InstallPlan, RepairPlan, Repoint, SmokeReport, DEFAULT_DEPLOY_CTX,
 };
 use localcode_core::config::LocalAssistantPreference;
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
@@ -460,6 +461,8 @@ pub enum BgMsg {
         kind: BackendKind,
         result: Result<Option<Repoint>, LocalCodeError>,
     },
+    /// Silent startup ensure of llama-server (install scripts / first launch).
+    LlamaSetupDone(Result<std::path::PathBuf, LocalCodeError>),
     /// A diagnosed repair: streamed output lines, then the terminal result. On
     /// success the `repoint` (if any) points the backend at the repaired install.
     RepairProgress(String),
@@ -891,6 +894,12 @@ impl App {
             }
         }
 
+        // If llama-server is missing (skipped install script, cargo install, …),
+        // fetch the managed prebuilt in the background so deploys / assistant work.
+        if resolve_llamacpp_bin(&app.config.backends.llamacpp.bin, &app.paths).is_none() {
+            app.ensure_llama_server_background();
+        }
+
         // One-time offer to install the local Bonsai assistant (user can decline).
         if should_offer_install(&app.config) {
             let need = install_need(&app.config, &app.paths);
@@ -918,6 +927,29 @@ impl App {
         }
 
         app
+    }
+
+    /// Background `ensure_llamacpp_installed` when the binary is not yet available.
+    fn ensure_llama_server_background(&mut self) {
+        // Unit tests construct `App` without a Tokio runtime; skip the spawn
+        // there so hermetic tests don't panic on `tokio::spawn`.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let paths = self.paths.clone();
+        let tx = self.bg_tx.clone();
+        self.set_status("Installing llama-server (one-time setup)…", false);
+        tokio::spawn(async move {
+            let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let fwd = tx.clone();
+            tokio::spawn(async move {
+                while let Some(line) = prx.recv().await {
+                    let _ = fwd.send(BgMsg::InstallProgress(line));
+                }
+            });
+            let result = ensure_llamacpp_installed(&paths, ptx).await;
+            let _ = tx.send(BgMsg::LlamaSetupDone(result));
+        });
     }
 
     /// Kick off `llama-server -hf …` in the background when the assistant is installed.
@@ -3399,6 +3431,35 @@ impl App {
                             self.error_backend = Some(kind);
                             self.last_failed_action = Some(RetryAction::InstallBackend(kind));
                             self.raise_error(e);
+                        }
+                    }
+                }
+                BgMsg::LlamaSetupDone(result) => {
+                    self.install_progress_line.clear();
+                    match result {
+                        Ok(bin) => {
+                            let bin_str = bin.display().to_string();
+                            if self.config.backends.llamacpp.bin != bin_str {
+                                self.apply_repoint(Repoint {
+                                    kind: BackendKind::LlamaCpp,
+                                    bin: bin_str.clone(),
+                                });
+                            }
+                            self.set_status(
+                                format!("llama-server ready at {bin_str}"),
+                                false,
+                            );
+                            self.start_detect();
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "startup llama-server setup failed");
+                            self.set_status(
+                                format!(
+                                    "llama-server setup failed: {} — run `localcode setup`",
+                                    e.message
+                                ),
+                                true,
+                            );
                         }
                     }
                 }
@@ -6448,5 +6509,96 @@ mod tests {
         assert!(screen.contains("48"), "dashboard shows tok/s value");
         assert!(screen.contains("energy"), "dashboard shows GPU energy");
         assert!(screen.contains("145W"), "dashboard shows power draw");
+    }
+
+    /// While the agent is working but has not streamed yet, the status-dashboard
+    /// spinner + log tail move next to the user message (3 lines), then clear
+    /// once thinking/agent text arrives.
+    #[test]
+    fn wait_state_shows_logs_and_spinner_next_to_user_message() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = rt.enter();
+
+        let mut app = test_app();
+        app.coding_transcript.push(TranscriptEntry::new(
+            EntryKind::You,
+            "fix the flaky suite",
+        ));
+        app.status_logs = vec![
+            "wait-log-alpha".into(),
+            "wait-log-beta".into(),
+            "wait-log-gamma".into(),
+        ];
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        app.busy = Some(Busy {
+            kind: BusyKind::Coding,
+            label: "Agent working".into(),
+            started: Instant::now(),
+            handle,
+        });
+
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(
+            screen.contains("fix the flaky suite"),
+            "user prompt is visible"
+        );
+        assert!(
+            screen.contains("wait-log-alpha")
+                && screen.contains("wait-log-beta")
+                && screen.contains("wait-log-gamma"),
+            "three backend log lines sit under the user message while waiting:\n{screen}"
+        );
+        // Braille spinner frames (any one is enough — tick index varies).
+        let has_spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            .iter()
+            .any(|c| screen.contains(*c));
+        assert!(has_spinner, "spinner rides next to the user message while waiting");
+
+        // Collapsed status is metrics-only while logs are redirected (height 4
+        // = 2 content + top/bottom border), not the usual 5.
+        assert_eq!(
+            app.status_bar_rect.height, 4,
+            "collapsed status drops the log row while wait logs live in chat"
+        );
+
+        // Agent starts responding → wait-under-prompt logs clear; spinner
+        // rides the live thinking line; status dashboard regains its log row
+        // (so a single latest log may reappear there — that is expected).
+        app.coding_transcript.push(TranscriptEntry {
+            kind: EntryKind::Thinking,
+            text: "considering options".into(),
+            live: true,
+            detail: None,
+            expanded: true,
+        });
+        let screen = render_to_string(&mut app, 120, 40);
+        assert!(
+            screen.contains("considering options"),
+            "agent thinking is shown"
+        );
+        // The three-line wait block under the user prompt is gone: older logs
+        // (alpha/beta) only lived there, while gamma may reappear as the
+        // status dashboard's single latest-log line.
+        assert!(
+            !screen.contains("wait-log-alpha") && !screen.contains("wait-log-beta"),
+            "multi-line wait log tail under the user message is gone:\n{screen}"
+        );
+        let has_spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+            .iter()
+            .any(|c| screen.contains(*c));
+        assert!(has_spinner, "spinner moves onto the live thinking line");
+        assert_eq!(
+            app.status_bar_rect.height, 5,
+            "status log row returns after wait ends"
+        );
+
+        if let Some(b) = app.busy.take() {
+            b.handle.abort();
+        }
     }
 }

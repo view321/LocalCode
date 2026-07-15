@@ -7,7 +7,9 @@
 //! overlays — every former panel renders inline in the working area, and
 //! confirms/errors are inline banners. The command palette ('/') and the file
 //! picker ('@') dock directly above the omnibar, where the eye already is. The
-//! only animated glyph is the braille spinner, shown only while busy.
+//! only animated glyph is the braille spinner, shown only while busy — during a
+//! coding turn it sits next to the user message (with a 3-line backend log
+//! tail) until the agent starts speaking, then moves onto the live stream line.
 
 use crate::app::{App, ClickRegion, ClickTarget, EntryKind, Mode, SettingAction, SettingsRowKind};
 use crate::markdown;
@@ -51,6 +53,40 @@ fn spinner_frame(app: &App) -> Option<char> {
         .or_else(|| app.update_busy.as_ref().map(|b| b.started))?;
     let i = (started.elapsed().as_millis() / 90) as usize % SPINNER.len();
     Some(SPINNER[i])
+}
+
+/// Coding turn is running but the model has not yet produced any thinking,
+/// tool, or agent text after the latest user message — the "waiting" gap
+/// where we park the spinner + backend log tail next to the user prompt.
+fn waiting_for_agent_response(app: &App) -> bool {
+    let Some(b) = app.busy.as_ref() else {
+        return false;
+    };
+    if b.kind != crate::app::BusyKind::Coding {
+        return false;
+    }
+    let Some(you_idx) = app
+        .coding_transcript
+        .iter()
+        .rposition(|e| e.kind == EntryKind::You)
+    else {
+        return false;
+    };
+    !app.coding_transcript[you_idx + 1..].iter().any(|e| {
+        matches!(
+            e.kind,
+            EntryKind::Agent | EntryKind::Thinking | EntryKind::Tool
+        )
+    })
+}
+
+/// Spinner lives in the chat transcript during a coding turn (next to the
+/// user message while waiting, or on the live agent/thinking/tool line once
+/// tokens arrive) — so the status dashboard yields it.
+fn spinner_carried_to_chat(app: &App) -> bool {
+    app.busy
+        .as_ref()
+        .is_some_and(|b| b.kind == crate::app::BusyKind::Coding)
 }
 
 /// A fixed-width inline meter: `█` (Fg) filled + `─` (faint) track. No color.
@@ -157,7 +193,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // ui.composer_rows. The '/' command palette and the '@' file picker dock
     // directly above it. The status dashboard is a matching bordered frame:
     // collapsed = 2 metric lines + 1 latest-log line; hover/pin expands to
-    // 10 content lines (2 metrics + 8 logs). Outer height adds top/bottom border.
+    // 10 content lines (2 metrics + 8 logs). While waiting for the agent,
+    // the log tail is redirected under the user message (3 lines there), so
+    // collapsed status is metrics-only. Outer height adds top/bottom border.
     let cap = app.config.ui.composer_rows.clamp(1, 10).max(2);
     let max_by_area = area.height.saturating_sub(8).max(1);
     let composer_h = (app.coding_input.split('\n').count().max(1) as u16)
@@ -165,7 +203,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .min(cap)
         .min(max_by_area);
 
-    let status_content: u16 = if app.status_expanded() { 10 } else { 3 };
+    let status_content: u16 = if app.status_expanded() {
+        10
+    } else if waiting_for_agent_response(app) {
+        2 // log lines live next to the user message while waiting
+    } else {
+        3
+    };
     // Leave room for omnibar (composer+2), a working min-1, and picker room.
     let status_h = (status_content + 2).min(area.height.saturating_sub(composer_h + 3).max(3));
 
@@ -302,9 +346,15 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
         line0.push(Span::styled(" copy text · F2 to exit", theme::muted(&th)));
         line0.push(sep(&th));
     }
-    match spinner_frame(app) {
-        Some(c) => line0.push(Span::styled(format!("{c} "), theme::work(&th))),
-        None => line0.push(Span::raw("  ")),
+    // During a coding turn the spinner is carried into the transcript (user
+    // message while waiting, live stream line once the agent responds).
+    if spinner_carried_to_chat(app) {
+        line0.push(Span::raw("  "));
+    } else {
+        match spinner_frame(app) {
+            Some(c) => line0.push(Span::styled(format!("{c} "), theme::work(&th))),
+            None => line0.push(Span::raw("  ")),
+        }
     }
     match app.active_runtime() {
         Some(rt) => line0.push(Span::styled(rt.name.clone(), fg(&th))),
@@ -481,7 +531,13 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // --- Lines 2..: latest log(s) ---
+    // While the agent is still waiting to speak, the log tail is shown under
+    // the user message instead (see `draw_chat`). Expanded/pinned status still
+    // keeps its full log view for inspection.
     if content.height < 3 {
+        return;
+    }
+    if waiting_for_agent_response(app) && !app.status_expanded() {
         return;
     }
     let log_area = Rect {
@@ -760,6 +816,13 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         .busy
         .as_ref()
         .is_some_and(|b| b.kind == crate::app::BusyKind::Coding);
+    let last_you_idx = app
+        .coding_transcript
+        .iter()
+        .rposition(|e| e.kind == EntryKind::You);
+    // Backend log tail + spinner sit under the latest user prompt until the
+    // first thinking/tool/agent token arrives, then they clear out of the way.
+    let waiting = waiting_for_agent_response(app);
 
     // Each logical line is tagged with the transcript entry that produced it
     // so we can register per-entry click regions after scroll is applied.
@@ -812,7 +875,13 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                 spans.push(Span::styled("  ".to_string(), style));
             }
             spans.push(Span::styled((*part).to_string(), style));
-            if e.live && agent_running && pi + 1 == part_count {
+            // Spinner: on the latest user line while waiting for first tokens;
+            // on the live stream line once the agent is speaking.
+            let spin_here = agent_running
+                && pi + 1 == part_count
+                && ((waiting && Some(idx) == last_you_idx)
+                    || (e.live && !waiting));
+            if spin_here {
                 spans.push(Span::styled(" ", style));
                 if let Some(c) = spinner_frame(app) {
                     spans.push(Span::styled(c.to_string(), theme::work(&th)));
@@ -821,6 +890,21 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(spans));
             // Header + expanded body rows are all clickable for toggleable entries.
             line_entry.push(if e.can_toggle() { Some(idx) } else { None });
+        }
+
+        // Three live backend log lines under the user message while waiting —
+        // something to watch until the agent starts responding, then gone.
+        if waiting && Some(idx) == last_you_idx {
+            let log_lines = status_log_lines(app, 3);
+            for i in 0..3 {
+                let text = log_lines.get(i).map(|s| s.as_str()).unwrap_or("");
+                let clipped = clip(text, inner_w.saturating_sub(2));
+                lines.push(Line::from(Span::styled(
+                    format!("  {clipped}"),
+                    theme::muted(&th),
+                )));
+                line_entry.push(None);
+            }
         }
     }
 

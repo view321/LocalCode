@@ -11,7 +11,8 @@ Philosophy: **one-click and no errors** — guided recovery, warnings over hard 
 ## Requirements
 
 - Rust 1.75+ (edition 2021)
-- Optional: [Ollama](https://ollama.com), [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server`, NVIDIA drivers + `nvidia-smi`
+- Optional: [Ollama](https://ollama.com), NVIDIA drivers + `nvidia-smi`
+- **llama-server** is installed automatically by the app installer / `localcode setup` (or on first TUI launch if missing)
 - Optional: `HF_TOKEN`, `OPENROUTER_API_KEY`, cloud API keys
 
 ## Install
@@ -30,7 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/view321/LocalCode/main/scripts/inst
 irm https://raw.githubusercontent.com/view321/LocalCode/main/scripts/install.ps1 | iex
 ```
 
-Scripts install Rust (via rustup) if needed, clone this repo, build the release binary, and place `localcode` on your PATH (`~/.local/bin` or `%USERPROFILE%\.local\bin`).
+Scripts install Rust (via rustup) if needed, clone this repo, build the release binary, place `localcode` on your PATH (`~/.local/bin` or `%USERPROFILE%\.local\bin`), and run `localcode setup` to install a managed **llama-server** (prebuilt CPU build) into LocalCode’s data dir, writing the absolute path to `backends.llamacpp.bin` in config. Skip with `LOCALCODE_SKIP_LLAMA=1`.
+
+You can re-run setup anytime:
+
+```bash
+localcode setup              # ensure llama-server + update config
+localcode setup --skip-llama # no-op placeholder for future steps
+```
 
 ### Updates
 

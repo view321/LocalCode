@@ -11,7 +11,7 @@ use localcode_backends::{resolve_install_plan, run_install, InstallPlan, Repoint
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
@@ -57,51 +57,7 @@ pub fn model_path(paths: &AppPaths) -> PathBuf {
 
 /// Resolve `llama-server`: config path → PATH → managed backends/llamacpp dir.
 pub fn resolve_llama_bin(cfg: &Config, paths: &AppPaths) -> Option<PathBuf> {
-    let configured = &cfg.backends.llamacpp.bin;
-    if let Ok(p) = which::which(configured) {
-        return Some(p);
-    }
-    if configured != "llama-server" {
-        if let Ok(p) = which::which("llama-server") {
-            return Some(p);
-        }
-    }
-    // Managed install from FetchLlamaCpp.
-    let managed = paths.llamacpp_dir();
-    find_file(
-        &managed,
-        if cfg!(windows) {
-            "llama-server.exe"
-        } else {
-            "llama-server"
-        },
-    )
-    .or_else(|| find_file(&managed, "llama-server"))
-}
-
-fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    if !root.exists() {
-        return None;
-    }
-    let direct = root.join(name);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
-                return Some(p);
-            }
-        }
-    }
-    None
+    localcode_backends::resolve_llamacpp_bin(&cfg.backends.llamacpp.bin, paths)
 }
 
 /// What still needs to happen before the local assistant can start.

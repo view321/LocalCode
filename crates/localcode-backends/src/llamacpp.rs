@@ -1,11 +1,12 @@
 use crate::{
-    port_in_use, probe_client, spawn_io_drain, BackendKind, DetectReport, Health,
-    InferenceBackend, ModelDeploySpec, RunningEndpoint,
+    port_in_use, probe_client, resolve_llamacpp_bin, spawn_io_drain, BackendKind, DetectReport,
+    Health, InferenceBackend, ModelDeploySpec, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_core::config::LlamaCppConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::{AppEvent, EventBus};
+use localcode_core::paths::AppPaths;
 use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -27,6 +28,12 @@ impl LlamaCppBackend {
             children: Arc::new(Mutex::new(Vec::new())),
         }
     }
+
+    /// Configured path / PATH / managed install (same rules as the assistant).
+    fn resolve_bin(&self) -> Option<std::path::PathBuf> {
+        let paths = AppPaths::resolve().ok()?;
+        resolve_llamacpp_bin(&self.cfg.bin, &paths)
+    }
 }
 
 #[async_trait]
@@ -36,15 +43,12 @@ impl InferenceBackend for LlamaCppBackend {
     }
 
     async fn detect(&self) -> DetectReport {
-        let binary = which::which(&self.cfg.bin)
-            .or_else(|_| which::which("llama-server"))
-            .ok()
-            .map(|p| p.display().to_string());
+        let binary = self.resolve_bin().map(|p| p.display().to_string());
         let mut notes = vec![];
         if binary.is_none() {
-            notes.push(format!("`{}` not found on PATH", self.cfg.bin));
-            notes.push("Install llama.cpp server build and add to PATH".into());
-            notes.push("https://github.com/ggerganov/llama.cpp".into());
+            notes.push(format!("`{}` not found on PATH or managed install", self.cfg.bin));
+            notes.push("Run `localcode setup` or install from the Backends panel".into());
+            notes.push("https://github.com/ggml-org/llama.cpp".into());
         }
         DetectReport {
             kind: BackendKind::LlamaCpp,
@@ -67,9 +71,9 @@ impl InferenceBackend for LlamaCppBackend {
             format!("llama.cpp binary `{}` not found", self.cfg.bin),
         )
         .with_source("llamacpp", "ensure_ready")
-        .with_cause("Binary not on PATH")
-        .with_hint("Install llama-server and set backends.llamacpp.bin in config")
-        .retryable(false))
+        .with_cause("Binary not on PATH and no managed install under data/backends/llamacpp")
+        .with_hint("Run `localcode setup` or Install from the Backends panel")
+        .retryable(true))
     }
 
     async fn list_models(&self) -> Result<Vec<String>, LocalCodeError> {
@@ -115,12 +119,11 @@ impl InferenceBackend for LlamaCppBackend {
             .retryable(false));
         }
 
-        let bin = which::which(&self.cfg.bin)
-            .or_else(|_| which::which("llama-server"))
-            .map_err(|_| {
-                LocalCodeError::new(ErrorCode::BackendBinaryMissing, "llama-server not found")
-                    .with_correlation(cid)
-            })?;
+        let bin = self.resolve_bin().ok_or_else(|| {
+            LocalCodeError::new(ErrorCode::BackendBinaryMissing, "llama-server not found")
+                .with_correlation(cid)
+                .with_hint("Run `localcode setup` to install llama-server automatically")
+        })?;
 
         info!(%cid, %model_path, port, "starting llama-server");
         events.publish(AppEvent::DeployProgress {
