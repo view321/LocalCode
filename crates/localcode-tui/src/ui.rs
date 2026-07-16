@@ -13,6 +13,7 @@
 
 use crate::app::{
     App, ClickRegion, ClickTarget, DashCard, EntryKind, Mode, SettingAction, SettingsRowKind,
+    DEPLOY_LABEL_W,
 };
 use crate::markdown;
 use crate::theme;
@@ -1355,13 +1356,17 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     click(app, Rect { x: area.x, y: backend_row, width: backend_w, height: 1 }, ClickTarget::BackendCycle);
 
     // Editable deploy parameters, filtered to what the current backend honors.
-    // Click a row to edit it inline (↵ save, Esc cancel, blank = default).
-    // Column budget for a field value after its fixed 11-col label.
-    let value_avail = area.width.saturating_sub(11).max(1) as usize;
+    // Click a row to edit it inline (↵ save, Esc cancel, blank = default);
+    // clicking into the value while editing moves the caret there.
+    // Column budget for a field value after its fixed-width label.
+    let value_avail = area.width.saturating_sub(DEPLOY_LABEL_W as u16).max(1) as usize;
     for field in app.deploy_fields() {
         let row = area.y + ctrl.len() as u16;
         let editing = app.deploy_editing_field() == Some(field);
-        let mut spans = vec![Span::styled(format!("{:<11}", field.label()), theme::muted(&th))];
+        let mut spans = vec![Span::styled(
+            format!("{:<w$}", field.label(), w = DEPLOY_LABEL_W),
+            theme::muted(&th),
+        )];
         if editing {
             // Horizontally scroll the buffer so the caret stays visible: the
             // command line is far wider than the panel, so without this a caret

@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tracing::info;
+use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroizing;
 
 const MAX_INPUT_HISTORY: usize = 100;
@@ -379,6 +380,11 @@ impl DeployField {
         }
     }
 }
+
+/// Width of the label column in the deploy panel. Field values render (and
+/// clicks map to caret positions) starting at this offset, so the renderer
+/// and the click handler must agree on it.
+pub const DEPLOY_LABEL_W: usize = 11;
 
 /// What activating a Settings row does. `Copy` so it can ride inside
 /// [`ClickTarget`]; index-carrying variants point into stable catalogs
@@ -2956,6 +2962,25 @@ impl App {
             format!("Editing {} — ↵ save, Esc cancel (blank = default)", field.label()),
             false,
         );
+    }
+
+    /// A click on a deploy field row. Starts editing the field, or — if this
+    /// field is already being edited — only moves the caret to the clicked
+    /// character: re-seeding on every click would silently drop the edit in
+    /// progress. `rel_col` is measured from the row's left edge; the value
+    /// area begins after the [`DEPLOY_LABEL_W`] label column.
+    fn click_deploy_field(&mut self, field: DeployField, rel_col: usize) {
+        let editing = self.deploy_editing == Some(field);
+        // While editing, the drawn value window starts at the renderer-kept
+        // horizontal scroll; a freshly opened edit always shows the head.
+        let scroll = if editing { self.deploy_field_scroll } else { 0 };
+        if !editing {
+            self.begin_deploy_edit(field);
+        }
+        // A click on the label column leaves the caret where the edit put it.
+        if let Some(col) = rel_col.checked_sub(DEPLOY_LABEL_W) {
+            self.deploy_field_cursor = caret_from_col(&self.deploy_field_edit, scroll, col);
+        }
     }
 
     /// Key handling while a deploy parameter is being edited inline. Supports
@@ -7547,7 +7572,10 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                     self.resume_download(&id);
                 }
             }
-            ClickTarget::DeployField(field) => self.begin_deploy_edit(field),
+            ClickTarget::DeployField(field) => {
+                let rel_col = col.saturating_sub(region.rect.x) as usize;
+                self.click_deploy_field(field, rel_col);
+            }
             // Runtimes.
             ClickTarget::RuntimeList => {
                 let n = self.all_runtimes().len();
@@ -8057,6 +8085,24 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// Char index in `buf` for a click `col` cells into the visible value window,
+/// which starts `scroll` chars into the buffer (mirrors how the deploy panel
+/// draws the field). Walks display widths so a double-width glyph maps both
+/// of its cells to the same caret; a click past the end appends.
+fn caret_from_col(buf: &str, scroll: usize, col: usize) -> usize {
+    let mut w = 0usize;
+    let mut idx = scroll.min(buf.chars().count());
+    for c in buf.chars().skip(idx) {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > col {
+            break;
+        }
+        w += cw;
+        idx += 1;
+    }
+    idx
 }
 
 pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeError> {
@@ -9318,6 +9364,103 @@ mod tests {
             app.deploy_command_override.as_deref(),
             Some("llama-server --port 9090")
         );
+    }
+
+    #[test]
+    fn clicking_the_command_row_edits_at_the_clicked_char() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.deploy_command_override = Some("llama-server --port 8080".into());
+        // First click opens the edit with the caret under the clicked column
+        // (13 chars into the value = the first '-' of "--port").
+        app.click_deploy_field(DeployField::Command, DEPLOY_LABEL_W + 13);
+        assert_eq!(app.deploy_editing, Some(DeployField::Command));
+        assert_eq!(app.deploy_field_cursor(), 13);
+        app.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(app.deploy_field_edit_buf(), "llama-server X--port 8080");
+        // A click on the label column keeps caret and buffer as they are.
+        app.click_deploy_field(DeployField::Command, 3);
+        assert_eq!(app.deploy_field_cursor(), 14);
+        // A click mid-edit moves the caret without re-seeding the buffer —
+        // the typed-but-uncommitted 'X' must survive.
+        app.click_deploy_field(DeployField::Command, DEPLOY_LABEL_W);
+        assert_eq!(app.deploy_field_edit_buf(), "llama-server X--port 8080");
+        assert_eq!(app.deploy_field_cursor(), 0);
+        // Past the end of the value: caret parks after the last char.
+        app.click_deploy_field(DeployField::Command, DEPLOY_LABEL_W + 500);
+        assert_eq!(app.deploy_field_cursor(), 25);
+        // With the value window scrolled, the click maps through the offset.
+        app.deploy_field_scroll = 10;
+        app.click_deploy_field(DeployField::Command, DEPLOY_LABEL_W + 2);
+        assert_eq!(app.deploy_field_cursor(), 12);
+    }
+
+    #[test]
+    fn editing_the_command_draws_a_caret_cell() {
+        use ratatui::style::Modifier;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.model_detail = Some(ModelDetail {
+            summary: ModelSummary {
+                id: "acme/coder-7b".into(),
+                author: None,
+                pipeline_tag: None,
+                tags: vec![],
+                likes: None,
+                downloads: None,
+                last_modified: None,
+                private: None,
+                gated: None,
+            },
+            siblings: vec![],
+            card_data: None,
+            sha: None,
+            card_markdown: None,
+            license: None,
+            parameter_size: None,
+            quants: vec![],
+        });
+        app.deploy_command_override = Some("llama-server --port 8080".into());
+        // Click 13 value-cells in: the caret must land on the first '-' of
+        // "--port" and be drawn as a REVERSED cell right there.
+        app.click_deploy_field(DeployField::Command, DEPLOY_LABEL_W + 13);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        let y = (0..buf.area.height)
+            .find(|&y| row_text(y).contains("llama-server"))
+            .expect("the command row is on screen while editing");
+        let carets: Vec<u16> = (0..buf.area.width)
+            .filter(|&x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(carets.len(), 1, "exactly one caret cell in the command row");
+        assert_eq!(
+            buf[(carets[0], y)].symbol(),
+            "-",
+            "caret sits under the clicked char"
+        );
+    }
+
+    #[test]
+    fn caret_from_col_maps_cells_to_chars() {
+        assert_eq!(caret_from_col("abc", 0, 0), 0);
+        assert_eq!(caret_from_col("abc", 0, 2), 2);
+        // Past the end → append position; a scrolled window offsets the walk.
+        assert_eq!(caret_from_col("abc", 0, 99), 3);
+        assert_eq!(caret_from_col("abcdef", 2, 1), 3);
+        // Both cells of a double-width glyph select the glyph itself.
+        assert_eq!(caret_from_col("日本", 0, 0), 0);
+        assert_eq!(caret_from_col("日本", 0, 1), 0);
+        assert_eq!(caret_from_col("日本", 0, 2), 1);
+        // Scroll clamped to the buffer, degenerate input safe.
+        assert_eq!(caret_from_col("ab", 99, 0), 2);
+        assert_eq!(caret_from_col("", 0, 5), 0);
     }
 
     fn sample_download(model_id: &str, status: DownloadStatus) -> DownloadState {
