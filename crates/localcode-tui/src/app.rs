@@ -1303,6 +1303,14 @@ impl App {
         } else if app.local_assistant_ready && app.config.assistant.prefer_local {
             // Already accepted in a previous session — warm-start for default chat.
             app.warm_start_local_assistant();
+            app.coding_transcript.push(TranscriptEntry::new(
+                EntryKind::System,
+                format!(
+                    "{ASSISTANT_DISPLAY_NAME} is your default chat — ask it to find, deploy, \
+                     or stop models, or to fix LocalCode. A model you deploy takes over chat \
+                     once selected on /dash."
+                ),
+            ));
         }
 
         app
@@ -3388,6 +3396,10 @@ impl App {
         let approver_tx = self.bg_tx.clone();
         let coding_http = self.coding_http.clone();
         let hf_arc = self.hf.clone().map(std::sync::Arc::new);
+        // Chat can manage models (deploy/stop/list/delete/ui) no matter which
+        // runtime serves it — this is what makes the default chat the
+        // assistant chat. Mutating calls still gate through the approver.
+        let model_ops = self.model_ops();
         let paths = self.paths.clone();
         let config = self.config.clone();
         let cloud_base = self.config.assistant.base_url.clone();
@@ -3430,7 +3442,9 @@ impl App {
                 r
             };
 
-            let mut agent = CodingAgent::new(agent_cfg).with_http_client(coding_http);
+            let mut agent = CodingAgent::new(agent_cfg)
+                .with_http_client(coding_http)
+                .with_model_ops(model_ops);
             if let Some(hf) = hf_arc {
                 agent = agent.with_hf(hf);
             }

@@ -7,8 +7,10 @@
 
 use crate::constants::{ASSISTANT_SYSTEM_PROMPT, BONSAI_TEMPERATURE};
 use crate::deploy_hints::{extract_deploy_hints, DeployHints};
-use async_trait::async_trait;
-use localcode_agent::{ToolApprover, ToolCall, ToolRegistry, ToolResult, ToolRisk};
+use localcode_agent::{
+    execute_model_tool, is_model_tool, model_tools_schema, ToolApprover, ToolCall, ToolRegistry,
+    ToolResult,
+};
 use localcode_backends::BackendKind;
 use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -21,33 +23,9 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
-/// Parameters for the assistant's `deploy_model` tool.
-#[derive(Debug, Clone, Default)]
-pub struct DeployToolArgs {
-    pub model_id: String,
-    pub backend: Option<String>,
-    pub quant: Option<String>,
-    pub port: Option<u16>,
-    pub context: Option<u32>,
-    /// Full launch command override (replaces the built one).
-    pub command: Option<String>,
-}
-
-/// Backend-management actions the assistant can perform on the user's behalf.
-///
-/// Implemented by the TUI and wired to its live [`BackendRegistry`] + deploy
-/// pipeline, so a model the assistant deploys/stops/deletes appears in `/dash`
-/// and `/models` exactly like a manual action. Each method returns a short,
-/// human-readable summary that becomes the tool's output to the model.
-#[async_trait]
-pub trait ModelActions: Send + Sync {
-    async fn deploy(&self, args: DeployToolArgs) -> Result<String, LocalCodeError>;
-    async fn stop(&self, id_or_name: &str) -> Result<String, LocalCodeError>;
-    async fn list_deployments(&self) -> Result<String, LocalCodeError>;
-    async fn list_downloaded(&self) -> Result<String, LocalCodeError>;
-    async fn delete_model(&self, model_id: &str) -> Result<String, LocalCodeError>;
-    async fn deploy_ui(&self) -> Result<String, LocalCodeError>;
-}
+// The model-management capability is shared with the coding agent (both offer
+// the same tool surface); re-exported so the TUI keeps importing it from here.
+pub use localcode_agent::{DeployToolArgs, ModelActions};
 
 /// Pack of context attached when the assistant is invoked from an error or
 /// the user opens `/assistant`.
@@ -252,15 +230,15 @@ impl AssistantAgent {
                     risk: localcode_agent::ToolRisk::Low,
                 });
             }
-            // Backend-management tools (deploy / stop / delete / ui). These gate
-            // through the approver themselves since they mutate system state.
-            "deploy_model" => return self.tool_deploy_model(call, approver).await,
-            "stop_model" => return self.tool_stop_model(call, approver).await,
-            "list_deployments" => return self.tool_list_deployments().await,
-            "list_downloaded_models" => return self.tool_list_downloaded().await,
-            "delete_model" => return self.tool_delete_model(call, approver).await,
-            "deploy_ui" => return self.tool_deploy_ui(call, approver).await,
             _ => {}
+        }
+
+        // Backend-management tools (deploy / stop / delete / ui), shared with
+        // the coding agent. They gate through the approver themselves since
+        // they mutate system state.
+        if is_model_tool(&call.name) {
+            let ops = self.require_ops()?;
+            return execute_model_tool(ops.as_ref(), call, self.approval, approver).await;
         }
 
         // Single approval path via ToolRegistry (no double-gate).
@@ -364,122 +342,6 @@ impl AssistantAgent {
         })
     }
 
-    /// Gate a state-mutating tool through the approver, honoring the active
-    /// approval mode. `destructive` tools (stop/delete) gate in every mode but
-    /// AlwaysApprove; deploys gate only under ApproveEdits / AskPermission. When
-    /// no approver is wired (headless), gated calls are refused rather than run.
-    async fn gate(
-        &self,
-        approver: Option<&dyn ToolApprover>,
-        destructive: bool,
-        desc: &str,
-    ) -> Result<(), LocalCodeError> {
-        let needs = match self.approval {
-            ApprovalMode::AlwaysApprove => false,
-            ApprovalMode::Auto => destructive,
-            ApprovalMode::ApproveEdits | ApprovalMode::AskPermission => true,
-        };
-        if !needs {
-            return Ok(());
-        }
-        let approved = match approver {
-            Some(a) => a.approve(desc).await,
-            None => false,
-        };
-        if approved {
-            Ok(())
-        } else {
-            Err(LocalCodeError::new(
-                ErrorCode::Cancelled,
-                format!("User declined: {desc}"),
-            ))
-        }
-    }
-
-    async fn tool_deploy_model(
-        &self,
-        call: &ToolCall,
-        approver: Option<&dyn ToolApprover>,
-    ) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        let model_id = str_arg(call, "model_id").ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, "deploy_model requires model_id")
-        })?;
-        let args = DeployToolArgs {
-            model_id: model_id.clone(),
-            backend: str_arg(call, "backend"),
-            quant: str_arg(call, "quant"),
-            port: call.arguments.get("port").and_then(|v| v.as_u64()).map(|n| n as u16),
-            context: call.arguments.get("context").and_then(|v| v.as_u64()).map(|n| n as u32),
-            command: str_arg(call, "command"),
-        };
-        self.gate(
-            approver,
-            false,
-            &format!(
-                "Deploy model {model_id} on {}",
-                args.backend.as_deref().unwrap_or("the default backend")
-            ),
-        )
-        .await?;
-        let out = ops.deploy(args).await?;
-        Ok(ToolResult { output: out, risk: ToolRisk::Medium })
-    }
-
-    async fn tool_stop_model(
-        &self,
-        call: &ToolCall,
-        approver: Option<&dyn ToolApprover>,
-    ) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        let target = str_arg(call, "model").or_else(|| str_arg(call, "id")).ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, "stop_model requires model (name or id)")
-        })?;
-        self.gate(approver, true, &format!("Stop runtime {target}")).await?;
-        let out = ops.stop(&target).await?;
-        Ok(ToolResult { output: out, risk: ToolRisk::High })
-    }
-
-    async fn tool_list_deployments(&self) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        Ok(ToolResult { output: ops.list_deployments().await?, risk: ToolRisk::Low })
-    }
-
-    async fn tool_list_downloaded(&self) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        Ok(ToolResult { output: ops.list_downloaded().await?, risk: ToolRisk::Low })
-    }
-
-    async fn tool_delete_model(
-        &self,
-        call: &ToolCall,
-        approver: Option<&dyn ToolApprover>,
-    ) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        let model_id = str_arg(call, "model_id").ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, "delete_model requires model_id")
-        })?;
-        self.gate(
-            approver,
-            true,
-            &format!("Delete downloaded weights for {model_id} from disk"),
-        )
-        .await?;
-        let out = ops.delete_model(&model_id).await?;
-        Ok(ToolResult { output: out, risk: ToolRisk::High })
-    }
-
-    async fn tool_deploy_ui(
-        &self,
-        _call: &ToolCall,
-        approver: Option<&dyn ToolApprover>,
-    ) -> Result<ToolResult, LocalCodeError> {
-        let ops = self.require_ops()?;
-        self.gate(approver, false, "Deploy the OpenWebUI browser chat (Docker)").await?;
-        let out = ops.deploy_ui().await?;
-        Ok(ToolResult { output: out, risk: ToolRisk::Medium })
-    }
-
     fn tools_schema(&self) -> Value {
         let mut tools = self.tools.openai_tools_schema();
         // Append HF / doctor tools.
@@ -515,59 +377,9 @@ impl AssistantAgent {
 
             // Backend-management tools — only offered when wired to a live
             // registry (the TUI). A model deployed here appears in /dash.
+            // Shared with the coding agent so both expose the same surface.
             if self.model_ops.is_some() {
-                arr.push(tool_schema(
-                    "deploy_model",
-                    "Deploy a Hugging Face model to a local backend and wait until it is serving. \
-                     backend is ollama|llamacpp|vllm|sglang (default: the app's configured backend). \
-                     Optionally set quant, port, context, or a full command override.",
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "model_id": { "type": "string", "description": "HF model id, e.g. Qwen/Qwen2.5-Coder-7B-Instruct" },
-                            "backend": { "type": "string" },
-                            "quant": { "type": "string", "description": "quantization label, e.g. Q4_K_M" },
-                            "port": { "type": "integer" },
-                            "context": { "type": "integer", "description": "max context length" },
-                            "command": { "type": "string", "description": "full launch command that replaces the built one" }
-                        },
-                        "required": ["model_id"]
-                    }),
-                ));
-                arr.push(tool_schema(
-                    "stop_model",
-                    "Stop a running model runtime and free its VRAM. Pass its name or id \
-                     (see list_deployments).",
-                    json!({
-                        "type": "object",
-                        "properties": { "model": { "type": "string" } },
-                        "required": ["model"]
-                    }),
-                ));
-                arr.push(tool_schema(
-                    "list_deployments",
-                    "List currently running model runtimes (name, backend, status, url).",
-                    json!({ "type": "object", "properties": {} }),
-                ));
-                arr.push(tool_schema(
-                    "list_downloaded_models",
-                    "List models whose weights are already downloaded on disk, with sizes.",
-                    json!({ "type": "object", "properties": {} }),
-                ));
-                arr.push(tool_schema(
-                    "delete_model",
-                    "Delete a downloaded model's weights from disk to free space (irreversible).",
-                    json!({
-                        "type": "object",
-                        "properties": { "model_id": { "type": "string" } },
-                        "required": ["model_id"]
-                    }),
-                ));
-                arr.push(tool_schema(
-                    "deploy_ui",
-                    "Launch the OpenWebUI browser chat (Docker) wired to the deployed models.",
-                    json!({ "type": "object", "properties": {} }),
-                ));
+                arr.extend(model_tools_schema());
             }
         }
         tools
@@ -708,15 +520,6 @@ fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
             "parameters": parameters,
         }
     })
-}
-
-/// Read a non-empty string argument from a tool call.
-fn str_arg(call: &ToolCall, key: &str) -> Option<String> {
-    call.arguments
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn format_context_pack(ctx: &AssistantContext) -> String {

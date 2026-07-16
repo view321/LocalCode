@@ -1,9 +1,14 @@
 //! Coding agent with tools, skills, and sessions.
 
+mod model_ops;
 mod session_store;
 mod skills;
 mod tools;
 
+pub use model_ops::{
+    execute_model_tool, is_model_tool, model_tools_schema, DeployToolArgs, ModelActions,
+    MODEL_TOOL_NAMES,
+};
 pub use session_store::{
     list_sessions, sessions_root, LoadedSession, SessionMeta, SessionStore,
 };
@@ -274,6 +279,9 @@ pub struct CodingAgent {
     /// When set, `hf.model_card` / `hf.search` tools are available so the default
     /// conversation can read the Hugging Face catalogue and model descriptions.
     hf: Option<Arc<HfClient>>,
+    /// When set, the model-management tools (deploy_model, stop_model, …) are
+    /// available so chat can run models on the user's behalf.
+    model_ops: Option<Arc<dyn ModelActions>>,
 }
 
 impl CodingAgent {
@@ -294,12 +302,20 @@ impl CodingAgent {
             config,
             http,
             hf: None,
+            model_ops: None,
         }
     }
 
     /// Attach a Hugging Face client so the agent can search models and read cards.
     pub fn with_hf(mut self, hf: Arc<HfClient>) -> Self {
         self.hf = Some(hf);
+        self
+    }
+
+    /// Attach the model-management capability (deploy/stop/list/delete/ui) so
+    /// chat can run models on the user's behalf.
+    pub fn with_model_ops(mut self, ops: Arc<dyn ModelActions>) -> Self {
+        self.model_ops = Some(ops);
         self
     }
 
@@ -731,6 +747,28 @@ No tools — reply with the summary only.";
         approver: Option<&dyn ToolApprover>,
         skill_body: Option<String>,
     ) -> Result<ToolResult, LocalCodeError> {
+        // Model-management tools (deploy / stop / list / delete / ui) are
+        // served here; they gate through the approver themselves (deploys under
+        // ApproveEdits/Ask, stop/delete in every mode but AlwaysApprove).
+        if is_model_tool(&call.name) {
+            if !self.tools.is_enabled(&call.name) {
+                return Err(LocalCodeError::new(
+                    ErrorCode::AgentToolFailed,
+                    format!("Tool '{}' is disabled in LocalCode settings", call.name),
+                )
+                .with_hint("Enable it in Settings → tools if you want the agent to use it"));
+            }
+            let Some(ops) = &self.model_ops else {
+                return Err(LocalCodeError::new(
+                    ErrorCode::AgentToolFailed,
+                    "Model management is unavailable in this context",
+                )
+                .with_hint("Run this from the LocalCode TUI chat"));
+            };
+            return execute_model_tool(ops.as_ref(), call, self.config.approval(), approver)
+                .await;
+        }
+
         // HF catalogue tools are served here rather than by the registry, so
         // they must honor the same enable + approval gate the registry applies
         // to everything else (previously they bypassed both).
@@ -854,7 +892,7 @@ No tools — reply with the summary only.";
                 parts.push(
                     "You are LocalCode's default assistant — a local coding agent with full \
 access to the workspace and the Hugging Face model catalogue. You help users write code, \
-fix LocalCode itself (config, backends, deploys, GPU, logs), discover models, and launch them."
+fix LocalCode itself (config, backends, deploys, GPU, logs), discover models, and run them."
                         .into(),
                 );
                 parts.push(
@@ -863,10 +901,31 @@ Work in a loop: gather context (read/ls/grep/hf.*), then act (write/bash). Prefe
 file edits over shell redirects."
                         .into(),
                 );
+                if self.model_ops.is_some() {
+                    parts.push(
+                        "Model management tools: deploy_model, stop_model, list_deployments, \
+list_downloaded_models, delete_model, deploy_ui. When the user asks to run, deploy, stop, or \
+delete a model, call these tools directly — do not tell the user to do it manually (the \
+Models tab /models is only the manual alternative). Mutating calls ask the user for approval \
+first, so calling them is always safe."
+                            .into(),
+                    );
+                }
                 parts.push(
-                    "For Hugging Face models: use hf.search to find candidates, then \
-hf.model_card to read descriptions and recommended server flags before suggesting a deploy. \
-Users deploy from the Models tab (/models) or with your guidance."
+                    "For Hugging Face models: use hf.search to find candidates and \
+hf.model_card to read descriptions and recommended server flags before deploying."
+                        .into(),
+                );
+                parts.push(
+                    "A Hugging Face token is NOT required for public models — only for gated \
+repos. Never ask for a token or block on one unless a download actually failed with 401/403; \
+a 429 rate limit just means retry or use a mirror."
+                        .into(),
+                );
+                parts.push(
+                    "If huggingface.co does not respond, use the mirror https://hf-mirror.com: \
+hf.* tools and deploy_model fall back to it automatically; for shell commands set \
+HF_ENDPOINT=https://hf-mirror.com."
                         .into(),
                 );
                 parts.push(
@@ -975,6 +1034,18 @@ Never repeat an identical failing call or alternate between two failing calls."
                         Some("hf.model_card" | "hf.search")
                     )
                 });
+            }
+        }
+        // Model-management tools are offered only when a live registry is wired
+        // (the TUI); headless contexts never see them. Honors Settings toggles.
+        if self.model_ops.is_some() {
+            if let Some(arr) = tools.as_array_mut() {
+                arr.extend(model_tools_schema().into_iter().filter(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| self.tools.is_enabled(n))
+                        .unwrap_or(true)
+                }));
             }
         }
         let mut body = json!({

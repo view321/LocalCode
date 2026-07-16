@@ -41,7 +41,9 @@ impl SkillLoader {
                 "When the user has backend/deploy issues:\n",
                 "1. Check GPU discovery (`nvidia-smi` via bash if available).\n",
                 "2. Verify the active backend is running and healthy.\n",
-                "3. Confirm ports, PATH, and HF token if downloads fail.\n",
+                "3. If a download failed, check ports, PATH, and network first. An HF token \
+matters only for gated models (401/403); public models need none. If huggingface.co does \
+not respond, use the mirror hf-mirror.com (HF_ENDPOINT=https://hf-mirror.com).\n",
                 "4. Suggest `/doctor` and concrete config fixes.\n",
             )
             .into(),

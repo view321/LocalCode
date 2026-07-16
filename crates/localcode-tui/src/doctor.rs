@@ -52,6 +52,10 @@ pub async fn run_doctor(paths: &AppPaths, cfg: &Config) -> Value {
             "api_endpoint": hf_api_endpoint,
             "reachable": hf_ok,
             "token_set": cfg.hf_token().is_some(),
+            // The doctor JSON is fed verbatim to the assistant; without this
+            // note a bare `token_set: false` reads as a blocking failure and
+            // the model starts demanding a token for public models.
+            "token_note": "HF token only matters for gated models; public models download and deploy without one",
         },
         "api": {
             "base_url": api_base,

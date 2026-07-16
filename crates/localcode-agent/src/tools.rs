@@ -187,6 +187,12 @@ impl ToolRegistry {
             ("skill", "Load a skill's full instructions"),
             ("hf.model_card", "Fetch a Hugging Face model card (README)"),
             ("hf.search", "Search the Hugging Face model catalogue"),
+            ("deploy_model", "Deploy a Hugging Face model to a local backend"),
+            ("stop_model", "Stop a running model runtime"),
+            ("list_deployments", "List running model runtimes"),
+            ("list_downloaded_models", "List models downloaded on disk"),
+            ("delete_model", "Delete a downloaded model's weights"),
+            ("deploy_ui", "Launch the OpenWebUI browser chat"),
         ]
     }
 
