@@ -53,7 +53,43 @@ pub fn parse_quant_from_filename(name: &str) -> Option<String> {
     None
 }
 
+/// A colibrì int4 container ships as one directory the engine loads whole:
+/// `out-*.safetensors` shards, `.qs` per-row scales, plus `config.json` and the
+/// tokenizer files. Detect it from that shard/scale naming (colibrì-specific —
+/// upstream HF checkpoints don't use an `out-` prefix or `.qs` sidecars).
+fn looks_like_colibri_container(siblings: &[ModelFile]) -> bool {
+    siblings.iter().any(|f| {
+        let l = f.rfilename.to_lowercase();
+        let name = l.rsplit(['/', '\\']).next().unwrap_or(&l);
+        l.ends_with(".qs") || (name.starts_with("out-") && name.ends_with(".safetensors"))
+    })
+}
+
 pub fn discover_quants(siblings: &[ModelFile]) -> Vec<QuantGroup> {
+    // A colibrì container is a single indivisible int4 group: the engine needs
+    // config.json (architecture), the tokenizer, and the `.qs` scales alongside
+    // the shards, and it can't pull them from HF itself. Expose the *whole*
+    // sibling list as one group so every download/deploy path fetches the
+    // complete container — a shard-only download is missing config.json and
+    // `coli serve` refuses to start.
+    if looks_like_colibri_container(siblings) {
+        let files: Vec<QuantFile> = siblings
+            .iter()
+            .map(|f| QuantFile {
+                filename: f.rfilename.clone(),
+                size: f.size,
+                quant_label: "INT4".into(),
+            })
+            .collect();
+        let total_size = siblings.iter().filter_map(|f| f.size).sum();
+        return vec![QuantGroup {
+            label: "INT4".into(),
+            files,
+            total_size,
+            known: true,
+        }];
+    }
+
     let weight_exts = [".gguf", ".safetensors", ".bin", ".pt", ".pth", ".gemma"];
     let mut groups: BTreeMap<String, QuantGroup> = BTreeMap::new();
 
@@ -118,6 +154,30 @@ mod tests {
             parse_quant_from_filename("model.awq.safetensors").as_deref(),
             Some("AWQ")
         );
+    }
+
+    #[test]
+    fn colibri_container_collapses_to_one_group_with_all_files() {
+        // A colibrì repo must download whole: config.json + tokenizer + .qs
+        // scales alongside the out-*.safetensors shards, not just the shards.
+        let files = vec![
+            ModelFile { rfilename: "config.json".into(), size: Some(2_000) },
+            ModelFile { rfilename: "tokenizer.json".into(), size: Some(5_000) },
+            ModelFile { rfilename: "out-00001-of-00002.safetensors".into(), size: Some(1_000_000) },
+            ModelFile { rfilename: "out-00002-of-00002.safetensors".into(), size: Some(1_000_000) },
+            ModelFile { rfilename: "out-mtp-0.safetensors".into(), size: Some(300) },
+            ModelFile { rfilename: "layer0.qs".into(), size: Some(100) },
+            ModelFile { rfilename: ".gitattributes".into(), size: Some(50) },
+        ];
+        let g = discover_quants(&files);
+        assert_eq!(g.len(), 1, "colibrì repo is one indivisible container group");
+        let names: Vec<&str> = g[0].files.iter().map(|f| f.filename.as_str()).collect();
+        assert!(names.contains(&"config.json"), "config.json must be in the download set");
+        assert!(names.contains(&"tokenizer.json"), "tokenizer must be in the download set");
+        assert!(names.contains(&"layer0.qs"), ".qs scales must be in the download set");
+        assert!(names.contains(&"out-00001-of-00002.safetensors"));
+        assert_eq!(g[0].total_size, 2_007_450, "size sums the whole container");
+        assert_eq!(g[0].label, "INT4");
     }
 
     #[test]

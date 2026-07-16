@@ -1702,6 +1702,8 @@ name = "localcode-bench"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
+ "localcode-agent",
  "localcode-api-client",
  "localcode-core",
  "pretty_assertions",
@@ -1709,11 +1711,13 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "toml",
  "tracing",
  "uuid",
+ "which",
 ]
 
 [[package]]

@@ -69,6 +69,22 @@ pub trait ToolApprover: Send + Sync {
     async fn approve(&self, description: &str) -> bool;
 }
 
+/// Route the `bash` tool into a running container (`docker exec`) instead of a
+/// host shell. Used by the benchmark runner: the workspace directory is
+/// bind-mounted into the container at `mount_root`, file tools keep operating
+/// on the host copy (still confined to the workspace), and every shell command
+/// executes inside the container — the container, not the host text checks, is
+/// the sandbox.
+#[derive(Debug, Clone)]
+pub struct ContainerShell {
+    /// Container name or id passed to `docker exec`.
+    pub container: String,
+    /// Absolute path the workspace is mounted at inside the container
+    /// (e.g. `/workspace`). Also accepted as a path prefix by the file tools,
+    /// so `read /workspace/src/x.py` and `read src/x.py` are the same file.
+    pub mount_root: String,
+}
+
 /// Whether `call` needs interactive approval under `mode`.
 pub fn approval_request(call: &ToolCall, mode: ApprovalMode) -> Option<String> {
     let arg = |k: &str| call.arguments.get(k).and_then(|v| v.as_str()).unwrap_or("?");
@@ -147,6 +163,9 @@ pub struct ToolRegistry {
     shell_sandbox: bool,
     /// Wall-clock cap for a single `bash` command.
     exec_timeout: Duration,
+    /// When set, `bash` runs inside this container instead of a host shell,
+    /// and file-tool paths under its mount root map back into the workspace.
+    container_shell: Option<ContainerShell>,
 }
 
 impl ToolRegistry {
@@ -155,6 +174,7 @@ impl ToolRegistry {
             disabled: std::collections::HashSet::new(),
             shell_sandbox: true,
             exec_timeout: Duration::from_secs(DEFAULT_EXEC_TIMEOUT_SECS),
+            container_shell: None,
         }
     }
 
@@ -172,7 +192,60 @@ impl ToolRegistry {
             disabled: disabled.into_iter().collect(),
             shell_sandbox,
             exec_timeout: Duration::from_secs(secs),
+            container_shell: None,
         }
+    }
+
+    /// Route `bash` into a container (see [`ContainerShell`]). `None` restores
+    /// the host shell.
+    pub fn set_container_shell(&mut self, cs: Option<ContainerShell>) {
+        self.container_shell = cs;
+    }
+
+    pub fn container_shell(&self) -> Option<&ContainerShell> {
+        self.container_shell.as_ref()
+    }
+
+    /// Map a container-absolute path back to a workspace-relative one, so the
+    /// file tools accept the paths the model sees in the container shell
+    /// (`/workspace/src/x.py` → `src/x.py`). Paths outside the mount root (or
+    /// when no container is set) pass through unchanged and hit the normal
+    /// workspace confinement.
+    fn localize_path(&self, p: &str) -> String {
+        let Some(cs) = &self.container_shell else {
+            return p.to_string();
+        };
+        let root = cs.mount_root.trim_end_matches('/');
+        if root.is_empty() {
+            return p.to_string();
+        }
+        if p == root {
+            return ".".into();
+        }
+        if let Some(rest) = p.strip_prefix(root) {
+            if let Some(rel) = rest.strip_prefix('/') {
+                return if rel.is_empty() { ".".into() } else { rel.to_string() };
+            }
+        }
+        p.to_string()
+    }
+
+    /// Resolve a path argument against the workspace, mapping container-mount
+    /// prefixes first (see [`Self::localize_path`]).
+    fn arg_path(
+        &self,
+        call: &ToolCall,
+        workspace: &Path,
+        key: &str,
+    ) -> Result<PathBuf, LocalCodeError> {
+        let p = call
+            .arguments
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                LocalCodeError::new(ErrorCode::AgentToolFailed, format!("{key} required"))
+            })?;
+        resolve_path(workspace, &self.localize_path(p))
     }
 
     /// Built-in tool catalog: `(name, one-line description)`.
@@ -391,7 +464,7 @@ impl ToolRegistry {
     }
 
     fn tool_read(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
-        let path = arg_path(call, workspace, "path")?;
+        let path = self.arg_path(call, workspace, "path")?;
         let meta = std::fs::metadata(&path).map_err(|e| {
             LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string())
                 .with_cause(format!("Cannot stat {}", path.display()))
@@ -489,7 +562,7 @@ impl ToolRegistry {
     }
 
     fn tool_write(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
-        let path = arg_path(call, workspace, "path")?;
+        let path = self.arg_path(call, workspace, "path")?;
         // `content` is required and must be a string. Defaulting a missing or
         // non-string value to "" would silently truncate an existing file to
         // zero bytes and report success — a dropped `content` field (or one
@@ -519,7 +592,7 @@ impl ToolRegistry {
     /// only ever touch the matched region, so it never drops content the model
     /// hasn't seen (e.g. the tail of a file too large to read in full).
     fn tool_edit(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
-        let path = arg_path(call, workspace, "path")?;
+        let path = self.arg_path(call, workspace, "path")?;
         let old = call
             .arguments
             .get("old_string")
@@ -611,8 +684,13 @@ impl ToolRegistry {
         // A missing path lists the workspace root, but a *supplied* path that is
         // invalid or escapes the workspace must surface an error rather than
         // silently listing the root (the model would trust a wrong result).
-        let path = match call.arguments.get("path").and_then(|v| v.as_str()) {
-            Some(p) if !p.is_empty() && p != "." => resolve_path(workspace, p)?,
+        let path = match call
+            .arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| self.localize_path(p))
+        {
+            Some(p) if !p.is_empty() && p != "." => resolve_path(workspace, &p)?,
             _ => workspace.to_path_buf(),
         };
         let mut entries = vec![];
@@ -658,7 +736,7 @@ impl ToolRegistry {
             .arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| resolve_path(workspace, p))
+            .map(|p| resolve_path(workspace, &self.localize_path(p)))
             .transpose()?
             .unwrap_or_else(|| workspace.to_path_buf());
         let re = regex::Regex::new(pattern)
@@ -729,7 +807,7 @@ impl ToolRegistry {
             .get("working_directory")
             .and_then(|v| v.as_str())
         {
-            Some(p) if !p.is_empty() => resolve_path(workspace, p)?,
+            Some(p) if !p.is_empty() => resolve_path(workspace, &self.localize_path(p))?,
             _ => std::fs::canonicalize(workspace).map_err(|e| {
                 LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string())
             })?,
@@ -740,11 +818,47 @@ impl ToolRegistry {
                 format!("working_directory is not a directory: {}", cwd.display()),
             ));
         }
+        // Container mode: the command runs inside the container via
+        // `docker exec`; the container is the confinement, so the host
+        // text-based sandbox checks (which would reject legitimate absolute
+        // paths like /usr/bin/python3) do not apply.
+        if let Some(cs) = &self.container_shell {
+            let container_cwd = container_cwd(&cwd, workspace, &cs.mount_root)?;
+            let mut cmd = Command::new("docker");
+            // Non-login shell: `sh -l` sources /etc/profile, which resets
+            // PATH and hides image-provided toolchains (e.g. cargo in
+            // rust:*-slim lives in /usr/local/cargo/bin via an image ENV).
+            cmd.args(["exec", "-w", &container_cwd, &cs.container, "sh", "-c", command]);
+            return run_command_capture(cmd, self.exec_timeout).await;
+        }
         if self.shell_sandbox {
             sandbox_check_command(command, workspace)?;
         }
         run_shell(command, &cwd, workspace, self.shell_sandbox, self.exec_timeout).await
     }
+}
+
+/// Where `host_cwd` (a resolved path under `workspace`) lives inside the
+/// container, given the workspace is mounted at `mount_root`.
+fn container_cwd(
+    host_cwd: &Path,
+    workspace: &Path,
+    mount_root: &str,
+) -> Result<String, LocalCodeError> {
+    let ws = std::fs::canonicalize(workspace)
+        .map_err(|e| LocalCodeError::new(ErrorCode::AgentWorkspaceMissing, e.to_string()))?;
+    let rel = host_cwd.strip_prefix(&ws).unwrap_or(Path::new(""));
+    let mut out = mount_root.trim_end_matches('/').to_string();
+    if out.is_empty() {
+        out.push('/');
+    }
+    for comp in rel.components() {
+        if let Component::Normal(part) = comp {
+            out.push('/');
+            out.push_str(&part.to_string_lossy());
+        }
+    }
+    Ok(out)
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -851,15 +965,25 @@ async fn run_shell(
         c.env("PWD", cwd);
         c
     };
-    cmd.current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.current_dir(cwd);
     if sandbox {
         // Hint for tools that respect it; real confinement is cwd + checks.
         cmd.env("LOCALCODE_WORKSPACE", workspace);
     }
+    run_command_capture(cmd, exec_timeout).await
+}
+
+/// Spawn `cmd`, capture stdout+stderr (bounded drain), enforce the wall-clock
+/// cap, and format the combined output + exit code the way the model expects.
+/// Shared by the host shell and the container (`docker exec`) path.
+async fn run_command_capture(
+    mut cmd: Command,
+    exec_timeout: Duration,
+) -> Result<ToolResult, LocalCodeError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = cmd
         .spawn()
         .map_err(|e| LocalCodeError::new(ErrorCode::AgentToolFailed, e.to_string()))?;
@@ -928,17 +1052,6 @@ fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
             "parameters": parameters
         }
     })
-}
-
-fn arg_path(call: &ToolCall, workspace: &Path, key: &str) -> Result<PathBuf, LocalCodeError> {
-    let p = call
-        .arguments
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            LocalCodeError::new(ErrorCode::AgentToolFailed, format!("{key} required"))
-        })?;
-    resolve_path(workspace, p)
 }
 
 fn escape_err() -> LocalCodeError {
@@ -1578,6 +1691,62 @@ mod tests {
         assert!(sandbox_check_command("git log main..HEAD", &ws).is_ok());
         // A plain relative command is fine.
         assert!(sandbox_check_command("cargo build", &ws).is_ok());
+    }
+
+    #[test]
+    fn container_paths_localize_to_workspace() {
+        let mut reg = ToolRegistry::default_tools();
+        // Without a container, paths pass through untouched.
+        assert_eq!(reg.localize_path("/workspace/src/a.py"), "/workspace/src/a.py");
+        reg.set_container_shell(Some(ContainerShell {
+            container: "c1".into(),
+            mount_root: "/workspace".into(),
+        }));
+        assert_eq!(reg.localize_path("/workspace/src/a.py"), "src/a.py");
+        assert_eq!(reg.localize_path("/workspace"), ".");
+        assert_eq!(reg.localize_path("/workspace/"), ".");
+        // A sibling that merely shares the prefix is NOT under the mount.
+        assert_eq!(reg.localize_path("/workspace-evil/x"), "/workspace-evil/x");
+        // Relative paths are untouched.
+        assert_eq!(reg.localize_path("src/a.py"), "src/a.py");
+        // Other absolute paths are untouched (and will be rejected by the
+        // workspace confinement downstream).
+        assert_eq!(reg.localize_path("/etc/passwd"), "/etc/passwd");
+    }
+
+    #[tokio::test]
+    async fn localized_container_path_reads_workspace_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hi from host").unwrap();
+        let mut reg = ToolRegistry::default_tools();
+        reg.set_container_shell(Some(ContainerShell {
+            container: "unused".into(),
+            mount_root: "/workspace".into(),
+        }));
+        let call = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "/workspace/hello.txt"}),
+        };
+        let r = reg
+            .execute(&call, dir.path(), ApprovalMode::AlwaysApprove, None, None)
+            .await
+            .unwrap();
+        assert_eq!(r.output, "hi from host");
+    }
+
+    #[test]
+    fn container_cwd_maps_subdirs() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("sub").join("deep")).unwrap();
+        let canon = std::fs::canonicalize(&ws).unwrap();
+        assert_eq!(container_cwd(&canon, &ws, "/workspace").unwrap(), "/workspace");
+        let sub = std::fs::canonicalize(ws.join("sub").join("deep")).unwrap();
+        assert_eq!(
+            container_cwd(&sub, &ws, "/workspace").unwrap(),
+            "/workspace/sub/deep"
+        );
     }
 
     #[tokio::test]

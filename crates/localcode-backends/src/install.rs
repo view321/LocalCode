@@ -599,11 +599,9 @@ fn write_prism_marker(dest_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     std::fs::write(
         dest_dir.join(PRISM_MARKER),
-        format!(
-            "repo=https://github.com/PrismML-Eng/llama.cpp\n\
-             purpose=Bonsai / Q1_0_g128 hybrid-attention kernels\n\
-             installed_by=localcode\n"
-        ),
+        "repo=https://github.com/PrismML-Eng/llama.cpp\n\
+         purpose=Bonsai / Q1_0_g128 hybrid-attention kernels\n\
+         installed_by=localcode\n",
     )
     .map_err(|e| e.to_string())
 }

@@ -21,6 +21,7 @@ use crate::{
     ModelDeploySpec, ModelMonitors, ProcState, RunningEndpoint,
 };
 use async_trait::async_trait;
+use localcode_gpu::GpuInventory;
 use localcode_core::config::ColibriConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::{AppEvent, EventBus};
@@ -257,11 +258,35 @@ impl InferenceBackend for ColibriBackend {
             built,
             spec.command_override.as_deref(),
         );
-        // The dash card's command is click-to-copy; when the model dir travels
-        // via env only (Hy3 fork, or a user override), show the env assignment
-        // so the copied line actually reproduces the launch.
+
+        // Use a GPU when one is present (unless the launch already pins --gpu).
+        // The CUDA env rides alongside --auto-tier, so the planner folds the GPU
+        // tier into its plan. discover() degrades to an empty inventory (CPU
+        // only) when there's no nvidia-smi, leaving the env untouched.
+        let user_pinned_gpu = args.iter().any(|a| a == "--gpu");
+        let inventory = localcode_gpu::discover().unwrap_or_else(|_| GpuInventory {
+            devices: vec![],
+            detection_method: "none".into(),
+            warnings: vec![],
+        });
+        let gpu_env = gpu_env_for(&inventory, user_pinned_gpu);
+        if !gpu_env.is_empty() {
+            info!(%cid, engine = self.kind.as_str(), "colibrì: GPU detected — enabling CUDA ({gpu_env:?})");
+        }
+
+        // The dash card's command is click-to-copy; surface the env the launch
+        // actually uses so the copied line reproduces it. COLI_MODEL rides here
+        // when it can't go on the command line (Hy3 fork, or a user override);
+        // COLI_API_KEY is a secret and deliberately omitted.
+        let mut env_prefix = String::new();
+        for (k, v) in &gpu_env {
+            env_prefix.push_str(&format!("{k}={v} "));
+        }
         if !args.iter().any(|a| a == "--model") {
-            command = format!("COLI_MODEL={} {command}", model_dir.display());
+            env_prefix.push_str(&format!("COLI_MODEL={} ", model_dir.display()));
+        }
+        if !env_prefix.is_empty() {
+            command = format!("{env_prefix}{command}");
         }
 
         let runtime_id = Uuid::new_v4();
@@ -273,6 +298,9 @@ impl InferenceBackend for ColibriBackend {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for (k, v) in &gpu_env {
+            cmd.env(k, v);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
                 .with_correlation(cid)
@@ -432,12 +460,49 @@ fn build_args(
     // colibrì's tiering knobs (--ram/--vram/--gpu) ride through extra_args —
     // the generic tuning fields (gpu fraction / tensor parallel / gpu layers)
     // have no coli equivalent and are deliberately not mapped.
+    let mut has_manual_tier = false;
     for a in &tuning.extra_args {
-        if !a.is_empty() {
-            args.push(a.clone());
+        if a.is_empty() {
+            continue;
         }
+        // An explicit budget (or a hand-supplied --auto-tier) opts out of the
+        // default planner below.
+        if matches!(a.as_str(), "--auto-tier" | "--ram" | "--vram") {
+            has_manual_tier = true;
+        }
+        args.push(a.clone());
+    }
+    // Default to colibrì's automatic tier planner: it sizes the RAM / VRAM /
+    // disk hierarchy to this machine, and (with COLI_CUDA/COLI_GPU set by
+    // `deploy` when a GPU is present) folds the GPU tier into that plan. Skip it
+    // only when the caller pinned an explicit budget.
+    if !has_manual_tier {
+        args.push("--auto-tier".into());
     }
     args
+}
+
+/// The environment that switches colibrì onto a GPU: enable the CUDA backend
+/// and select the device with the most VRAM. Empty when the caller already
+/// pinned `--gpu` (manual control) or no GPU is present — `--auto-tier` then
+/// plans a CPU/RAM hierarchy. The VRAM budget is left to `--auto-tier`, so no
+/// `CUDA_EXPERT_GB` is forced here.
+///
+/// `COLI_CUDA`/`COLI_GPU` are the portable channel across both engines:
+/// upstream colibrì reads them directly, and the Hy3 fork treats `COLI_GPU` as
+/// its `--gpu` flag — so this turns the GPU on without a fork-specific serve
+/// flag that the other engine might reject.
+fn gpu_env_for(inv: &GpuInventory, user_pinned_gpu: bool) -> Vec<(&'static str, String)> {
+    if user_pinned_gpu {
+        return vec![];
+    }
+    match inv.devices.iter().max_by_key(|d| d.total_vram_bytes) {
+        Some(dev) => vec![
+            ("COLI_CUDA", "1".to_string()),
+            ("COLI_GPU", dev.index.to_string()),
+        ],
+        None => vec![],
+    }
 }
 
 /// The `(program, args)` a colibrì deploy would spawn — used to seed the
@@ -506,5 +571,77 @@ mod tests {
         );
         let ram_pos = args.iter().position(|a| a == "--ram").expect("--ram");
         assert_eq!(args[ram_pos + 1], "12");
+        // An explicit --ram budget opts out of the default auto-tier planner.
+        assert!(!args.iter().any(|a| a == "--auto-tier"));
+    }
+
+    #[test]
+    fn default_deploy_enables_auto_tier() {
+        for kind in [BackendKind::Colibri, BackendKind::ColibriHy3] {
+            let args = build_args(kind, "127.0.0.1", 8091, Path::new("/m"), &DeployTuning::default());
+            assert!(
+                args.iter().any(|a| a == "--auto-tier"),
+                "{kind:?} should default to --auto-tier"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_vram_or_auto_tier_is_not_doubled() {
+        // A hand-supplied --auto-tier isn't appended a second time.
+        let tuning = DeployTuning {
+            extra_args: vec!["--auto-tier".into()],
+            ..Default::default()
+        };
+        let args = build_args(BackendKind::Colibri, "127.0.0.1", 8091, Path::new("/m"), &tuning);
+        assert_eq!(args.iter().filter(|a| *a == "--auto-tier").count(), 1);
+
+        // An explicit --vram budget opts out of the planner entirely.
+        let tuning = DeployTuning {
+            extra_args: vec!["--vram".into(), "14".into()],
+            ..Default::default()
+        };
+        let args = build_args(BackendKind::ColibriHy3, "0.0.0.0", 8092, Path::new("/m"), &tuning);
+        assert!(!args.iter().any(|a| a == "--auto-tier"));
+    }
+
+    fn gpu(index: u32, total_gib: u64) -> localcode_gpu::GpuDevice {
+        localcode_gpu::GpuDevice {
+            index,
+            name: format!("dev{index}"),
+            total_vram_bytes: total_gib << 30,
+            free_vram_bytes: total_gib << 30,
+            driver_version: None,
+            backend_affinity: vec![],
+            temperature_c: None,
+            utilization_pct: None,
+            power_draw_w: None,
+        }
+    }
+
+    fn inventory(devices: Vec<localcode_gpu::GpuDevice>) -> GpuInventory {
+        GpuInventory { devices, detection_method: "test".into(), warnings: vec![] }
+    }
+
+    #[test]
+    fn gpu_env_enables_cuda_on_largest_device() {
+        // Two GPUs: pick the one with the most VRAM (index 1, 24 GiB).
+        let env = gpu_env_for(&inventory(vec![gpu(0, 8), gpu(1, 24)]), false);
+        assert!(env.iter().any(|(k, v)| *k == "COLI_CUDA" && v == "1"));
+        assert!(
+            env.iter().any(|(k, v)| *k == "COLI_GPU" && v == "1"),
+            "should target the 24 GiB device (index 1)"
+        );
+    }
+
+    #[test]
+    fn gpu_env_empty_without_gpu() {
+        assert!(gpu_env_for(&inventory(vec![]), false).is_empty());
+    }
+
+    #[test]
+    fn gpu_env_empty_when_user_pinned_gpu() {
+        // A user-supplied --gpu means manual control; don't inject the env.
+        assert!(gpu_env_for(&inventory(vec![gpu(0, 24)]), true).is_empty());
     }
 }

@@ -1,0 +1,22 @@
+title = "Implement statistics helpers"
+domain = "rust"
+tier = 1
+image = "rust:1-slim"
+network = "none"
+timeout_secs = 900
+exec_timeout_secs = 240
+prompt = """
+The workspace is a Rust library crate (`stats`) whose three public functions in
+`src/lib.rs` — `mean`, `median`, and `percentile` — are unimplemented (`todo!()`).
+Implement all three exactly as their doc comments specify. Do not change the
+signatures and do not add dependencies (there is no network; build with
+`cargo build --offline` / `cargo test --offline`). Verify your work compiles and
+behaves correctly before finishing.
+"""
+
+[grader]
+timeout_secs = 300
+
+[[grader.checks]]
+name = "cargo test"
+cmd = "cargo test --offline"

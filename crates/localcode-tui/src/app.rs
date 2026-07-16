@@ -42,7 +42,6 @@ use localcode_backends::{
     OPENWEBUI_DEFAULT_PORT,
 };
 use localcode_core::config::LocalAssistantPreference;
-use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
 use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::{AppEvent, EventBus, Severity};
@@ -179,6 +178,7 @@ impl Mode {
             Mode::Models => "search models — type to filter, Enter to run",
             Mode::Dash => "↑↓ pick a model for the next request · Enter to chat with it",
             Mode::Sessions => "↑↓ pick a past chat · Enter to resume it",
+            Mode::Bench => "↑↓ pick a suite · Enter benchmarks the active model (Esc cancels)",
             Mode::Settings => "↑↓ move · Enter toggle/edit · or type to chat",
             _ => "type to chat, or / for commands",
         }
@@ -625,6 +625,36 @@ struct BgChat {
     done: bool,
 }
 
+/// One task row in the /bench run view.
+pub struct BenchRow {
+    pub task_id: String,
+    pub title: String,
+    pub state: BenchRowState,
+    /// Last phase or tool-activity line, for the live view.
+    pub activity: String,
+    pub score: Option<f64>,
+    pub started: Instant,
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchRowState {
+    Pending,
+    Running,
+    Passed,
+    Failed,
+    Error,
+}
+
+/// Live/last state of a benchmark run rendered by /bench.
+pub struct BenchRunView {
+    pub suite_id: String,
+    pub model: String,
+    pub rows: Vec<BenchRow>,
+    pub summary: Option<localcode_bench::RunSummary>,
+    pub cancelled: bool,
+}
+
 /// The last failed operation, so the error modal's Retry button can actually
 /// retry instead of telling the user to do it themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +748,9 @@ pub enum BgMsg {
         description: String,
         respond: oneshot::Sender<bool>,
     },
-    BenchDone(Result<localcode_bench::RunResult, LocalCodeError>),
+    /// Live progress from a running benchmark suite.
+    BenchEvent(localcode_bench::RunEvent),
+    BenchDone(Result<localcode_bench::RunSummary, LocalCodeError>),
     AssistantDone(Result<String, LocalCodeError>),
     /// Background auto-repair: assistant finished diagnosing an error.
     AssistantAutoDone(Result<String, LocalCodeError>),
@@ -1234,9 +1266,16 @@ pub struct App {
     pub settings_view_height: u16,
     settings_editing: Option<SettingField>,
     settings_field_edit: String,
-    // Bench
-    pub last_bench_summary: String,
-    pub last_bench_result: Option<localcode_bench::RunResult>,
+    // Bench (agentic benchmark)
+    /// Installed suites (built-in smoke materialized on refresh).
+    pub bench_suites: Vec<localcode_bench::SuiteInfo>,
+    pub bench_selected: usize,
+    /// Live/last run for the /bench view.
+    pub bench_run: Option<BenchRunView>,
+    pub bench_scroll: u16,
+    /// Updated during draw so wheel scrolling knows the bounds.
+    pub bench_total_lines: usize,
+    pub bench_view_height: u16,
     // Services
     events: EventBus,
     registry: Arc<BackendRegistry>,
@@ -1446,8 +1485,12 @@ impl App {
             settings_view_height: 0,
             settings_editing: None,
             settings_field_edit: String::new(),
-            last_bench_summary: "No runs yet.".into(),
-            last_bench_result: None,
+            bench_suites: Vec::new(),
+            bench_selected: 0,
+            bench_run: None,
+            bench_scroll: 0,
+            bench_total_lines: 0,
+            bench_view_height: 0,
             events,
             registry,
             hf,
@@ -2142,6 +2185,16 @@ impl App {
                 if let Some(url) = self.pre_remote_ollama_url.take() {
                     self.config.backends.ollama.base_url = url;
                 }
+            }
+            if b.kind == BusyKind::Bench {
+                // The aborted run leaves its task container behind — sweep by
+                // label so nothing keeps running (and holding the workspace).
+                if let Some(run) = &mut self.bench_run {
+                    run.cancelled = true;
+                }
+                tokio::spawn(async move {
+                    localcode_bench::cleanup_stale_containers().await;
+                });
             }
             self.set_status(format!("Cancelled: {}", b.label), false);
         } else if let Some(b) = self.update_busy.take() {
@@ -3353,43 +3406,158 @@ impl App {
         });
     }
 
+    /// Refresh the installed-suite list (materializes the built-in smoke
+    /// suite) and keep the selection in range.
+    fn refresh_bench_suites(&mut self) {
+        self.bench_suites = localcode_bench::prepare_suites(&self.paths.data_dir);
+        if self.bench_selected >= self.bench_suites.len() {
+            self.bench_selected = self.bench_suites.len().saturating_sub(1);
+        }
+    }
+
+    /// Run the selected suite against the active runtime: one Docker container
+    /// per task, the coding agent inside, hidden-test grading after.
     fn start_bench(&mut self) {
         if self.fg_busy() {
             self.set_status("Busy — Esc to cancel first", false);
             return;
         }
-        let Some(runtime) = self.active_runtime() else {
-            self.set_status("Deploy a runtime first", true);
+        if self.bench_suites.is_empty() {
+            self.refresh_bench_suites();
+        }
+        let Some(info) = self.bench_suites.get(self.bench_selected).cloned() else {
+            self.set_status(
+                "No benchmark suites installed — localcode bench pull <dir-or-url>",
+                true,
+            );
             return;
         };
-        let suite = sample_coding_suite();
-        let subject = Subject {
-            hf_model_id: runtime.model_id.clone().unwrap_or_else(|| "unknown".into()),
-            quantization: runtime
-                .quantization
-                .clone()
-                .unwrap_or_else(|| "unknown".into()),
-            weight_source: "local".into(),
-            backend: format!("{:?}", runtime.kind),
-            backend_version: "unknown".into(),
-            precision_notes: String::new(),
-            hardware: serde_json::to_value(&self.gpu).unwrap_or_default(),
+        let Some(runtime) = self.active_runtime() else {
+            self.set_status("Deploy a runtime first — the bench needs a model", true);
+            return;
         };
-        let runner = BenchRunner::new(self.events.clone());
+        if !localcode_bench::docker_available() {
+            self.last_failed_action = Some(RetryAction::RunBench);
+            self.raise_error(localcode_bench::docker_missing_err());
+            return;
+        }
+        let suite = match localcode_bench::load_bench_suite(&info.path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_failed_action = Some(RetryAction::RunBench);
+                self.raise_error(e);
+                return;
+            }
+        };
+
+        let model = runtime
+            .model_id
+            .clone()
+            .unwrap_or_else(|| runtime.name.clone());
+        self.bench_run = Some(BenchRunView {
+            suite_id: suite.meta.id.clone(),
+            model,
+            rows: suite
+                .tasks
+                .iter()
+                .map(|t| BenchRow {
+                    task_id: t.spec.id.clone(),
+                    title: t.spec.title.clone(),
+                    state: BenchRowState::Pending,
+                    activity: String::new(),
+                    score: None,
+                    started: Instant::now(),
+                    elapsed_ms: None,
+                })
+                .collect(),
+            summary: None,
+            cancelled: false,
+        });
+        self.bench_scroll = 0;
+
+        let opts = localcode_bench::RunOptions {
+            suite,
+            runs_root: localcode_bench::runs_root(&self.paths.data_dir),
+            runtime: Some(runtime),
+            base_agent_config: self.config.agent.clone(),
+            oracle: false,
+            task_filter: None,
+        };
         let tx = self.bg_tx.clone();
+        let ev_bridge = self.bg_tx.clone();
         let handle = tokio::spawn(async move {
-            let result = runner
-                .run(
-                    &suite,
-                    subject,
-                    &runtime.base_url,
-                    runtime.api_key.as_deref(),
-                    runtime.model_id.as_deref().unwrap_or("default"),
-                )
-                .await;
+            // Bridge runner events into the UI channel.
+            let (etx, mut erx) = mpsc::unbounded_channel::<localcode_bench::RunEvent>();
+            let fwd = tokio::spawn(async move {
+                while let Some(ev) = erx.recv().await {
+                    let _ = ev_bridge.send(BgMsg::BenchEvent(ev));
+                }
+            });
+            let result = localcode_bench::run_suite(opts, etx).await;
+            let _ = fwd.await;
             let _ = tx.send(BgMsg::BenchDone(result));
         });
-        self.begin_busy(BusyKind::Bench, "Running benchmark", handle);
+        self.begin_busy(BusyKind::Bench, "Benchmark running", handle);
+    }
+
+    /// Fold one runner event into the /bench view state.
+    fn apply_bench_event(&mut self, ev: localcode_bench::RunEvent) {
+        use localcode_bench::RunEvent as Ev;
+        let Some(run) = &mut self.bench_run else {
+            return;
+        };
+        fn row_mut<'a>(run: &'a mut BenchRunView, id: &str) -> Option<&'a mut BenchRow> {
+            run.rows.iter_mut().find(|r| r.task_id == id)
+        }
+        match ev {
+            Ev::RunStarted { .. } => {}
+            Ev::TaskStarted { task_id, .. } => {
+                if let Some(row) = row_mut(run, &task_id) {
+                    row.state = BenchRowState::Running;
+                    row.started = Instant::now();
+                    row.activity = "starting".into();
+                }
+            }
+            Ev::TaskPhase { task_id, phase } => {
+                if let Some(row) = row_mut(run, &task_id) {
+                    row.activity = phase.to_string();
+                }
+            }
+            Ev::AgentActivity { task_id, line } => {
+                if let Some(row) = row_mut(run, &task_id) {
+                    row.activity = line;
+                }
+            }
+            Ev::TaskFinished { task_id, report } => {
+                if let Some(row) = row_mut(run, &task_id) {
+                    row.elapsed_ms = Some(row.started.elapsed().as_millis() as u64);
+                    row.score = Some(report.score);
+                    row.state = match report.status {
+                        localcode_bench::TaskStatus::Passed => BenchRowState::Passed,
+                        localcode_bench::TaskStatus::Failed => BenchRowState::Failed,
+                        localcode_bench::TaskStatus::Error => BenchRowState::Error,
+                    };
+                    row.activity = match report.status {
+                        localcode_bench::TaskStatus::Passed => String::new(),
+                        localcode_bench::TaskStatus::Failed => {
+                            let failing: Vec<&str> = report
+                                .checks
+                                .iter()
+                                .filter(|c| !c.passed)
+                                .map(|c| c.name.as_str())
+                                .collect();
+                            format!("failed: {}", failing.join(", "))
+                        }
+                        localcode_bench::TaskStatus::Error => {
+                            report.error.clone().unwrap_or_else(|| "error".into())
+                        }
+                    };
+                }
+            }
+            Ev::RunFinished { summary } => {
+                run.summary = Some(summary);
+            }
+        }
     }
 
     fn start_assistant(&mut self) {
@@ -5279,18 +5447,21 @@ impl App {
                         ConfirmAction::ToolApproval,
                     ));
                 }
+                BgMsg::BenchEvent(ev) => self.apply_bench_event(ev),
                 BgMsg::BenchDone(result) => {
                     self.finish_busy();
                     match result {
-                        Ok(result) => {
-                            self.last_bench_summary = format!(
-                                "score={:.2} pass_rate={:.0}% p50={}ms",
-                                result.metrics.score,
-                                result.metrics.pass_rate * 100.0,
-                                result.metrics.latency_p50_ms
+                        Ok(summary) => {
+                            self.set_status(
+                                format!(
+                                    "Benchmark complete — score {:.2}, {}/{} passed",
+                                    summary.score, summary.tasks_passed, summary.tasks_total
+                                ),
+                                false,
                             );
-                            self.last_bench_result = Some(result);
-                            self.set_status("Benchmark complete", false);
+                            if let Some(run) = &mut self.bench_run {
+                                run.summary = Some(summary);
+                            }
                         }
                         Err(e) => {
                             self.last_failed_action = Some(RetryAction::RunBench);
@@ -5755,7 +5926,7 @@ impl App {
             ("/runtimes", "", "active runtimes & system overview"),
             ("/remote", "", "connect a GPU server over SSH"),
             ("/backends", "", "install & configure inference backends"),
-            ("/bench", "", "run the sample benchmark suite"),
+            ("/bench", "", "benchmark the active model on sandboxed coding tasks"),
             ("/setup", "", "first-run setup & doctor"),
             ("/settings", "", "preferences & config file"),
             ("/mode", "[always|auto|edits|ask]", "how much the agent asks before running tools"),
@@ -7162,6 +7333,11 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 .position(|c| c.runtime_index == Some(self.runtime_selected))
                 .unwrap_or(0);
         }
+        // The /bench suite list reads the disk — refresh on entry (also
+        // materializes the built-in smoke suite on first open).
+        if mode == Mode::Bench {
+            self.refresh_bench_suites();
+        }
     }
 
     /// Selection / scroll keys for the active mode (arrows, page keys, Tab).
@@ -7283,8 +7459,26 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 }
                 _ => {}
             },
-            Mode::Bench => {}
+            Mode::Bench => match code {
+                KeyCode::Down => {
+                    let n = self.bench_suites.len();
+                    if n > 0 {
+                        self.bench_selected = (self.bench_selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Up => self.bench_selected = self.bench_selected.saturating_sub(1),
+                KeyCode::PageDown => self.scroll_bench(6),
+                KeyCode::PageUp => self.scroll_bench(-6),
+                _ => {}
+            },
         }
+    }
+
+    fn scroll_bench(&mut self, delta: i64) {
+        let max = self
+            .bench_total_lines
+            .saturating_sub(self.bench_view_height as usize) as i64;
+        self.bench_scroll = (self.bench_scroll as i64 + delta).clamp(0, max.max(0)) as u16;
     }
 
     /// Enter in the omnibar: run a model search, submit a chat prompt (from any
@@ -7765,6 +7959,7 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             Mode::Chat => self.scroll_transcript(delta),
             Mode::Models => self.scroll_card(delta),
             Mode::Dash => self.scroll_dash(delta),
+            Mode::Bench => self.scroll_bench(delta),
             Mode::Sessions => self.scroll_sessions(delta),
             Mode::Setup => {
                 self.setup_scroll = (i64::from(self.setup_scroll) + delta).max(0) as u16;

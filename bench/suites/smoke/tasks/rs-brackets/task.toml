@@ -1,0 +1,21 @@
+title = "Fix the bracket balance checker"
+domain = "rust"
+tier = 1
+image = "rust:1-slim"
+network = "none"
+timeout_secs = 900
+exec_timeout_secs = 240
+prompt = """
+The Rust library crate in the workspace exports `balanced(s: &str) -> bool`, a checker
+for (), [], {} nesting. QA reports it wrongly accepts some malformed inputs. Find and
+fix the bug so the function matches its doc comment exactly. Do not change the
+signature and do not add dependencies (there is no network; use `cargo build --offline`
+/ `cargo test --offline`). Verify with your own cases before finishing.
+"""
+
+[grader]
+timeout_secs = 300
+
+[[grader.checks]]
+name = "cargo test"
+cmd = "cargo test --offline"

@@ -14,7 +14,8 @@ pub use session_store::{
 };
 pub use skills::{Skill, SkillLoader};
 pub use tools::{
-    approval_request, ToolApprover, ToolCall, ToolRegistry, ToolResult, ToolRisk,
+    approval_request, ContainerShell, ToolApprover, ToolCall, ToolRegistry, ToolResult,
+    ToolRisk,
 };
 
 use futures::StreamExt;
@@ -326,6 +327,15 @@ impl CodingAgent {
     /// pool warm rather than discarding it every turn.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Run every `bash` call inside a container (`docker exec`) instead of a
+    /// host shell, with the workspace mounted at `cs.mount_root`. File tools
+    /// keep operating on the host copy of the workspace (still confined to
+    /// it). Used by the benchmark runner, where the container is the sandbox.
+    pub fn with_container_shell(mut self, cs: ContainerShell) -> Self {
+        self.tools.set_container_shell(Some(cs));
         self
     }
 
@@ -946,9 +956,21 @@ Never repeat an identical failing call or alternate between two failing calls."
             }
         }
 
-        parts.push(format!("Workspace: {}", session.workspace_root.display()));
-        if self.config.shell_sandbox {
-            parts.push("Shell sandbox is on: bash runs in the workspace only.".into());
+        // In container mode the model's world is the mount point, not the host
+        // path — showing a host path would tempt it into host-style paths that
+        // don't exist inside the container shell.
+        match self.tools.container_shell() {
+            Some(cs) => parts.push(format!(
+                "Workspace: {} — bash runs inside a Linux container whose working \
+directory is the workspace; file tools take paths relative to it.",
+                cs.mount_root
+            )),
+            None => {
+                parts.push(format!("Workspace: {}", session.workspace_root.display()));
+                if self.config.shell_sandbox {
+                    parts.push("Shell sandbox is on: bash runs in the workspace only.".into());
+                }
+            }
         }
 
         let enabled_skills: Vec<&Skill> = self

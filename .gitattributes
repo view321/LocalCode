@@ -1,0 +1,3 @@
+# Benchmark suite files are consumed inside Linux containers and embedded
+# into the binary verbatim — keep them LF regardless of core.autocrlf.
+bench/** text eol=lf

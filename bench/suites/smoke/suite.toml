@@ -1,0 +1,4 @@
+id = "smoke"
+title = "Smoke — cross-language pipeline check"
+version = "0.1.0"
+description = "8 small feature/bugfix tasks across Python, JavaScript, Rust, and C on stock Docker images. Validates the bench pipeline end-to-end and gives a quick capability floor for a model."

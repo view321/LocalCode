@@ -1,0 +1,18 @@
+title = "Fix the ring buffer wraparound"
+domain = "c"
+tier = 1
+image = "gcc:14"
+network = "none"
+timeout_secs = 600
+prompt = """
+The workspace contains a byte ring buffer (`ringbuf.h`, `ringbuf.c`). After the
+buffer wraps around, pops start returning stale values that were pushed long ago
+instead of the values just pushed. Find and fix the bug in `ringbuf.c` so the FIFO
+contract in the header holds. Do not modify `ringbuf.h`. Your code must compile
+warning-free under `gcc -Wall -Wextra -Werror` (C is graded that way). Verify the
+wraparound behavior with your own test before finishing.
+"""
+
+[[grader.checks]]
+name = "compile and run hidden tests"
+cmd = "gcc -Wall -Wextra -Werror -O1 -o /tmp/test_ringbuf test_ringbuf.c ringbuf.c && /tmp/test_ringbuf"

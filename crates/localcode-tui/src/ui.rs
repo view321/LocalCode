@@ -12,8 +12,8 @@
 //! tail) until the agent starts speaking, then moves onto the live stream line.
 
 use crate::app::{
-    App, ClickRegion, ClickTarget, DashCard, EntryKind, Mode, SettingAction, SettingsRowKind,
-    DEPLOY_LABEL_W,
+    App, BenchRowState, ClickRegion, ClickTarget, DashCard, EntryKind, Mode, SettingAction,
+    SettingsRowKind, DEPLOY_LABEL_W,
 };
 use crate::markdown;
 use crate::theme;
@@ -2502,93 +2502,153 @@ fn clip(s: &str, max: usize) -> String {
 fn draw_bench(f: &mut Frame, area: Rect, app: &mut App) {
     let th = app.theme;
     let inner = pad(area);
+    let w = inner.width as usize;
     let target = app
         .active_runtime()
-        .and_then(|r| r.model_id.clone())
+        .map(|r| r.model_id.unwrap_or(r.name))
         .unwrap_or_else(|| "no runtime".into());
 
-    // Suite line + run button.
-    let suite = Line::from(vec![
-        Span::styled("suite  ", theme::muted(&th)),
-        Span::styled("localcode-sample-coding v1.0.0", fg(&th)),
-        Span::styled(format!("  · target {target}"), theme::faint(&th)),
+    // Header line + run button (top right).
+    let header = Line::from(vec![
+        Span::styled("agent benchmark", theme::accent(&th).add_modifier(Modifier::BOLD)),
+        Span::styled("  sandboxed tasks · hidden-test grading", theme::faint(&th)),
+        Span::styled(format!("  · target {target}"), theme::muted(&th)),
     ]);
-    f.render_widget(Paragraph::new(suite), Rect { x: inner.x, y: inner.y, width: inner.width.saturating_sub(8), height: 1 });
+    f.render_widget(
+        Paragraph::new(header),
+        Rect { x: inner.x, y: inner.y, width: inner.width.saturating_sub(8), height: 1 },
+    );
     let run_w = button_width("run");
-    let rx = inner.x + inner.width - run_w;
-    f.render_widget(Paragraph::new(Line::from(button(&th, "run", true))), Rect { x: rx, y: inner.y, width: run_w, height: 1 });
+    let rx = inner.x + inner.width.saturating_sub(run_w);
+    f.render_widget(
+        Paragraph::new(Line::from(button(&th, "run", true))),
+        Rect { x: rx, y: inner.y, width: run_w, height: 1 },
+    );
     click(app, Rect { x: rx, y: inner.y, width: run_w, height: 1 }, ClickTarget::BenchRun);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
-    match &app.last_bench_result {
-        None => {
-            lines.push(Line::from(Span::styled("no runs yet — press the run button", theme::muted(&th))));
-        }
-        Some(r) => {
-            let m = &r.metrics;
-            // Stat grid: labels, values, bars (score/pass).
-            let cells = [
-                ("SCORE", format!("{:.2}", m.score), Some(m.score)),
-                ("PASS", format!("{:.0}%", m.pass_rate * 100.0), Some(m.pass_rate)),
-                ("P50", format!("{}ms", m.latency_p50_ms), None),
-                ("P95", format!("{}ms", m.latency_p95_ms), None),
-                (
-                    "TOK/S",
-                    m.tokens_per_sec.map(|t| format!("{t:.0}")).unwrap_or_else(|| "—".into()),
-                    None,
-                ),
-            ];
-            let mut labels: Vec<Span> = Vec::new();
-            let mut values: Vec<Span> = Vec::new();
-            let mut bars: Vec<Span> = Vec::new();
-            for (i, (label, value, ratio)) in cells.iter().enumerate() {
-                if i > 0 {
-                    labels.push(Span::styled(" │ ", theme::faint(&th)));
-                    values.push(Span::styled(" │ ", theme::faint(&th)));
-                    bars.push(Span::styled("   ", theme::faint(&th)));
-                }
-                labels.push(Span::styled(format!("{label:<7}"), theme::muted(&th)));
-                values.push(Span::styled(format!("{value:<7}"), theme::accent(&th).add_modifier(Modifier::BOLD)));
-                match ratio {
-                    Some(r) => {
-                        let mut m = meter(&th, *r, 5);
-                        m.push(Span::styled("  ", theme::faint(&th)));
-                        bars.extend(m);
-                    }
-                    None => bars.push(Span::styled(format!("{:<7}", ""), theme::faint(&th))),
-                }
-            }
-            lines.push(Line::from(labels));
-            lines.push(Line::from(values));
-            lines.push(Line::from(bars));
-            lines.push(Line::from(""));
 
-            lines.push(Line::from(Span::styled("tasks", theme::muted(&th))));
-            for t in r.tasks.iter().take(10) {
-                let (word, wstyle) = if t.passed {
-                    ("pass", fg(&th))
-                } else {
-                    ("fail", fg(&th).add_modifier(Modifier::BOLD))
+    // Installed suites (↑↓ moves the selection, Enter runs).
+    lines.push(Line::from(Span::styled("suites", theme::muted(&th))));
+    if app.bench_suites.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none installed — localcode bench pull <dir-or-url>",
+            theme::faint(&th),
+        )));
+    }
+    for (i, s) in app.bench_suites.iter().enumerate() {
+        let selected = i == app.bench_selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let spans = vec![
+            Span::styled(
+                format!("{marker}{:<10}", clip(&s.id, 10)),
+                if selected { theme::accent(&th) } else { fg(&th) },
+            ),
+            Span::styled(format!("v{:<8}", clip(&s.version, 7)), theme::muted(&th)),
+            Span::styled(format!("{:>2} tasks  ", s.task_count), theme::muted(&th)),
+            Span::styled(clip(&s.title, w.saturating_sub(36)), theme::faint(&th)),
+        ];
+        lines.push(sel_line(&th, spans, inner.width, selected));
+    }
+
+    match &app.bench_run {
+        Some(run) => {
+            lines.push(Line::from(""));
+            let state = if run.cancelled {
+                "· cancelled (containers swept)"
+            } else if run.summary.is_some() {
+                "· finished"
+            } else {
+                "· running — Esc cancels"
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("run  {} vs {}  ", run.suite_id, clip(&run.model, 40)),
+                    theme::muted(&th),
+                ),
+                Span::styled(state.to_string(), theme::faint(&th)),
+            ]));
+
+            for row in &run.rows {
+                let (glyph, style) = match row.state {
+                    BenchRowState::Pending => ("○", theme::faint(&th)),
+                    BenchRowState::Running => ("◐", theme::accent(&th)),
+                    BenchRowState::Passed => ("✓", fg(&th)),
+                    BenchRowState::Failed => ("✗", fg(&th).add_modifier(Modifier::BOLD)),
+                    BenchRowState::Error => ("!", fg(&th).add_modifier(Modifier::BOLD)),
                 };
-                let latency = if t.passed { format!("{} ms", t.latency_ms) } else { "—".into() };
+                let score = row
+                    .score
+                    .map(|s| format!("{s:.2}"))
+                    .unwrap_or_else(|| "  — ".into());
+                let secs = match (row.state, row.elapsed_ms) {
+                    (_, Some(ms)) => format!("{:>6.1}s", ms as f64 / 1000.0),
+                    (BenchRowState::Running, None) => {
+                        format!("{:>6.1}s", row.started.elapsed().as_secs_f64())
+                    }
+                    _ => "       ".into(),
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<34}", t.task_id), fg(&th)),
-                    Span::styled(format!("{word:<6}"), wstyle),
-                    Span::styled(latency, theme::muted(&th)),
+                    Span::styled(format!(" {glyph} "), style),
+                    Span::styled(format!("{:<13}", clip(&row.task_id, 13)), fg(&th)),
+                    Span::styled(format!("{score:>5}"), theme::accent(&th)),
+                    Span::styled(format!("{secs}  "), theme::muted(&th)),
+                    Span::styled(clip(&row.activity, w.saturating_sub(32)), theme::faint(&th)),
                 ]));
             }
+
+            if let Some(sum) = &run.summary {
+                lines.push(Line::from(""));
+                let mut spans = vec![
+                    Span::styled("score ", theme::muted(&th)),
+                    Span::styled(
+                        format!("{:.2}  ", sum.score),
+                        theme::accent(&th).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                spans.extend(meter(&th, sum.score, 16));
+                spans.push(Span::styled(
+                    format!(
+                        "  {}/{} passed · {} failed · {} errored",
+                        sum.tasks_passed, sum.tasks_total, sum.tasks_failed, sum.tasks_errored
+                    ),
+                    fg(&th),
+                ));
+                lines.push(Line::from(spans));
+                lines.push(Line::from(Span::styled(
+                    format!("results  {}", sum.results_dir),
+                    theme::faint(&th),
+                )));
+            }
+        }
+        None => {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("recent runs", theme::muted(&th))));
-            let mut hspans = vec![
-                Span::styled(format!("{:<8}", "latest"), theme::muted(&th)),
-                Span::styled(format!("{:<6}", format!("{:.2}", m.score)), fg(&th)),
-            ];
-            hspans.extend(meter(&th, m.score, 16));
-            lines.push(Line::from(hspans));
+            lines.push(Line::from(Span::styled(
+                "Runs the coding agent on each task inside a Docker container, then grades",
+                theme::faint(&th),
+            )));
+            lines.push(Line::from(Span::styled(
+                "the final workspace with hidden tests in a fresh container.",
+                theme::faint(&th),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Headless: localcode bench run · task-author check: localcode bench verify",
+                theme::faint(&th),
+            )));
         }
     }
-    let body = Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: inner.height.saturating_sub(1) };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    app.bench_total_lines = lines.len();
+    app.bench_view_height = body.height;
+    let max_scroll = lines.len().saturating_sub(body.height as usize) as u16;
+    app.bench_scroll = app.bench_scroll.min(max_scroll);
+    f.render_widget(Paragraph::new(lines).scroll((app.bench_scroll, 0)), body);
 }
 
 // ---------------------------------------------------------------------------

@@ -129,14 +129,62 @@ enum ModelsCmd {
 
 #[derive(Subcommand, Debug)]
 enum BenchCmd {
+    /// List installed benchmark suites (materializes the built-in `smoke` suite)
+    List,
+    /// Run a suite: Docker-sandboxed agentic tasks graded by hidden tests.
+    ///
+    /// Progress streams to stderr (or NDJSON to stdout with --json); the final
+    /// summary line goes to stdout. The run completing counts as success even
+    /// when tasks fail — the score is the measurement. Results are saved under
+    /// the data directory (`bench/runs/…`).
     Run {
-        /// Suite path or "sample"
-        #[arg(default_value = "sample")]
+        /// Suite name (see `bench list`) or a path to a suite directory
+        #[arg(default_value = "smoke")]
         suite: String,
+        /// Only run tasks whose id contains this substring
         #[arg(long)]
-        endpoint: Option<String>,
+        task: Option<String>,
+        /// OpenAI-compatible endpoint (http://host:port/v1). Defaults to the
+        /// local assistant / configured provider, like `agent run`.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Model id to request (required with --base-url when the server
+        /// hosts several models)
         #[arg(long)]
         model: Option<String>,
+        /// Bearer API key for --base-url
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Emit newline-delimited JSON events on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a suite with its reference solutions instead of a model: each
+    /// task's solution must pass every check, and its unmodified workspace
+    /// must fail at least one. Exits non-zero when any task flunks — the CI
+    /// gate for task authors.
+    Verify {
+        /// Suite name or path
+        #[arg(default_value = "smoke")]
+        suite: String,
+        /// Only verify tasks whose id contains this substring
+        #[arg(long)]
+        task: Option<String>,
+        /// Emit newline-delimited JSON events on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install a benchmark suite and pre-pull its Docker images.
+    ///
+    /// Suites ship separately from the app: a suite is a directory (or a
+    /// .tar.gz of one) with suite.toml + tasks/. Installed under the data
+    /// directory; images are pulled so runs can go offline afterwards.
+    Pull {
+        /// "smoke", a path to a suite directory, or an http(s) URL to .tar.gz
+        source: String,
+        /// Install files only; skip docker pulls
+        #[arg(long)]
+        no_images: bool,
     },
 }
 
@@ -425,37 +473,7 @@ async fn real_main() -> Result<(), LocalCodeError> {
             println!("deploy job {} correlation {}", job.id, job.correlation_id);
             Ok(())
         }
-        Commands::Bench { cmd } => match cmd {
-            BenchCmd::Run {
-                suite,
-                endpoint,
-                model,
-            } => {
-                let suite_obj = if suite == "sample" {
-                    localcode_bench::sample_coding_suite()
-                } else {
-                    localcode_bench::load_suite(std::path::Path::new(&suite))?
-                };
-                let endpoint = endpoint.unwrap_or_else(|| config.backends.ollama.base_url.clone());
-                let model = model.unwrap_or_else(|| "default".into());
-                let events = EventBus::new();
-                let runner = localcode_bench::BenchRunner::new(events);
-                let subject = localcode_bench::Subject {
-                    hf_model_id: model.clone(),
-                    quantization: "unknown".into(),
-                    weight_source: "cli".into(),
-                    backend: "cli".into(),
-                    backend_version: env!("CARGO_PKG_VERSION").into(),
-                    precision_notes: String::new(),
-                    hardware: serde_json::json!({}),
-                };
-                let result = runner
-                    .run(&suite_obj, subject, &endpoint, None, &model)
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
-                Ok(())
-            }
-        },
+        Commands::Bench { cmd } => run_bench_cmd(paths, config, cmd).await,
         Commands::Update { check } => run_update(&config, check).await,
         Commands::Setup { skip_llama } => run_setup(paths, config, skip_llama).await,
     }
@@ -586,6 +604,230 @@ async fn run_headless(
                 );
             }
             Err(e)
+        }
+    }
+}
+
+/// Dispatch `localcode bench …` (headless benchmark commands).
+async fn run_bench_cmd(
+    paths: AppPaths,
+    config: Config,
+    cmd: BenchCmd,
+) -> Result<(), LocalCodeError> {
+    match cmd {
+        BenchCmd::List => {
+            let infos = localcode_bench::prepare_suites(&paths.data_dir);
+            if infos.is_empty() {
+                println!("no suites installed — `localcode bench pull <dir-or-url>` adds one");
+                return Ok(());
+            }
+            for s in &infos {
+                println!("{}  v{}  {} task(s) — {}", s.id, s.version, s.task_count, s.title);
+                if !s.description.is_empty() {
+                    println!("    {}", s.description);
+                }
+                println!("    path:   {}", s.path.display());
+                println!("    images: {}", s.images.join(", "));
+            }
+            Ok(())
+        }
+        BenchCmd::Run {
+            suite,
+            task,
+            base_url,
+            model,
+            api_key,
+            json,
+        } => {
+            localcode_bench::prepare_suites(&paths.data_dir);
+            let suite_obj =
+                localcode_bench::find_suite(&localcode_bench::suites_root(&paths.data_dir), &suite)?;
+            let rt_args = RunArgs {
+                prompt: None,
+                workspace: None,
+                base_url,
+                model,
+                api_key,
+                approval: None,
+                yes: false,
+                json: false,
+                quiet: false,
+            };
+            let runtime = resolve_headless_runtime(&config, &paths, &rt_args).await?;
+            let summary =
+                run_bench_suite(&paths, &config, suite_obj, Some(runtime), false, task, json)
+                    .await?;
+            if !json {
+                println!(
+                    "{}: score {:.2} — {}/{} passed · results: {}",
+                    summary.model,
+                    summary.score,
+                    summary.tasks_passed,
+                    summary.tasks_total,
+                    summary.results_dir
+                );
+            }
+            Ok(())
+        }
+        BenchCmd::Verify { suite, task, json } => {
+            localcode_bench::prepare_suites(&paths.data_dir);
+            let suite_obj =
+                localcode_bench::find_suite(&localcode_bench::suites_root(&paths.data_dir), &suite)?;
+            let summary =
+                run_bench_suite(&paths, &config, suite_obj, None, true, task, json).await?;
+            let flunked = summary.tasks_total - summary.tasks_passed;
+            if flunked > 0 {
+                return Err(LocalCodeError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "{flunked}/{} task(s) failed verification",
+                        summary.tasks_total
+                    ),
+                )
+                .with_hint("Per-task reasons are in the progress output and results.jsonl"));
+            }
+            if !json {
+                println!(
+                    "all {} task(s) verified: solutions pass, unmodified workspaces fail",
+                    summary.tasks_total
+                );
+            }
+            Ok(())
+        }
+        BenchCmd::Pull { source, no_images } => {
+            let suites_root = localcode_bench::suites_root(&paths.data_dir);
+            std::fs::create_dir_all(&suites_root)?;
+            let installed = if source == localcode_bench::SMOKE_SUITE_ID {
+                localcode_bench::ensure_smoke_suite(&suites_root)?
+            } else if source.starts_with("http://") || source.starts_with("https://") {
+                localcode_bench::install_suite_from_url(&suites_root, &source).await?
+            } else {
+                localcode_bench::install_suite_from_dir(&suites_root, std::path::Path::new(&source))?
+            };
+            let suite = localcode_bench::load_bench_suite(&installed)?;
+            println!(
+                "installed suite '{}' v{} ({} task(s)) → {}",
+                suite.meta.id,
+                suite.meta.version,
+                suite.tasks.len(),
+                installed.display()
+            );
+            if no_images {
+                return Ok(());
+            }
+            if !localcode_bench::docker_available() {
+                return Err(localcode_bench::docker_missing_err()
+                    .with_hint("Re-run with --no-images to install files only"));
+            }
+            let failures =
+                localcode_bench::pull_suite_images(&suite, |line| eprintln!("==> {line}")).await;
+            if !failures.is_empty() {
+                let names: Vec<&str> = failures.iter().map(|(i, _)| i.as_str()).collect();
+                return Err(LocalCodeError::new(
+                    ErrorCode::BackendStartFailed,
+                    format!("{} image(s) failed to pull: {}", failures.len(), names.join(", ")),
+                )
+                .retryable(true));
+            }
+            println!("images ready");
+            Ok(())
+        }
+    }
+}
+
+/// Drive one suite run with a console reporter attached.
+async fn run_bench_suite(
+    paths: &AppPaths,
+    config: &Config,
+    suite: localcode_bench::BenchSuite,
+    runtime: Option<ActiveRuntime>,
+    oracle: bool,
+    task_filter: Option<String>,
+    json: bool,
+) -> Result<localcode_bench::RunSummary, LocalCodeError> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<localcode_bench::RunEvent>();
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            print_bench_event(&ev, json);
+        }
+    });
+    let opts = localcode_bench::RunOptions {
+        suite,
+        runs_root: localcode_bench::runs_root(&paths.data_dir),
+        runtime,
+        base_agent_config: config.agent.clone(),
+        oracle,
+        task_filter,
+    };
+    let result = localcode_bench::run_suite(opts, tx).await;
+    let _ = printer.await;
+    result
+}
+
+/// Render one bench [`RunEvent`]: NDJSON on stdout with `json`, else a human
+/// progress stream on stderr (stdout stays clean for the final summary line).
+fn print_bench_event(ev: &localcode_bench::RunEvent, json: bool) {
+    use localcode_bench::{RunEvent, TaskStatus};
+    if json {
+        if let Ok(line) = serde_json::to_string(ev) {
+            println!("{line}");
+        }
+        return;
+    }
+    match ev {
+        RunEvent::RunStarted {
+            run_id,
+            suite_id,
+            total,
+        } => eprintln!("suite {suite_id} — {total} task(s), run {run_id}"),
+        RunEvent::TaskStarted {
+            index,
+            total,
+            task_id,
+            title,
+        } => eprintln!("[{}/{}] {task_id} — {title}", index + 1, total),
+        RunEvent::TaskPhase { phase, .. } => eprintln!("    · {phase}"),
+        RunEvent::AgentActivity { line, .. } => eprintln!("      {line}"),
+        RunEvent::TaskFinished { report, .. } => {
+            match report.status {
+                TaskStatus::Passed => eprintln!("    ✓ pass (score {:.2})", report.score),
+                TaskStatus::Failed => {
+                    eprintln!("    ✗ fail (score {:.2})", report.score);
+                    for c in report.checks.iter().filter(|c| !c.passed) {
+                        eprintln!("        check '{}' exited {}", c.name, c.exit_code);
+                    }
+                    if let Some(err) = &report.error {
+                        eprintln!("        {err}");
+                    }
+                }
+                TaskStatus::Error => eprintln!(
+                    "    ! error: {}",
+                    report.error.as_deref().unwrap_or("unknown")
+                ),
+            }
+            if let Some(a) = &report.agent {
+                eprintln!(
+                    "      agent: {} round(s), {} tool call(s) ({} error(s)), {:.1}s{}",
+                    a.rounds,
+                    a.tool_calls,
+                    a.tool_errors,
+                    a.wall_ms as f64 / 1000.0,
+                    if a.timed_out { " — TIMED OUT" } else { "" }
+                );
+            }
+        }
+        RunEvent::RunFinished { summary } => {
+            eprintln!();
+            eprintln!(
+                "{}: score {:.2} · strict pass {}/{} ({} failed, {} errored)",
+                summary.model,
+                summary.score,
+                summary.tasks_passed,
+                summary.tasks_total,
+                summary.tasks_failed,
+                summary.tasks_errored
+            );
+            eprintln!("results: {}", summary.results_dir);
         }
     }
 }

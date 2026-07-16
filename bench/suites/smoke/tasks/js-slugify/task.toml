@@ -1,0 +1,16 @@
+title = "Implement a URL slugifier"
+domain = "javascript"
+tier = 1
+image = "node:22-slim"
+network = "none"
+timeout_secs = 600
+prompt = """
+The workspace contains `slugify.js` exporting an unimplemented function `slugify(title)`.
+Implement it exactly as the JSDoc comment specifies, using only the Node.js standard
+library (there is no network). Keep the CommonJS export shape unchanged. Verify your
+implementation yourself on a few inputs (e.g. with `node -e`) before finishing.
+"""
+
+[[grader.checks]]
+name = "hidden node:test suite"
+cmd = "node --test slugify.test.js"

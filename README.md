@@ -202,9 +202,38 @@ mirrors  = ["https://git.internal.lan/LocalCode.git"]  # self-update fallback
 localcode models search "qwen coder"
 localcode models info Qwen/Qwen2.5-Coder-7B-Instruct
 localcode deploy qwen2.5-coder:7b --backend ollama --force
-localcode bench run sample --endpoint http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b
 localcode agent run "List files in the workspace" --workspace .
+localcode bench run smoke --base-url http://127.0.0.1:11434/v1 --model qwen2.5-coder:7b
 ```
+
+### Benchmarks (`/bench`)
+
+Measure a model as a *coding agent*, not a chat bot: each task starts a Docker
+container with the task's workspace bind-mounted, the LocalCode agent works
+inside it (every `bash` runs in the container — the container is the sandbox),
+and the final workspace is graded by **hidden tests** in a fresh container.
+Hidden files overwrite anything the agent wrote at the same paths, so editing
+the tests can't game the grade. Local-only: no external judges, no uploads;
+results are JSONL + `summary.json` under the data dir (`bench/runs/…`).
+
+- **TUI**: `/bench` → pick a suite → `Enter` runs it against the active model
+  (live per-task rows; `Esc` cancels and sweeps containers).
+- **Headless**: `localcode bench list | run | verify | pull`.
+
+```bash
+localcode bench pull smoke          # install a suite + pre-pull its images
+localcode bench run smoke           # run against the resolved runtime
+localcode bench run smoke --task py --json   # filter tasks, NDJSON events
+localcode bench verify smoke        # task-author gate: reference solutions
+                                    # must pass, unmodified workspaces must fail
+```
+
+Suites ship separately from the app (`bench pull <dir-or-tar.gz-url>`); the
+built-in `smoke` suite (8 small feature/bugfix tasks across Python, JS, Rust,
+and C on stock images) is materialized automatically as a pipeline check and
+capability floor. A suite is a directory: `suite.toml` + `tasks/<id>/`
+(`task.toml`, `workspace/`, hidden `hidden/` tests, `solution/` for verify).
+Docker required; tasks default to `network = "none"`.
 
 ### Config
 
@@ -305,7 +334,7 @@ crates/
   localcode-remote/     SSH remote GPU servers (russh: connect, provision, tunnel)
   localcode-cloud/      RunPod, Vast, Akash adapters
   localcode-payments/   USDC balance client
-  localcode-bench/      suites + runner + publish
+  localcode-bench/      agentic bench: suites, Docker sandbox runner, oracle verify
   localcode-agent/      coding agent, skills, MCP, tools
   localcode-assistant/  local Bonsai + hosted app-repair assistant
   localcode-api-client/ VPS REST client

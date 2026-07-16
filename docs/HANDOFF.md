@@ -366,7 +366,7 @@ localcode/
     localcode-backends/      # ollama, llama.cpp, vllm, sglang adapters
     localcode-cloud/         # runpod, vast, akash
     localcode-payments/      # top-up client, balance
-    localcode-bench/         # suites, runners, publish payloads
+    localcode-bench/         # agentic bench: suites, Docker sandbox runner, oracle verify
     localcode-agent/         # coding agent, tools, skills, MCP, subagents
     localcode-assistant/     # app-fix assistant (may share agent core)
     localcode-api-client/    # VPS REST client
@@ -761,6 +761,51 @@ UI + schema:
 
 - Mark results `unverified` by default.
 - Optional future: reproducible attestation. v1: show hardware self-report + client version.
+
+### 13.7 Agentic benchmark (implemented — P0)
+
+The shipped benchmark measures the model **as a coding agent** (model ×
+harness), superseding the prompt/regex QA bench for headline numbers (the QA
+runner survives in `localcode-bench/src/qa.rs` for the publish payload shape).
+Local-only by decision: no external judges, no result uploads.
+
+**Architecture** (`localcode-bench`):
+
+- **Suite on disk** = `suite.toml` + `tasks/<id>/{task.toml, workspace/,
+  hidden/, solution/}`. `task.toml`: prompt, Docker `image`,
+  `network = "none"|"bridge"`, wall/exec/round budgets, weighted
+  `[[grader.checks]]` (shell cmd, pass = exit 0).
+- **Sandbox**: one container per task; the task workspace is bind-mounted at
+  `/workspace`. The agent runs **in-process** (same `CodingAgent` as chat) with
+  `ContainerShell`: every `bash` becomes `docker exec` in the task container;
+  file tools stay host-side, jailed to the workspace, and translate
+  `/workspace/...` paths. Approvals pinned to always-approve (the container is
+  the confinement); user skills disabled for reproducibility.
+- **Grading**: fresh containers over `graded/ = workspace ⊕ hidden` — the
+  hidden overlay overwrites agent edits at the same paths, so tampering with
+  tests cannot survive. Score = weight-fraction of passing checks; task passes
+  iff all pass. Agent timeout still grades (partial credit).
+- **Oracle verify** (`bench verify`): `workspace ⊕ solution ⊕ hidden` must
+  pass every check AND `workspace ⊕ hidden` must fail at least one — proves a
+  task is solvable and discriminating with no model in the loop. CI gate for
+  task authors.
+- **Results**: `data/bench/runs/<stamp>-<suite>-<model>/results.jsonl` (one
+  `TaskReport` per line: status, score, checks, agent rounds/tool
+  calls/errors/wall) + `summary.json` (adds `harness_version` — results are
+  model × harness, never compare across versions silently).
+- **Distribution**: suites ship separately (`bench pull <dir|.tar.gz-url>`,
+  then docker pulls); the built-in `smoke` suite (8 tasks: py/js/rust/c,
+  feature+bugfix each) is embedded via `include_str!` from `bench/suites/smoke/`
+  and materialized on demand.
+- **Surfaces**: TUI `/bench` (suite picker, live per-task rows, Esc cancels +
+  sweeps containers by the `localcode.bench` label) and CLI
+  `localcode bench list|run|verify|pull` (NDJSON with `--json`).
+
+**Planned next** (per the benchmark research doc): import Aider-polyglot-style
+and Multi-SWE-bench samples as suites, SWE-smith-style task generation for the
+target language matrix, gamedev (Phaser/pygame) probe harnesses, embedded via
+Renode/Wokwi, test-writing + bug-hunt suites, per-domain score breakdowns and
+run-to-run compare in the TUI.
 
 ---
 

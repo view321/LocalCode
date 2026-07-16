@@ -3,20 +3,24 @@ name = "localcode-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Benchmark suites, runner, and publish payloads"
+description = "Agentic benchmark suites, sandboxed Docker runner, and the legacy QA bench"
 
 [dependencies]
 localcode-core = { workspace = true }
+localcode-agent = { workspace = true }
 localcode-api-client = { workspace = true }
 chrono = { workspace = true }
+flate2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
+which = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

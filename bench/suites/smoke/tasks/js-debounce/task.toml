@@ -1,0 +1,18 @@
+title = "Fix the debounce helper"
+domain = "javascript"
+tier = 1
+image = "node:22-slim"
+network = "none"
+timeout_secs = 600
+prompt = """
+`debounce.js` implements a trailing-edge debounce helper, but callers report two
+problems: rapid repeated calls don't reset the wait window (the function fires too
+early, based on the FIRST call instead of the last), and methods lose their `this`
+when debounced. Fix the implementation so it matches the documented contract exactly.
+Keep the export shape and the `.cancel()` API unchanged, and verify the timing
+behavior yourself with a small script before finishing.
+"""
+
+[[grader.checks]]
+name = "hidden node:test suite"
+cmd = "node --test debounce.test.js"

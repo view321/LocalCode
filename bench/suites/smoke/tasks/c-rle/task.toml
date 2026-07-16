@@ -1,0 +1,17 @@
+title = "Implement run-length encoding"
+domain = "c"
+tier = 1
+image = "gcc:14"
+network = "none"
+timeout_secs = 600
+prompt = """
+The workspace contains `rle.h` declaring `rle_encode` and `rle_decode`, and `rle.c`
+with stub implementations that just return -1. Implement both functions in `rle.c`
+exactly as the header comments specify. Do not modify `rle.h`. Your code must compile
+warning-free under `gcc -Wall -Wextra -Werror` (C is graded that way). Verify your
+implementation with your own small test program before finishing.
+"""
+
+[[grader.checks]]
+name = "compile and run hidden tests"
+cmd = "gcc -Wall -Wextra -Werror -O1 -o /tmp/test_rle test_rle.c rle.c && /tmp/test_rle"

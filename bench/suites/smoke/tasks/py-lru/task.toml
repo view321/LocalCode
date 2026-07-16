@@ -1,0 +1,17 @@
+title = "Fix the LRU cache eviction"
+domain = "python"
+tier = 1
+image = "python:3.12-slim"
+network = "none"
+timeout_secs = 600
+prompt = """
+`lru.py` implements a fixed-capacity least-recently-used cache, but users report it
+evicts the wrong entries: recently used keys disappear while stale ones survive.
+Find and fix the bug(s) so the class behaves exactly as its docstrings describe.
+Keep the public interface (`__init__`, `get`, `put`, `__len__`) unchanged and verify
+the behavior yourself with a quick scenario before finishing.
+"""
+
+[[grader.checks]]
+name = "hidden unit tests"
+cmd = "python3 -m unittest -v test_lru"
