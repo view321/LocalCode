@@ -17,7 +17,7 @@ use crate::app::{
 use crate::markdown;
 use crate::theme;
 use crate::widgets::{banner_height, button, button_width, draw_inline_banner};
-use localcode_backends::human_size;
+use localcode_backends::{human_size, DownloadStatus};
 use localcode_core::runtime::RuntimeStatus;
 use localcode_core::theme::{ThemeMode, ThemeToken};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -1356,22 +1356,37 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Editable deploy parameters, filtered to what the current backend honors.
     // Click a row to edit it inline (↵ save, Esc cancel, blank = default).
+    // Column budget for a field value after its fixed 11-col label.
+    let value_avail = area.width.saturating_sub(11).max(1) as usize;
     for field in app.deploy_fields() {
         let row = area.y + ctrl.len() as u16;
         let editing = app.deploy_editing_field() == Some(field);
-        let value = if editing {
-            // Live edit buffer with a block cursor.
-            Span::styled(
-                format!("{}\u{2588}", app.deploy_field_edit_buf()),
-                theme::accent(&th).add_modifier(Modifier::BOLD),
-            )
+        let mut spans = vec![Span::styled(format!("{:<11}", field.label()), theme::muted(&th))];
+        if editing {
+            // Horizontally scroll the buffer so the caret stays visible: the
+            // command line is far wider than the panel, so without this a caret
+            // past the right edge makes typing look dead. A trailing space gives
+            // the caret a cell to sit on at end-of-line.
+            let mut chars: Vec<char> = app.deploy_field_edit_buf().chars().collect();
+            let cursor = app.deploy_field_cursor().min(chars.len());
+            chars.push(' ');
+            let scroll = caret_scroll(cursor, app.deploy_field_scroll(), value_avail);
+            app.set_deploy_field_scroll(scroll);
+            let end = (scroll + value_avail).min(chars.len());
+            let base = theme::accent(&th).add_modifier(Modifier::BOLD);
+            for (i, &c) in chars[scroll..end].iter().enumerate() {
+                let style = if scroll + i == cursor {
+                    base.add_modifier(Modifier::REVERSED)
+                } else {
+                    base
+                };
+                spans.push(Span::styled(c.to_string(), style));
+            }
         } else {
-            Span::styled(app.deploy_field_display(field), fg(&th))
-        };
-        ctrl.push(Line::from(vec![
-            Span::styled(format!("{:<11}", field.label()), theme::muted(&th)),
-            value,
-        ]));
+            // Clip so a long built command never spills past the panel edge.
+            spans.push(Span::styled(clip(&app.deploy_field_display(field), value_avail), fg(&th)));
+        }
+        ctrl.push(Line::from(spans));
         click(
             app,
             Rect { x: area.x, y: row, width: area.width, height: 1 },
@@ -1405,6 +1420,58 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ctrl.push(Line::from(meter(&th, ratio, 24)));
     }
     ctrl.push(Line::from(""));
+
+    // A background download for this model (runs in a detached worker that
+    // survives app exit and resumes on its own). Shown above the deploy button
+    // so its progress is visible while the user keeps working — or quits.
+    if let Some(dl) = app.download_for(&s.id).cloned() {
+        let now = localcode_backends::now_unix();
+        let failed = dl.status == DownloadStatus::Failed;
+        let stalled = !failed && dl.is_stale(now);
+        let head_style = if failed || stalled {
+            Style::default()
+                .fg(theme::color(&th, ThemeToken::Warn))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::accent(&th).add_modifier(Modifier::BOLD)
+        };
+        let head = if failed {
+            "download failed".to_string()
+        } else if stalled {
+            format!("download stalled {}%", dl.percent())
+        } else {
+            format!("downloading {}%", dl.percent())
+        };
+        let mut spans = vec![Span::styled(format!("{head}  "), head_style)];
+        spans.extend(meter(&th, dl.fraction(), 16));
+        ctrl.push(Line::from(spans));
+
+        let detail = if dl.total_bytes > 0 {
+            format!("{} / {} · {}", gib(dl.downloaded_bytes), gib(dl.total_bytes), dl.message)
+        } else {
+            dl.message.clone()
+        };
+        ctrl.push(Line::from(Span::styled(
+            clip(&detail, area.width.saturating_sub(1) as usize),
+            theme::faint(&th),
+        )));
+
+        if dl.is_resumable(now) {
+            let resume_row = area.y + ctrl.len() as u16;
+            ctrl.push(Line::from(button(&th, "resume", true)));
+            click(
+                app,
+                Rect { x: area.x, y: resume_row, width: button_width("resume"), height: 1 },
+                ClickTarget::DownloadResume,
+            );
+        } else {
+            ctrl.push(Line::from(Span::styled(
+                "background — safe to quit; resumes automatically",
+                theme::faint(&th),
+            )));
+        }
+        ctrl.push(Line::from(""));
+    }
 
     // Deploy button, or — while deploying — a progress meter with a Cancel
     // button on its own row (deploy is cancelled here, never with Esc).
@@ -2390,6 +2457,21 @@ fn draw_backends(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Truncate to at most `max` display columns, adding an ellipsis when clipped.
+/// New horizontal scroll offset (first visible char) that keeps `cursor` inside
+/// a window of `avail` columns. Slides the window the minimum needed: back to
+/// the caret when it falls left of the view, or forward so the caret sits on the
+/// last column when it runs off the right.
+fn caret_scroll(cursor: usize, scroll: usize, avail: usize) -> usize {
+    let avail = avail.max(1);
+    if cursor < scroll {
+        cursor
+    } else if cursor >= scroll + avail {
+        cursor + 1 - avail
+    } else {
+        scroll
+    }
+}
+
 fn clip(s: &str, max: usize) -> String {
     if max == 0 || s.width() <= max {
         return s.to_string();
@@ -2756,6 +2838,21 @@ mod tests {
         let rows = wrap_line(Line::from("aaa bbb"), 5);
         let texts: Vec<String> = rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["aaa ", "bbb"]);
+    }
+
+    #[test]
+    fn caret_scroll_keeps_cursor_visible() {
+        // Caret already inside the window: offset unchanged.
+        assert_eq!(caret_scroll(3, 0, 10), 0);
+        assert_eq!(caret_scroll(9, 0, 10), 0); // last visible column
+        // Caret one past the right edge: slide so it sits on the last column.
+        assert_eq!(caret_scroll(10, 0, 10), 1);
+        assert_eq!(caret_scroll(120, 0, 10), 111); // far tail of a long command
+        // Caret left of the window (moved back with ←/Home): jump to the caret.
+        assert_eq!(caret_scroll(2, 50, 10), 2);
+        assert_eq!(caret_scroll(0, 50, 10), 0);
+        // Degenerate width never divides by zero.
+        assert_eq!(caret_scroll(5, 0, 0), 5);
     }
 
     #[test]

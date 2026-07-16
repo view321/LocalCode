@@ -43,6 +43,21 @@ enum Commands {
         #[command(subcommand)]
         cmd: ModelsCmd,
     },
+    /// Download a model's weights in the background (resumable).
+    ///
+    /// Used by the TUI as a detached worker that survives app exit, but also
+    /// runnable directly. Writes progress to a state file in the model's cache
+    /// directory; a re-run resumes a partial download from where it stopped.
+    Download {
+        /// Hugging Face model id
+        model: String,
+        /// Quantization label (defaults to the model's first quant)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Backend the weights are for: llamacpp | colibri | colibri-hy3
+        #[arg(long, default_value = "llamacpp")]
+        backend: String,
+    },
     /// Deploy a model to a local backend
     Deploy {
         /// Hugging Face model id
@@ -307,6 +322,11 @@ async fn real_main() -> Result<(), LocalCodeError> {
             }
             Ok(())
         }
+        Commands::Download {
+            model,
+            quant,
+            backend,
+        } => run_download_worker(paths, config, model, quant, backend).await,
         Commands::Deploy {
             model,
             quant,
@@ -708,6 +728,75 @@ async fn run_setup(
     }
     println!("llama-server ready: {bin_str}");
     Ok(())
+}
+
+/// Background download worker (`localcode download`). Resolves the weight list —
+/// reusing a task the TUI already wrote to avoid a fragile HF round-trip, else
+/// querying HF — then drives the resumable [`run_worker`], which publishes
+/// progress to the model's state file. Prints the primary weight path on success.
+async fn run_download_worker(
+    paths: AppPaths,
+    config: Config,
+    model: String,
+    quant: Option<String>,
+    backend: String,
+) -> Result<(), LocalCodeError> {
+    let kind = BackendKind::parse(&backend).ok_or_else(|| {
+        LocalCodeError::new(ErrorCode::BackendNotFound, format!("Unknown backend {backend}"))
+    })?;
+    let dir = localcode_backends::model_dir(&paths.models_cache, &model);
+
+    // Prefer a task already resolved into the state file (by the TUI or a prior
+    // run) so an unstable link isn't needed just to learn the file list.
+    let (quantization, files, urls, total_bytes) = match localcode_backends::read_state(&dir) {
+        Some(st) if !st.files.is_empty() && !st.download_urls.is_empty() => {
+            (st.quantization, st.files, st.download_urls, st.total_bytes)
+        }
+        _ => resolve_download_task(&config, &paths, &model, quant.as_deref()).await?,
+    };
+
+    let spec = localcode_backends::DownloadSpec {
+        model_id: model.clone(),
+        quantization,
+        backend: kind,
+        dir,
+        files,
+        download_urls: urls,
+        total_bytes,
+    };
+    eprintln!("Downloading {model} → {}", spec.dir.display());
+    let primary =
+        localcode_backends::run_worker(&spec, config.hf_token().as_deref(), &config.hf_mirror_hosts())
+            .await?;
+    println!("{}", primary.display());
+    Ok(())
+}
+
+/// Resolve a model+quant to its weight files, download URLs, and total size via
+/// the HF registry (mirrors applied). Mirrors the enrichment the `deploy`
+/// command does.
+async fn resolve_download_task(
+    config: &Config,
+    paths: &AppPaths,
+    model: &str,
+    quant: Option<&str>,
+) -> Result<(Option<String>, Vec<String>, Vec<String>, u64), LocalCodeError> {
+    let hf = HfClient::new(&config.registry, config.hf_token(), paths.models_cache.clone())?;
+    let detail = hf.model_info(model).await?;
+    let group = match quant {
+        Some(q) => detail.quants.iter().find(|g| g.label.eq_ignore_ascii_case(q)),
+        None => detail.quants.first(),
+    }
+    .ok_or_else(|| {
+        LocalCodeError::new(
+            ErrorCode::HfModelNotFound,
+            format!("No downloadable quant for {model}"),
+        )
+        .with_hint("List quants with: localcode models info <id>")
+    })?;
+    let files: Vec<String> = group.files.iter().map(|f| f.filename.clone()).collect();
+    let urls: Vec<String> = files.iter().map(|f| hf.download_url(model, f)).collect();
+    Ok((Some(group.label.clone()), files, urls, group.total_size))
 }
 
 async fn run_update(config: &Config, check_only: bool) -> Result<(), LocalCodeError> {

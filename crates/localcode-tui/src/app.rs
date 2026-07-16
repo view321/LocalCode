@@ -32,12 +32,14 @@ use localcode_assistant::{
     BONSAI_FILE, InstallNeed,
 };
 use localcode_backends::{
-    can_elevate_noninteractively, delete_downloaded, diagnose, ensure_llamacpp_installed,
-    find_downloaded, human_size, list_downloaded, preview_deploy_command, resolve_install_plan,
-    resolve_llamacpp_bin, resolve_repair, run_install, run_repair, sanitize_model_dir, smoke_test,
+    can_elevate_noninteractively, clear_state, delete_downloaded, diagnose,
+    ensure_llamacpp_installed, find_downloaded, human_size, list_downloaded, model_dir, now_unix,
+    preview_deploy_command, resolve_install_plan, resolve_llamacpp_bin, resolve_repair, run_install,
+    run_repair, sanitize_model_dir, scan_active, smoke_test, spawn_detached_worker, write_state,
     BackendKind, BackendRegistry, DashSnapshot, DeployRequest, DeployService, DeployTuning,
-    DetectReport, Diagnosis, DownloadedModel, InstallPlan, OpenWebUi, OpenWebUiHandle, ProcState,
-    RepairPlan, Repoint, SmokeReport, DASH_LOG_CAP, DEFAULT_DEPLOY_CTX, OPENWEBUI_DEFAULT_PORT,
+    DetectReport, Diagnosis, DownloadState, DownloadStatus, DownloadedModel, InstallPlan, OpenWebUi,
+    OpenWebUiHandle, ProcState, RepairPlan, Repoint, SmokeReport, DASH_LOG_CAP, DEFAULT_DEPLOY_CTX,
+    OPENWEBUI_DEFAULT_PORT,
 };
 use localcode_core::config::LocalAssistantPreference;
 use localcode_bench::{sample_coding_suite, BenchRunner, Subject};
@@ -281,6 +283,8 @@ pub enum ClickTarget {
     DeployAutoConfig,
     DeployButton,
     DeployCancel,
+    /// Resume the current model's interrupted background download.
+    DownloadResume,
     /// Edit an inline deploy parameter (context, port, per-backend tuning).
     DeployField(DeployField),
     // Runtimes
@@ -1159,6 +1163,14 @@ pub struct App {
     /// Which deploy parameter is being edited inline (Models view), if any.
     deploy_editing: Option<DeployField>,
     deploy_field_edit: String,
+    /// Caret position (char index) within `deploy_field_edit`. Lets the command
+    /// field — the only value long enough to overflow the panel — be edited in
+    /// the middle, not just at the tail.
+    deploy_field_cursor: usize,
+    /// First visible char index while editing: the horizontal scroll offset that
+    /// keeps the caret on-screen when the value is wider than the panel. Adjusted
+    /// by the renderer, which alone knows the available width.
+    deploy_field_scroll: usize,
     /// Full launch-command override from the deploy panel's command field.
     /// `None` = build the command from the fields; `Some` = spawn this verbatim.
     deploy_command_override: Option<String>,
@@ -1166,6 +1178,13 @@ pub struct App {
     /// Models with weights on disk (cached; refreshed on enter/deploy/delete).
     /// Backs the `/models` "downloaded" tag and the `/dash` downloaded section.
     pub downloaded_models: Vec<DownloadedModel>,
+    /// In-flight background downloads, read from each model's on-disk state file
+    /// (the source of truth, so tracking survives app restarts). Refreshed on a
+    /// timer by [`App::poll_downloads`]; drives the deploy panel's progress bar
+    /// and the resume-on-relaunch scan.
+    pub active_downloads: Vec<DownloadState>,
+    /// Throttle for the background-download poll (rescan + auto-resume).
+    last_download_poll: Instant,
     /// Running OpenWebUI container (from `/ui` or the assistant tool), if any.
     pub openwebui: Option<OpenWebUiHandle>,
     /// A `/ui` deploy is in flight (Docker pull/run).
@@ -1287,6 +1306,8 @@ impl App {
         // Enumerate models already on disk once at startup (refreshed later on
         // deploy/delete and when entering /models or /dash).
         let downloaded_models = list_downloaded(&paths.models_cache);
+        // Background downloads left running (or interrupted) by a prior session.
+        let active_downloads = scan_active(&paths.models_cache);
 
         let mut app = Self {
             theme: Theme::new(config.ui.theme),
@@ -1373,9 +1394,13 @@ impl App {
             deploy_hints_notes: Vec::new(),
             deploy_editing: None,
             deploy_field_edit: String::new(),
+            deploy_field_cursor: 0,
+            deploy_field_scroll: 0,
             deploy_command_override: None,
             deploy_progress: 0,
             downloaded_models,
+            active_downloads,
+            last_download_poll: Instant::now(),
             openwebui: None,
             openwebui_busy: false,
             pending_delete_model: None,
@@ -2856,6 +2881,22 @@ impl App {
         &self.deploy_field_edit
     }
 
+    /// Caret position (char index) within the deploy-field edit buffer.
+    pub fn deploy_field_cursor(&self) -> usize {
+        self.deploy_field_cursor
+    }
+
+    /// Current horizontal scroll offset (first visible char) while editing.
+    pub fn deploy_field_scroll(&self) -> usize {
+        self.deploy_field_scroll
+    }
+
+    /// Store the scroll offset the renderer computed from the live width so the
+    /// caret stays on-screen next frame.
+    pub fn set_deploy_field_scroll(&mut self, v: usize) {
+        self.deploy_field_scroll = v;
+    }
+
     /// Current value of a deploy field as display text (`auto` when unset).
     pub fn deploy_field_display(&self, field: DeployField) -> String {
         match field {
@@ -2906,6 +2947,10 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| self.deploy_command_seed()),
         };
+        // Caret at the end of the seeded value; the renderer re-derives the
+        // scroll window so the caret is visible even on a long command.
+        self.deploy_field_cursor = self.deploy_field_edit.chars().count();
+        self.deploy_field_scroll = 0;
         self.deploy_editing = Some(field);
         self.set_status(
             format!("Editing {} — ↵ save, Esc cancel (blank = default)", field.label()),
@@ -2913,8 +2958,12 @@ impl App {
         );
     }
 
-    /// Key handling while a deploy parameter is being edited inline.
+    /// Key handling while a deploy parameter is being edited inline. Supports
+    /// caret movement and mid-string insert/delete so a long launch command (the
+    /// only field that overflows the panel) can be edited anywhere, not just at
+    /// the tail.
     fn handle_deploy_field_key(&mut self, key: crossterm::event::KeyEvent) {
+        let len = self.deploy_field_edit.chars().count();
         match key.code {
             KeyCode::Enter => self.commit_deploy_field(),
             KeyCode::Esc => {
@@ -2922,9 +2971,32 @@ impl App {
                 self.set_status("Edit cancelled", false);
             }
             KeyCode::Backspace => {
-                self.deploy_field_edit.pop();
+                if self.deploy_field_cursor > 0 {
+                    let at = self.deploy_field_cursor - 1;
+                    let idx = char_to_byte(&self.deploy_field_edit, at);
+                    self.deploy_field_edit.remove(idx);
+                    self.deploy_field_cursor = at;
+                }
             }
-            KeyCode::Char(c) => self.deploy_field_edit.push(c),
+            KeyCode::Delete => {
+                if self.deploy_field_cursor < len {
+                    let idx = char_to_byte(&self.deploy_field_edit, self.deploy_field_cursor);
+                    self.deploy_field_edit.remove(idx);
+                }
+            }
+            KeyCode::Left => {
+                self.deploy_field_cursor = self.deploy_field_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.deploy_field_cursor = (self.deploy_field_cursor + 1).min(len);
+            }
+            KeyCode::Home => self.deploy_field_cursor = 0,
+            KeyCode::End => self.deploy_field_cursor = len,
+            KeyCode::Char(c) => {
+                let idx = char_to_byte(&self.deploy_field_edit, self.deploy_field_cursor);
+                self.deploy_field_edit.insert(idx, c);
+                self.deploy_field_cursor += 1;
+            }
             _ => {}
         }
     }
@@ -3041,6 +3113,27 @@ impl App {
         let Some(req) = self.build_deploy_request(continue_oversize) else {
             return;
         };
+        // A locally-served backend whose weights aren't on disk yet gets a
+        // background, resumable, exit-surviving download instead of a blocking
+        // in-deploy fetch. vLLM/SGLang/Ollama resolve their own weights, and an
+        // already-downloaded model has a `local_path`, so those deploy directly.
+        let needs_weights = req.local_path.is_none()
+            && !req.download_urls.is_empty()
+            && matches!(
+                req.backend,
+                BackendKind::LlamaCpp | BackendKind::Colibri | BackendKind::ColibriHy3
+            );
+        if needs_weights {
+            if self.download_for(&req.model_id).is_some() {
+                self.set_status(
+                    "Already downloading this model in the background — deploy when it finishes",
+                    false,
+                );
+                return;
+            }
+            self.start_background_download(&req);
+            return;
+        }
         self.spawn_deploy(req);
     }
 
@@ -3340,6 +3433,176 @@ impl App {
     /// Re-scan the models cache for downloaded weights (cheap; sync).
     fn refresh_downloaded(&mut self) {
         self.downloaded_models = list_downloaded(&self.paths.models_cache);
+        self.refresh_active_downloads();
+    }
+
+    /// Rescan the on-disk download state files. Completed downloads are consumed
+    /// (state file cleared, on-disk list refreshed, one notification) so they
+    /// stop showing as "in progress" and the model reads as downloaded.
+    fn refresh_active_downloads(&mut self) {
+        let mut active = Vec::new();
+        let mut completed = Vec::new();
+        for st in scan_active(&self.paths.models_cache) {
+            if st.status == DownloadStatus::Completed {
+                clear_state(&model_dir(&self.paths.models_cache, &st.model_id));
+                completed.push(st.model_id);
+            } else {
+                active.push(st);
+            }
+        }
+        self.active_downloads = active;
+        if !completed.is_empty() {
+            self.downloaded_models = list_downloaded(&self.paths.models_cache);
+            self.set_status(
+                format!("✓ Download complete: {} — ready to deploy", completed.join(", ")),
+                false,
+            );
+        }
+    }
+
+    /// The active background download for a model id, if any.
+    pub fn download_for(&self, model_id: &str) -> Option<&DownloadState> {
+        self.active_downloads.iter().find(|d| d.model_id == model_id)
+    }
+
+    /// Periodic tick (called from the event loop, throttled): rescan progress and
+    /// auto-resume any download whose worker died (stale). A live detached worker
+    /// keeps its state fresh and is left running — this only revives crashes,
+    /// reboots, and app exits that killed the worker.
+    fn poll_downloads(&mut self) {
+        if self.last_download_poll.elapsed() < Duration::from_millis(1000) {
+            return;
+        }
+        self.last_download_poll = Instant::now();
+        self.refresh_active_downloads();
+        self.resume_stale_downloads();
+    }
+
+    /// Spawn (or re-spawn) a detached worker for a download whose worker is no
+    /// longer running. Failed downloads are left for an explicit user resume so a
+    /// permanently-failing fetch (gated model, bad url) can't spin-loop.
+    fn resume_stale_downloads(&mut self) {
+        let now = now_unix();
+        let stale: Vec<DownloadState> = self
+            .active_downloads
+            .iter()
+            .filter(|d| d.status == DownloadStatus::Downloading && d.is_stale(now))
+            .cloned()
+            .collect();
+        let mut resumed = 0;
+        for st in stale {
+            if self.spawn_download_worker(&st) {
+                resumed += 1;
+            }
+        }
+        if resumed > 0 {
+            self.set_status(
+                format!("Resuming {resumed} interrupted download(s) in the background"),
+                false,
+            );
+            self.refresh_active_downloads();
+        }
+    }
+
+    /// Explicit user resume of a stalled or failed download (from the panel's
+    /// resume button).
+    fn resume_download(&mut self, model_id: &str) {
+        let Some(st) = self.download_for(model_id).cloned() else {
+            return;
+        };
+        if self.spawn_download_worker(&st) {
+            self.set_status(format!("Resuming download of {model_id}"), false);
+            self.refresh_active_downloads();
+        }
+    }
+
+    /// Launch the detached `localcode download` worker for `st` and touch its
+    /// state file so the next poll doesn't see it as stale before the worker's
+    /// first heartbeat (which would double-spawn). Returns whether it launched.
+    fn spawn_download_worker(&mut self, st: &DownloadState) -> bool {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                self.raise_error(
+                    LocalCodeError::new(ErrorCode::Internal, e.to_string())
+                        .with_cause("Could not locate the localcode binary to run the download worker"),
+                );
+                return false;
+            }
+        };
+        match spawn_detached_worker(&exe, &st.model_id, st.quantization.as_deref(), st.backend) {
+            Ok(pid) => {
+                let mut fresh = st.clone();
+                fresh.pid = pid;
+                fresh.status = DownloadStatus::Downloading;
+                fresh.message = "Resuming…".into();
+                fresh.updated_unix = now_unix();
+                write_state(&model_dir(&self.paths.models_cache, &st.model_id), &fresh);
+                true
+            }
+            Err(e) => {
+                self.raise_error(e);
+                false
+            }
+        }
+    }
+
+    /// Start a background, resumable, exit-surviving download for a deploy whose
+    /// weights aren't on disk yet: write the initial state file, spawn the
+    /// detached worker, and let the deploy panel track it. Falls back to a
+    /// foreground deploy (still resumable) if the worker can't be launched.
+    fn start_background_download(&mut self, req: &DeployRequest) {
+        let dir = model_dir(&self.paths.models_cache, &req.model_id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.spawn_deploy(req.clone());
+            return;
+        }
+        let mut state = DownloadState {
+            model_id: req.model_id.clone(),
+            quantization: req.quantization.clone(),
+            backend: req.backend,
+            files: req.weight_files.clone(),
+            download_urls: req.download_urls.clone(),
+            total_bytes: req.weight_bytes,
+            downloaded_bytes: 0,
+            status: DownloadStatus::Downloading,
+            message: "Queued".into(),
+            primary_file: None,
+            pid: 0,
+            updated_unix: now_unix(),
+        };
+        write_state(&dir, &state);
+
+        let exe = std::env::current_exe().ok();
+        let spawned = exe.and_then(|exe| {
+            spawn_detached_worker(&exe, &req.model_id, req.quantization.as_deref(), req.backend).ok()
+        });
+        match spawned {
+            Some(pid) => {
+                state.pid = pid;
+                state.message = "Downloading in the background".into();
+                state.updated_unix = now_unix();
+                write_state(&dir, &state);
+                self.set_status(
+                    format!(
+                        "Downloading {} in the background — safe to quit; it resumes on its own. Deploy once it finishes.",
+                        req.model_id
+                    ),
+                    false,
+                );
+                self.refresh_active_downloads();
+            }
+            None => {
+                // No detached worker (e.g. current_exe failed) — don't strand the
+                // user; do the download inline via the normal deploy pipeline.
+                clear_state(&dir);
+                self.set_status(
+                    "Background worker unavailable — downloading in the foreground",
+                    false,
+                );
+                self.spawn_deploy(req.clone());
+            }
+        }
     }
 
     /// True when a model's weights are on disk (drives the /models "downloaded"
@@ -6746,7 +7009,10 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             return;
         }
         if self.mode == Mode::Models && self.deploy_editing.is_some() {
-            self.deploy_field_edit.push_str(&flat());
+            let text = flat();
+            let idx = char_to_byte(&self.deploy_field_edit, self.deploy_field_cursor);
+            self.deploy_field_edit.insert_str(idx, &text);
+            self.deploy_field_cursor += text.chars().count();
             return;
         }
         let idx = char_to_byte(&self.coding_input, self.coding_cursor);
@@ -7276,6 +7542,11 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             ClickTarget::DeployAutoConfig => self.auto_configure_deploy(),
             ClickTarget::DeployButton => self.start_deploy(false),
             ClickTarget::DeployCancel => self.cancel_deploy(),
+            ClickTarget::DownloadResume => {
+                if let Some(id) = self.current_model_id() {
+                    self.resume_download(&id);
+                }
+            }
             ClickTarget::DeployField(field) => self.begin_deploy_edit(field),
             // Runtimes.
             ClickTarget::RuntimeList => {
@@ -7833,6 +8104,10 @@ pub async fn run_tui(paths: AppPaths, config: Config) -> Result<(), LocalCodeErr
         app.start_update_check(false);
     }
     app.autoconnect_remotes();
+    // Revive any background downloads whose worker didn't survive the last exit
+    // (crash/reboot). Workers that are still running keep their state fresh and
+    // are simply re-attached (rendered) rather than restarted.
+    app.resume_stale_downloads();
     let result = run_loop(&mut terminal, &mut app).await;
 
     // Kill managed model servers on EVERY exit path — including an early return
@@ -7860,6 +8135,7 @@ async fn run_loop(
     loop {
         app.process_events().await;
         app.process_bg();
+        app.poll_downloads();
 
         // Apply a pending mouse-capture change. "Select mode" (F2 / `/select`)
         // releases the mouse so the terminal can drag-select/copy text; the
@@ -9014,6 +9290,117 @@ mod tests {
         assert_eq!(app.deploy_ctx, 16384);
         // Typing into the field must not leak into the omnibar / model search.
         assert!(app.coding_input.is_empty());
+    }
+
+    #[test]
+    fn command_field_edits_the_tail_and_sets_override() {
+        // The reported bug: the launch command couldn't be edited. It's the only
+        // field long enough to overflow the panel, so a caret past the right edge
+        // made edits look dead. Editing it must still update the override.
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.deploy_command_override = Some("llama-server --port 8080".into());
+        app.begin_deploy_edit(DeployField::Command);
+        // Caret seeds at the end of the command.
+        assert_eq!(app.deploy_field_cursor(), "llama-server --port 8080".chars().count());
+        // Retype the trailing port 8080 -> 9090.
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        for c in "9090".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.deploy_field_edit_buf(), "llama-server --port 9090");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.deploy_editing.is_none());
+        assert_eq!(
+            app.deploy_command_override.as_deref(),
+            Some("llama-server --port 9090")
+        );
+    }
+
+    fn sample_download(model_id: &str, status: DownloadStatus) -> DownloadState {
+        DownloadState {
+            model_id: model_id.into(),
+            quantization: Some("Q4_K_M".into()),
+            backend: BackendKind::LlamaCpp,
+            files: vec!["m.gguf".into()],
+            download_urls: vec!["https://h/m.gguf".into()],
+            total_bytes: 100,
+            downloaded_bytes: 40,
+            status,
+            message: "…".into(),
+            primary_file: None,
+            pid: 0,
+            updated_unix: now_unix(),
+        }
+    }
+
+    #[test]
+    fn deploy_panel_renders_background_download() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.model_detail = Some(detail_with_quant("org/x", "Q4_K_M", "x-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+
+        // A live download shows progress and the "safe to quit" note.
+        app.active_downloads = vec![sample_download("org/x", DownloadStatus::Downloading)];
+        let s = render_to_string(&mut app, 120, 40);
+        assert!(s.contains("downloading"), "expected progress line, got:\n{s}");
+
+        // A failed download surfaces the warning and a resume button.
+        app.active_downloads = vec![sample_download("org/x", DownloadStatus::Failed)];
+        let s = render_to_string(&mut app, 120, 40);
+        assert!(s.contains("download failed"), "{s}");
+        assert!(s.contains("resume"), "expected a resume button, got:\n{s}");
+    }
+
+    #[test]
+    fn active_download_tracked_and_completed_one_consumed() {
+        let mut app = test_app();
+        let cache = app.paths.models_cache.clone();
+        // One in-progress and one completed download, each with a state file.
+        let dir_a = model_dir(&cache, "org/a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        write_state(&dir_a, &sample_download("org/a", DownloadStatus::Downloading));
+        let dir_b = model_dir(&cache, "org/b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        write_state(&dir_b, &sample_download("org/b", DownloadStatus::Completed));
+
+        app.refresh_active_downloads();
+
+        // The in-progress one is tracked and its state file preserved.
+        assert!(app.download_for("org/a").is_some());
+        assert!(localcode_backends::read_state(&dir_a).is_some());
+        // The completed one is consumed: dropped from the active list and its
+        // state file cleared so it stops showing as "downloading".
+        assert!(app.download_for("org/b").is_none());
+        assert!(localcode_backends::read_state(&dir_b).is_none());
+    }
+
+    #[test]
+    fn command_field_caret_moves_and_edits_mid_string() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.deploy_command_override = Some("abd".into());
+        app.begin_deploy_edit(DeployField::Command);
+        // ← between 'b' and 'd', insert 'c' -> "abcd" (mid-string edit).
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.deploy_field_edit_buf(), "abcd");
+        assert_eq!(app.deploy_field_cursor(), 3);
+        // Home + Delete drops the leading char.
+        app.handle_key(key(KeyCode::Home));
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.deploy_field_edit_buf(), "bcd");
+        assert_eq!(app.deploy_field_cursor(), 0);
+        // Backspace at column 0 is a no-op (doesn't underflow).
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.deploy_field_edit_buf(), "bcd");
+        assert_eq!(app.deploy_field_cursor(), 0);
     }
 
     #[test]

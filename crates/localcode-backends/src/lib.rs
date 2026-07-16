@@ -3,6 +3,7 @@
 mod colibri;
 mod deploy;
 mod diagnose;
+mod download;
 mod install;
 mod models_store;
 mod monitor;
@@ -17,6 +18,11 @@ mod registry;
 
 pub use deploy::{
     preview_deploy_command, DeployJob, DeployProgress, DeployRequest, DeployService,
+};
+pub use download::{
+    clear_state, model_dir, now_unix, read_state, run_download, run_worker, scan_active,
+    spawn_detached_worker, write_progress_state, write_state, DownloadSpec, DownloadState,
+    DownloadStatus, DOWNLOAD_STATE_FILE, STALE_AFTER_SECS,
 };
 pub use diagnose::{classify, diagnose, Confidence, Diagnosis, FailureClass, RepairIntent};
 pub use models_store::{

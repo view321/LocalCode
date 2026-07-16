@@ -8,7 +8,6 @@ use localcode_gpu::{predict_fit, FitRequest, GpuInventory};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tracing::info;
 use uuid::Uuid;
 
@@ -233,6 +232,11 @@ impl DeployService {
 
     /// Download quant weight files into the models cache, emitting progress.
     /// Returns the path to the primary weight file (first shard).
+    ///
+    /// Delegates to the shared resumable [`crate::download::run_download`] engine
+    /// so a dropped connection resumes from the partial `.part` (HTTP `Range`)
+    /// rather than restarting — the same behaviour the detached background worker
+    /// gives, kept identical by sharing one engine.
     async fn download_weights(
         &self,
         req: &DeployRequest,
@@ -259,185 +263,35 @@ impl DeployService {
             return Err(err);
         }
 
-        let dir = self.models_dir.join(sanitize_dir(&req.model_id));
-        std::fs::create_dir_all(&dir).map_err(LocalCodeError::from)?;
-        // Record the exact HF id so the on-disk store can reverse the lossy
-        // directory-name sanitization when listing downloaded models later.
-        crate::models_store::write_marker(&dir, &req.model_id);
-
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
+        let spec = crate::download::DownloadSpec {
+            model_id: req.model_id.clone(),
+            quantization: req.quantization.clone(),
+            backend: req.backend,
+            dir: self.models_dir.join(sanitize_dir(&req.model_id)),
+            files: req.weight_files.clone(),
+            download_urls: req.download_urls.clone(),
+            total_bytes: req.weight_bytes,
+        };
 
         let total = req.weight_bytes;
-        let mut fetched: u64 = 0;
-        let mut paths: Vec<PathBuf> = Vec::new();
+        let events = self.events.clone();
+        let job = job_id.to_string();
+        let primary = crate::download::run_download(
+            &spec,
+            self.registry_token.as_deref(),
+            &self.mirror_hosts,
+            move |downloaded, msg| {
+                events.publish(AppEvent::DeployProgress {
+                    job_id: job.clone(),
+                    percent: download_percent(downloaded, total),
+                    message: msg.to_string(),
+                });
+            },
+        )
+        .await
+        .map_err(|e| e.with_correlation(*cid))?;
 
-        for (i, url) in req.download_urls.iter().enumerate() {
-            let filename = req
-                .weight_files
-                .get(i)
-                .map(|f| f.as_str())
-                .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("weights.bin"));
-            // Only the file name — never let a path component escape the dir.
-            let filename = std::path::Path::new(filename)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "weights.bin".into());
-            let dest = dir.join(&filename);
-
-            if dest.exists()
-                && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false)
-            {
-                self.emit_progress(
-                    job_id,
-                    cid,
-                    download_percent(fetched, total),
-                    &format!("Cached: {filename}"),
-                );
-                fetched += std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                paths.push(dest);
-                continue;
-            }
-
-            // Try the primary URL then every mirror host in turn: an isolated
-            // network can reach a mirror even when huggingface.co times out.
-            let candidates = expand_mirror_candidates(url, &self.mirror_hosts);
-            let part = dir.join(format!("{filename}.part"));
-            let bytes = self
-                .download_one(&client, &candidates, &filename, &part, job_id, cid, fetched, total)
-                .await?;
-            fetched += bytes;
-            tokio::fs::rename(&part, &dest).await.map_err(|e| {
-                LocalCodeError::new(ErrorCode::IoError, e.to_string()).with_correlation(*cid)
-            })?;
-            paths.push(dest);
-        }
-
-        paths.sort();
-        let primary = paths
-            .iter()
-            .find(|p| {
-                p.extension()
-                    .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| paths.first())
-            .ok_or_else(|| {
-                LocalCodeError::new(ErrorCode::DeployDownloadFailed, "No files downloaded")
-                    .with_correlation(*cid)
-            })?;
         Ok(primary.display().to_string())
-    }
-
-    /// Download one file, trying each candidate URL (primary then mirrors) into
-    /// `part`. Returns the byte count on success. A transport error or non-2xx
-    /// status falls through to the next mirror; only a local write error (disk)
-    /// is fatal. Emits progress against the overall `total`.
-    #[allow(clippy::too_many_arguments)]
-    async fn download_one(
-        &self,
-        client: &reqwest::Client,
-        candidates: &[String],
-        filename: &str,
-        part: &std::path::Path,
-        job_id: &str,
-        cid: &CorrelationId,
-        fetched_base: u64,
-        total: u64,
-    ) -> Result<u64, LocalCodeError> {
-        use futures::StreamExt;
-        let mut last_err: Option<LocalCodeError> = None;
-        let n = candidates.len();
-        for (attempt, url) in candidates.iter().enumerate() {
-            let via = if attempt == 0 {
-                format!("Downloading {filename}")
-            } else {
-                format!("Downloading {filename} (mirror {}/{})", attempt + 1, n)
-            };
-            self.emit_progress(job_id, cid, download_percent(fetched_base, total), &via);
-
-            let mut request = client.get(url);
-            if let Some(token) = &self.registry_token {
-                request = request.bearer_auth(token);
-            }
-            let resp = match request.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = Some(
-                        LocalCodeError::new(ErrorCode::DeployDownloadFailed, e.to_string())
-                            .with_correlation(*cid)
-                            .with_cause(format!("Network error downloading {filename}"))
-                            .with_hint("Check connectivity or configure registry.mirrors")
-                            .retryable(true),
-                    );
-                    continue;
-                }
-            };
-            if !resp.status().is_success() {
-                last_err = Some(
-                    LocalCodeError::new(
-                        ErrorCode::DeployDownloadFailed,
-                        format!("Download failed ({}): {filename}", resp.status()),
-                    )
-                    .with_correlation(*cid)
-                    .with_hint("Gated model? Set HF_TOKEN")
-                    .retryable(true),
-                );
-                continue;
-            }
-
-            let mut file = tokio::fs::File::create(part).await.map_err(|e| {
-                LocalCodeError::new(ErrorCode::IoError, e.to_string()).with_correlation(*cid)
-            })?;
-            let mut stream = resp.bytes_stream();
-            let mut file_bytes: u64 = 0;
-            let mut last_emit = std::time::Instant::now();
-            let mut stream_err: Option<LocalCodeError> = None;
-            while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        stream_err = Some(
-                            LocalCodeError::new(ErrorCode::DeployDownloadFailed, e.to_string())
-                                .with_correlation(*cid)
-                                .retryable(true),
-                        );
-                        break;
-                    }
-                };
-                file_bytes += chunk.len() as u64;
-                file.write_all(&chunk).await.map_err(|e| {
-                    LocalCodeError::new(ErrorCode::IoError, e.to_string())
-                        .with_correlation(*cid)
-                        .with_hint("Check free disk space")
-                })?;
-                if last_emit.elapsed() > std::time::Duration::from_millis(750) {
-                    last_emit = std::time::Instant::now();
-                    self.emit_progress(
-                        job_id,
-                        cid,
-                        download_percent(fetched_base + file_bytes, total),
-                        &format!("{via} — {:.1} GiB", (fetched_base + file_bytes) as f64 / GIB),
-                    );
-                }
-            }
-            file.flush().await.ok();
-            drop(file);
-            if let Some(e) = stream_err {
-                // Partial download: discard and try the next mirror.
-                let _ = tokio::fs::remove_file(part).await;
-                last_err = Some(e);
-                continue;
-            }
-            return Ok(file_bytes);
-        }
-        Err(last_err.unwrap_or_else(|| {
-            LocalCodeError::new(ErrorCode::DeployDownloadFailed, format!("No source for {filename}"))
-                .with_correlation(*cid)
-                .retryable(true)
-        }))
     }
 
     fn emit_progress(&self, job_id: &str, cid: &CorrelationId, percent: u8, message: &str) {
@@ -450,8 +304,6 @@ impl DeployService {
     }
 }
 
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-
 /// Map download progress into the 15..=38 band of the overall deploy.
 fn download_percent(fetched: u64, total: u64) -> u8 {
     if total == 0 {
@@ -460,25 +312,6 @@ fn download_percent(fetched: u64, total: u64) -> u8 {
         let frac = (fetched as f64 / total as f64).clamp(0.0, 1.0);
         15 + (frac * 23.0) as u8
     }
-}
-
-/// Expand a resolved download URL into the same path on every mirror host
-/// (primary first, in `hosts` order). If the URL isn't on a known host it is
-/// returned unchanged as the sole candidate. Mirrors the logic of
-/// `localcode_hf::UrlBuilder::mirror_candidates` without a crate dependency.
-fn expand_mirror_candidates(url: &str, hosts: &[String]) -> Vec<String> {
-    let trimmed: Vec<String> = hosts
-        .iter()
-        .map(|h| h.trim_end_matches('/').to_string())
-        .collect();
-    for h in &trimmed {
-        if let Some(rest) = url.strip_prefix(h.as_str()) {
-            let mut out: Vec<String> = trimmed.iter().map(|host| format!("{host}{rest}")).collect();
-            out.dedup();
-            return out;
-        }
-    }
-    vec![url.to_string()]
 }
 
 /// True when a GGUF model is being deployed to a backend that loads HF
@@ -630,32 +463,6 @@ pub fn preview_deploy_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mirror_candidates_swap_and_order() {
-        let hosts = vec![
-            "https://huggingface.co".to_string(),
-            "https://hf-mirror.com".to_string(),
-        ];
-        let got = expand_mirror_candidates(
-            "https://huggingface.co/org/model/resolve/main/m.gguf",
-            &hosts,
-        );
-        assert_eq!(
-            got,
-            vec![
-                "https://huggingface.co/org/model/resolve/main/m.gguf".to_string(),
-                "https://hf-mirror.com/org/model/resolve/main/m.gguf".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn mirror_candidates_unknown_host_passthrough() {
-        let hosts = vec!["https://huggingface.co".to_string()];
-        let got = expand_mirror_candidates("https://other.example/a/b.gguf", &hosts);
-        assert_eq!(got, vec!["https://other.example/a/b.gguf".to_string()]);
-    }
 
     #[test]
     fn download_percent_bands() {
