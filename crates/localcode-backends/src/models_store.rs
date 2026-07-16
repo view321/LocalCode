@@ -34,7 +34,10 @@ pub struct DownloadedModel {
     pub total_bytes: u64,
     /// Distinct quantization labels inferred from filenames (best-effort).
     pub quants: Vec<String>,
-    /// Weight file names present (sorted).
+    /// All real file names present, sorted (weights AND sidecars like
+    /// `config.json` / tokenizer / colibrì `.qs` scales). The "is this quant
+    /// fully downloaded?" check compares against this, so it must list every
+    /// file the engine needs — not just the weights.
     pub files: Vec<String>,
 }
 
@@ -114,24 +117,40 @@ pub fn write_marker(dir: &Path, model_id: &str) {
 }
 
 /// Scan one model directory, returning a [`DownloadedModel`] when it holds at
-/// least one non-empty weight file. `.part` files (partial downloads) and empty
-/// files are ignored so a half-finished download does not read as present.
+/// least one non-empty weight file. `.part` files (partial downloads), our own
+/// `.localcode*` bookkeeping files, and empty files are ignored so a
+/// half-finished download does not read as present.
+///
+/// Every other real file is recorded in `files` — not just weights — because a
+/// colibrì container is only usable once its `config.json`, tokenizer, and `.qs`
+/// scales are on disk alongside the shards, and the deploy path checks for them.
+/// Weight files alone still drive `total_bytes`, the quant labels, and the
+/// "is this a real download" gate (a lone `config.json` is not a model).
 fn scan_dir(dir: &Path) -> Option<DownloadedModel> {
     let mut total_bytes = 0u64;
     let mut files = Vec::new();
     let mut quants = Vec::new();
+    let mut has_weight = false;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
-        if !path.is_file() || !is_weight_file(&path) {
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Skip partial downloads and LocalCode's own state/marker files.
+        if name.ends_with(".part") || name.starts_with(".localcode") {
             continue;
         }
         let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
         if len == 0 {
             continue;
         }
-        total_bytes += len;
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            files.push(name.to_string());
+        files.push(name.to_string());
+        if is_weight_file(&path) {
+            has_weight = true;
+            total_bytes += len;
             if let Some(q) = quant_label_from_filename(name) {
                 if !quants.contains(&q) {
                     quants.push(q);
@@ -139,7 +158,7 @@ fn scan_dir(dir: &Path) -> Option<DownloadedModel> {
             }
         }
     }
-    if files.is_empty() {
+    if !has_weight {
         return None;
     }
     files.sort();
@@ -308,6 +327,41 @@ mod tests {
         let freed = delete_downloaded(models, "org/coder-7b").unwrap();
         assert_eq!(freed, 2048);
         assert!(!is_downloaded(models, "org/coder-7b"));
+    }
+
+    #[test]
+    fn records_colibri_sidecars_not_just_weights() {
+        // A colibrì container: shards + config.json + tokenizer + .qs scales.
+        // All must be listed so the deploy "fully downloaded?" check passes,
+        // but only the shards count toward total_bytes / the weight gate.
+        let root = tempdir().unwrap();
+        let d = root.path().join(sanitize_model_dir("org/glm-colibri"));
+        write_file(&d, "out-00001-of-00002.safetensors", 4096);
+        write_file(&d, "out-00002-of-00002.safetensors", 4096);
+        write_file(&d, "config.json", 512);
+        write_file(&d, "tokenizer.json", 1024);
+        write_file(&d, "layer0.qs", 64);
+        write_file(&d, "out-00001-of-00002.safetensors.part", 10); // ignored
+        write_marker(&d, "org/glm-colibri");
+
+        let m = find_downloaded(root.path(), "org/glm-colibri").unwrap();
+        for needed in ["config.json", "tokenizer.json", "layer0.qs", "out-00001-of-00002.safetensors"] {
+            assert!(m.files.iter().any(|f| f == needed), "{needed} must be recorded");
+        }
+        assert!(!m.files.iter().any(|f| f.ends_with(".part")), "partial files excluded");
+        assert!(!m.files.iter().any(|f| f.starts_with(".localcode")), "marker excluded");
+        // Only the two shards count as weight bytes.
+        assert_eq!(m.total_bytes, 8192);
+    }
+
+    #[test]
+    fn config_only_dir_is_not_a_download() {
+        // No weight file → not a usable model, even with config/tokenizer.
+        let root = tempdir().unwrap();
+        let d = root.path().join("half");
+        write_file(&d, "config.json", 512);
+        write_file(&d, "tokenizer.json", 1024);
+        assert!(scan_dir(&d).is_none());
     }
 
     #[test]
