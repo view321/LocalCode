@@ -133,11 +133,22 @@ pub async fn execute_model_tool(
             let model_id = str_arg(call, "model_id").ok_or_else(|| {
                 LocalCodeError::new(ErrorCode::AgentToolFailed, "deploy_model requires model_id")
             })?;
+            // Reject an out-of-range port rather than silently wrapping it via
+            // `as u16` (99999 → 34463 would deploy on a surprise port).
+            let port = match call.arguments.get("port").and_then(|v| v.as_u64()) {
+                Some(n) => Some(u16::try_from(n).map_err(|_| {
+                    LocalCodeError::new(
+                        ErrorCode::AgentToolFailed,
+                        format!("port {n} is out of range (1-65535)"),
+                    )
+                })?),
+                None => None,
+            };
             let args = DeployToolArgs {
                 model_id: model_id.clone(),
                 backend: str_arg(call, "backend"),
                 quant: str_arg(call, "quant"),
-                port: call.arguments.get("port").and_then(|v| v.as_u64()).map(|n| n as u16),
+                port,
                 context: call.arguments.get("context").and_then(|v| v.as_u64()).map(|n| n as u32),
                 command: str_arg(call, "command"),
             };

@@ -133,7 +133,14 @@ fn parse_skill_md(raw: &str) -> (Option<String>, Option<String>, String) {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    // `len() >= 2` guards the single-character case: a lone `"` (or `'`) is
+    // both `starts_with` and `ends_with` the same byte, so `s[1..len-1]` would
+    // be `s[1..0]` and panic — a half-edited SKILL.md would then crash every
+    // agent turn (SkillLoader runs inside every `CodingAgent::new`).
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
@@ -152,6 +159,27 @@ mod tests {
         assert_eq!(n.as_deref(), Some("my-skill"));
         assert_eq!(d.as_deref(), Some("Does a thing"));
         assert!(b.contains("Hello"));
+    }
+
+    #[test]
+    fn unquote_handles_degenerate_and_quoted_values() {
+        // A lone quote must not panic (half-edited frontmatter).
+        assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("'"), "'");
+        assert_eq!(unquote(""), "");
+        // Proper quote pairs are stripped; multi-byte inner content is fine.
+        assert_eq!(unquote("\"\""), "");
+        assert_eq!(unquote("\"hi\""), "hi");
+        assert_eq!(unquote("'日本'"), "日本");
+        // Unbalanced or bare values pass through unchanged.
+        assert_eq!(unquote("\"open"), "\"open");
+        assert_eq!(unquote("bare"), "bare");
+    }
+
+    #[test]
+    fn frontmatter_with_lone_quote_does_not_panic() {
+        let (n, _d, _b) = parse_skill_md("---\nname: \"\ndescription: x\n---\nbody");
+        assert_eq!(n.as_deref(), Some("\""));
     }
 
     #[test]

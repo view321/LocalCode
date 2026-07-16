@@ -16,7 +16,7 @@ use localcode_core::config::AgentConfig;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::paths::AppPaths;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -213,49 +213,67 @@ impl SessionStore {
             }
         }
 
+        // Build the new entries into LOCALS — do not touch the durable-state
+        // trackers (leaf / message_ids / message_fps / synced_compaction /
+        // last_title) until the write below succeeds. If the write fails after
+        // these were already updated, the trimmed fingerprints would mark the
+        // messages as persisted and every later sync would skip them — silent,
+        // permanent loss of exactly the turns that failed to save.
         let mut appended: Vec<SessionEntry> = Vec::new();
+        let mut new_ids: Vec<String> = Vec::new();
+        let mut new_fps: Vec<u64> = Vec::new();
+        let mut leaf = self.leaf.clone();
+
         for (m, fp) in session.messages[common..].iter().zip(&fps[common..]) {
             let entry = MessageEntry {
                 id: Uuid::new_v4().to_string(),
-                parent_id: self.leaf.clone(),
+                parent_id: leaf.clone(),
                 ts: Utc::now(),
                 message: m.clone(),
             };
-            self.leaf = Some(entry.id.clone());
-            self.message_ids.push(entry.id.clone());
-            self.message_fps.push(*fp);
+            leaf = Some(entry.id.clone());
+            new_ids.push(entry.id.clone());
+            new_fps.push(*fp);
             appended.push(SessionEntry::Message(entry));
         }
 
+        // Message count once these appends land, for the `*_at` anchors and the
+        // compaction lookup (whose target may be one of the just-built ids).
+        let total_msgs = self.message_ids.len() + new_ids.len();
+
+        let mut new_synced_compaction: Option<(Option<usize>, usize)> = None;
         if let Some(c) = &session.compaction {
-            if self.synced_compaction != Some(c.first_kept_index)
-                && c.first_kept_index < self.message_ids.len()
+            if self.synced_compaction != Some(c.first_kept_index) && c.first_kept_index < total_msgs
             {
+                let first_kept_id = if c.first_kept_index < self.message_ids.len() {
+                    self.message_ids[c.first_kept_index].clone()
+                } else {
+                    new_ids[c.first_kept_index - self.message_ids.len()].clone()
+                };
                 let entry = CompactionEntry {
                     id: Uuid::new_v4().to_string(),
-                    parent_id: self.leaf.clone(),
+                    parent_id: leaf.clone(),
                     ts: Utc::now(),
                     summary: c.summary.clone(),
-                    first_kept_id: self.message_ids[c.first_kept_index].clone(),
+                    first_kept_id,
                     chars_before: c.chars_before,
                 };
-                self.leaf = Some(entry.id.clone());
-                self.synced_compaction = Some(c.first_kept_index);
-                self.synced_compaction_at = self.message_ids.len();
+                leaf = Some(entry.id.clone());
+                new_synced_compaction = Some((Some(c.first_kept_index), total_msgs));
                 appended.push(SessionEntry::Compaction(entry));
             }
         }
 
+        let mut new_title: Option<(String, usize)> = None;
         if session.title != self.last_title {
             let entry = TitleEntry {
                 id: Uuid::new_v4().to_string(),
-                parent_id: self.leaf.clone(),
+                parent_id: leaf.clone(),
                 ts: Utc::now(),
                 title: session.title.clone(),
             };
-            self.leaf = Some(entry.id.clone());
-            self.last_title = session.title.clone();
-            self.last_title_at = self.message_ids.len();
+            leaf = Some(entry.id.clone());
+            new_title = Some((session.title.clone(), total_msgs));
             appended.push(SessionEntry::Title(entry));
         }
 
@@ -267,20 +285,59 @@ impl SessionStore {
         for entry in &appended {
             lines.push_str(&to_line(entry)?);
         }
+
+        // If a prior append was cut off mid-line by a crash, the file won't end
+        // in '\n'; appending onto it would fuse two JSONL records into one
+        // unparsable line and, because every later entry chains its parent
+        // through it, orphan the whole subsequent branch on reload. Repair by
+        // prefixing a newline when the tail isn't already one.
+        let needs_leading_nl = self.file_lacks_trailing_newline()?;
+
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
             .map_err(|e| save_err(e, &self.path))?;
+        if needs_leading_nl {
+            file.write_all(b"\n").map_err(|e| save_err(e, &self.path))?;
+        }
         file.write_all(lines.as_bytes())
             .map_err(|e| save_err(e, &self.path))?;
         file.flush().map_err(|e| save_err(e, &self.path))?;
 
+        // The write succeeded — only now commit the in-memory trackers.
+        self.leaf = leaf;
+        self.message_ids.extend(new_ids);
+        self.message_fps.extend(new_fps);
+        if let Some((sc, at)) = new_synced_compaction {
+            self.synced_compaction = sc;
+            self.synced_compaction_at = at;
+        }
+        if let Some((title, at)) = new_title {
+            self.last_title = title;
+            self.last_title_at = at;
+        }
         let n = appended.len();
         for entry in appended {
             self.by_id.insert(entry.id().to_string(), self.entries.len());
             self.entries.push(entry);
         }
         Ok(n)
+    }
+
+    /// Whether the session file is non-empty and its last byte isn't `'\n'`
+    /// (a partial line left by an interrupted append). Reads only the final
+    /// byte, so it stays cheap regardless of session size.
+    fn file_lacks_trailing_newline(&self) -> Result<bool, LocalCodeError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(&self.path).map_err(|e| save_err(e, &self.path))?;
+        let len = f.seek(SeekFrom::End(0)).map_err(|e| save_err(e, &self.path))?;
+        if len == 0 {
+            return Ok(false);
+        }
+        f.seek(SeekFrom::End(-1)).map_err(|e| save_err(e, &self.path))?;
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last).map_err(|e| save_err(e, &self.path))?;
+        Ok(last[0] != b'\n')
     }
 
     /// Load a session file, repairing what it can. The active path is the
@@ -354,8 +411,15 @@ impl SessionStore {
         let mut leaf = entries.last().map(|e| e.id().to_string());
         let mut chain: Vec<usize> = Vec::new();
         let mut cur = leaf.clone();
+        // A duplicate id (hand-edited or concatenated file) could make `by_id`
+        // resolve a parent back to an already-visited entry and spin forever;
+        // the visited set makes the walk terminate.
+        let mut visited: HashSet<usize> = HashSet::new();
         while let Some(id) = cur {
             let Some(&idx) = by_id.get(&id) else { break };
+            if !visited.insert(idx) {
+                break;
+            }
             chain.push(idx);
             cur = entries[idx].parent_id().map(str::to_string);
         }
@@ -681,6 +745,89 @@ mod tests {
         assert_eq!(store.sync(&session).unwrap(), 0);
         let text = std::fs::read_to_string(store.path()).unwrap();
         assert_eq!(text.matches("{\"type\":\"title\"").count(), 1);
+    }
+
+    #[test]
+    fn failed_write_does_not_mark_messages_persisted() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let mut session = new_session(dir.path());
+        session.messages.push(user("first"));
+        let mut store = SessionStore::create(&root, &session).unwrap();
+        store.sync(&session).unwrap();
+
+        // Point the store at a path whose parent doesn't exist so the append
+        // fails, then confirm the messages weren't silently dropped: restoring
+        // a good path and syncing again writes them.
+        let good = store.path().to_path_buf();
+        store.path = dir.path().join("absent-dir").join("s.jsonl");
+        session.messages.push(user("second"));
+        session.messages.push(asst("answer"));
+        assert!(store.sync(&session).is_err());
+
+        store.path = good;
+        assert_eq!(store.sync(&session).unwrap(), 2);
+        let loaded = SessionStore::load(store.path()).unwrap();
+        assert_eq!(loaded.session.messages.len(), 3);
+        assert_eq!(loaded.session.messages[2].content, "answer");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn append_after_partial_line_keeps_all_history() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let mut session = new_session(dir.path());
+        session.messages.push(user("one"));
+        session.messages.push(asst("two"));
+        let mut store = SessionStore::create(&root, &session).unwrap();
+        store.sync(&session).unwrap();
+
+        // Simulate a crash mid-append: a truncated line with no trailing '\n'.
+        let mut text = std::fs::read_to_string(store.path()).unwrap();
+        text.push_str("{\"type\":\"message\",\"id\":\"partia");
+        std::fs::write(store.path(), &text).unwrap();
+
+        // The next turn's append must land on its own line, not fuse onto the
+        // partial one — otherwise "three" (and everything chained after it)
+        // would be lost on reload.
+        session.messages.push(user("three"));
+        assert_eq!(store.sync(&session).unwrap(), 1);
+
+        let loaded = SessionStore::load(store.path()).unwrap();
+        let contents: Vec<&str> =
+            loaded.session.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["one", "two", "three"], "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn load_terminates_on_duplicate_id_cycle() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let session = new_session(dir.path());
+        let store = SessionStore::create(&root, &session).unwrap();
+        let path = store.path().to_path_buf();
+
+        // Header + a duplicate-id chain that loops (x → y → x). Without the
+        // visited-set guard the active-path walk would spin forever and hang
+        // startup auto-resume.
+        let entry = |id: &str, parent: Option<&str>| {
+            SessionEntry::Message(MessageEntry {
+                id: id.into(),
+                parent_id: parent.map(String::from),
+                ts: Utc::now(),
+                message: user("m"),
+            })
+        };
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        for e in [entry("x", None), entry("y", Some("x")), entry("x", Some("y"))] {
+            text.push_str(&to_line(&e).unwrap());
+        }
+        std::fs::write(&path, text).unwrap();
+
+        // The assertion is really "this returns at all".
+        let loaded = SessionStore::load(&path).unwrap();
+        assert!(!loaded.session.messages.is_empty());
     }
 
     #[test]

@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -498,26 +500,17 @@ impl CodingAgent {
         }
 
         if final_text.is_empty() {
-            final_text =
-                "(agent completed tool rounds without a final message)".into();
-            // Persist the synthetic stop so history and UI agree (issue 9).
-            let last_is_tool = session
-                .messages
-                .last()
-                .map(|m| m.role == "tool")
-                .unwrap_or(false);
-            let last_is_assistant_with_tools = session
-                .messages
-                .last()
-                .map(|m| m.role == "assistant" && m.tool_calls.is_some())
-                .unwrap_or(false);
-            if last_is_tool || last_is_assistant_with_tools || session.messages.last().map(|m| m.role == "user").unwrap_or(false) {
-                // Only append if we didn't already push a final assistant text message.
-                let needs = !matches!(
-                    session.messages.last(),
-                    Some(m) if m.role == "assistant" && m.tool_calls.is_none()
-                );
-                if needs {
+            final_text = "(agent completed tool rounds without a final message)".into();
+            // Keep history and the returned text in agreement. If the loop broke
+            // on an *empty* final assistant message, that empty message is the
+            // tail — fill it in rather than leaving "" in history while the UI
+            // shows the synthetic stop. Otherwise (ran out of rounds on a tool
+            // result / assistant-with-tools / user tail) append the stop.
+            match session.messages.last_mut() {
+                Some(m) if m.role == "assistant" && m.tool_calls.is_none() => {
+                    m.content = final_text.clone();
+                }
+                _ => {
                     session
                         .messages
                         .push(ChatMessage::assistant(final_text.clone(), None, None));
@@ -719,24 +712,33 @@ No tools — reply with the summary only.";
         if let Some(k) = key {
             req = req.bearer_auth(k);
         }
-        let resp = req.send().await.map_err(|e| {
-            LocalCodeError::new(ErrorCode::BackendNotReady, e.to_string())
-                .with_cause("Summarization request failed")
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let t = resp.text().await.unwrap_or_default();
-            return Err(LocalCodeError::new(
-                ErrorCode::BackendNotReady,
-                format!("Summarization failed {status}: {t}"),
-            ));
-        }
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| LocalCodeError::new(ErrorCode::Internal, e.to_string()))?;
-        let parsed = parse_full_response(&v)?;
-        Ok(parsed.content.unwrap_or_default())
+        // Bound the whole round-trip so a wedged server can't hang compaction
+        // forever (a summary is small, bounded work).
+        let summarize = async {
+            let resp = req.send().await.map_err(|e| {
+                LocalCodeError::new(ErrorCode::BackendNotReady, e.to_string())
+                    .with_cause("Summarization request failed")
+            })?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let t = resp.text().await.unwrap_or_default();
+                return Err(LocalCodeError::new(
+                    ErrorCode::BackendNotReady,
+                    format!("Summarization failed {status}: {t}"),
+                ));
+            }
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| LocalCodeError::new(ErrorCode::Internal, e.to_string()))?;
+            let parsed = parse_full_response(&v)?;
+            Ok(parsed.content.unwrap_or_default())
+        };
+        timeout(SUMMARIZE_TIMEOUT, summarize).await.map_err(|_| {
+            LocalCodeError::new(ErrorCode::BackendNotReady, "Summarization timed out")
+                .with_cause("The model server did not respond within 5 minutes")
+                .retryable(true)
+        })?
     }
 
     /// Run a single tool call: HF catalogue tools first, then the workspace registry.
@@ -906,8 +908,10 @@ file edits over shell redirects."
                         "Model management tools: deploy_model, stop_model, list_deployments, \
 list_downloaded_models, delete_model, deploy_ui. When the user asks to run, deploy, stop, or \
 delete a model, call these tools directly — do not tell the user to do it manually (the \
-Models tab /models is only the manual alternative). Mutating calls ask the user for approval \
-first, so calling them is always safe."
+Models tab /models is only the manual alternative). deploy_model and deploy_ui start real work \
+(a multi-GB download, a GPU server, or a Docker container), so call them only when the user \
+actually asked to run or deploy a model — not speculatively. stop_model and delete_model are \
+destructive and ask the user to confirm first."
                             .into(),
                     );
                 }
@@ -1125,7 +1129,24 @@ Never repeat an identical failing call or alternate between two failing calls."
         let mut acc = SseAccumulator::default();
         let mut done = false;
 
-        while let Some(chunk) = byte_stream.next().await {
+        loop {
+            // Bound the wait for the *next* chunk (idle timeout), not the whole
+            // stream — as long as tokens keep flowing the timer resets, so a long
+            // legitimate generation is never cut off, but a server that stops
+            // responding mid-stream fails instead of hanging forever.
+            let chunk = match timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(LocalCodeError::new(
+                        ErrorCode::BackendNotReady,
+                        "Runtime stopped sending stream data",
+                    )
+                    .with_cause("No bytes from the model server for 10 minutes — it may be wedged")
+                    .with_hint("Check runtime logs; the server may have run out of memory")
+                    .retryable(true));
+                }
+            };
             let bytes = chunk.map_err(|e| {
                 LocalCodeError::new(ErrorCode::BackendNotReady, e.to_string())
                     .with_cause("Stream from the runtime broke mid-response")
@@ -1212,8 +1233,15 @@ fn parse_full_response(v: &Value) -> Result<LlmResponse, LocalCodeError> {
     let mut raw_tool_calls = None;
     if let Some(arr) = choice["tool_calls"].as_array() {
         let mut tcs = Vec::new();
-        for tc in arr {
-            let id = tc["id"].as_str().unwrap_or("call").to_string();
+        for (i, tc) in arr.iter().enumerate() {
+            // Fall back to a *unique* id per call (`call_0`, `call_1`, …). A
+            // shared constant would give two id-less calls the same
+            // `tool_call_id`, which strict OpenAI-compatible servers reject on
+            // the replayed history.
+            let id = tc["id"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{i}"));
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let args = tc["function"]["arguments"]
                 .as_str()
@@ -1476,6 +1504,13 @@ impl SseAccumulator {
         if let Some(arr) = delta["tool_calls"].as_array() {
             for tc in arr {
                 let idx = tc["index"].as_u64().unwrap_or(self.tool_calls.len() as u64) as usize;
+                // The `index` comes straight off the wire; a malformed or hostile
+                // value (e.g. 4_000_000_000) would `resize` to billions of slots
+                // and OOM the process. No real response has this many parallel
+                // tool calls, so treat an out-of-range index as noise and skip.
+                if idx >= MAX_STREAM_TOOL_CALLS {
+                    continue;
+                }
                 if self.tool_calls.len() <= idx {
                     self.tool_calls.resize(idx + 1, PartialToolCall::default());
                 }
@@ -1553,11 +1588,23 @@ impl SseAccumulator {
             .filter(|t| !t.name.is_empty())
             .collect();
         if !complete.is_empty() {
+            // Unique fallback ids so two id-less streamed calls don't collide on
+            // the same `tool_call_id` (rejected by strict servers on replay). The
+            // raw array and the parsed calls index in lockstep, so a given call
+            // gets the same id in both.
+            let fallback_id = |i: usize, t: &PartialToolCall| {
+                if t.id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    t.id.clone()
+                }
+            };
             let raw: Vec<Value> = complete
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(i, t)| {
                     json!({
-                        "id": if t.id.is_empty() { "call" } else { t.id.as_str() },
+                        "id": fallback_id(i, t),
                         "type": "function",
                         "function": {
                             "name": t.name,
@@ -1568,12 +1615,9 @@ impl SseAccumulator {
                 .collect();
             let calls: Vec<ToolCall> = complete
                 .iter()
-                .map(|t| ToolCall {
-                    id: if t.id.is_empty() {
-                        "call".to_string()
-                    } else {
-                        t.id.clone()
-                    },
+                .enumerate()
+                .map(|(i, t)| ToolCall {
+                    id: fallback_id(i, t),
                     name: t.name.clone(),
                     arguments: serde_json::from_str(&t.arguments).unwrap_or(json!({})),
                 })
@@ -1600,6 +1644,22 @@ struct LlmResponse {
     /// True when content already went out as `Delta` / `ThinkingDelta` events.
     streamed: bool,
 }
+
+/// Upper bound on parallel tool-call slots a single streamed response may open.
+/// A wire `index` beyond this is treated as noise so a bogus value can't drive
+/// an unbounded `Vec::resize` (OOM). Far above any real fan-out.
+const MAX_STREAM_TOOL_CALLS: usize = 1024;
+
+/// Max gap between streamed chunks before the runtime is treated as wedged
+/// (e.g. a vLLM server that accepts the request after an OOM but never emits a
+/// token). Generous so it never fires during normal generation — even slow CPU
+/// prompt-processing produces bytes long before this — but bounds the otherwise
+/// infinite hang, which headless runs can't Esc out of.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Ceiling on a non-streaming summarization round-trip (bounded work). Stops a
+/// wedged server from hanging auto-compaction forever.
+const SUMMARIZE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Rough chars-per-token used to convert a model's token context window into a
 /// history char budget. Matches the `chars / 4` estimate the TUI context meter

@@ -439,15 +439,47 @@ impl ToolRegistry {
             (None, None) => content,
             (start, max) => {
                 let start = start.unwrap_or(0);
-                let total = content.lines().count();
-                let take = max.map(|n| n as usize).unwrap_or(usize::MAX);
-                let slice: Vec<&str> = content.lines().skip(start).take(take).collect();
-                format!(
-                    "[lines {}-{} of {total}]\n{}",
-                    start + 1,
-                    start + slice.len(),
-                    slice.join("\n")
-                )
+                // Split keeping the line terminators (`split_inclusive` retains
+                // the trailing "\n", and any "\r" before it), so a windowed read
+                // is a byte-for-byte slice of the file. Rebuilding with
+                // `lines().join("\n")` instead would strip "\r" from CRLF files,
+                // and a follow-up exact-match `edit` copied from this window
+                // would then never match on Windows.
+                let all: Vec<&str> = content.split_inclusive('\n').collect();
+                let total = all.len();
+                if start >= total {
+                    return Err(LocalCodeError::new(
+                        ErrorCode::AgentToolFailed,
+                        format!(
+                            "start_line {} is past the end of the file ({total} lines)",
+                            start + 1
+                        ),
+                    )
+                    .with_hint("Use a start_line within the file, or read without a window"));
+                }
+                let take = match max {
+                    Some(0) => {
+                        return Err(LocalCodeError::new(
+                            ErrorCode::AgentToolFailed,
+                            "max_lines must be at least 1",
+                        ));
+                    }
+                    Some(n) => n as usize,
+                    None => usize::MAX,
+                };
+                let end = start.saturating_add(take).min(total);
+                let mut slice = all[start..end].concat();
+                // Internal line endings are preserved (so an `edit` copied from
+                // this window matches CRLF files); only a single trailing
+                // terminator is trimmed so the window doesn't show a blank last
+                // line.
+                if slice.ends_with('\n') {
+                    slice.pop();
+                    if slice.ends_with('\r') {
+                        slice.pop();
+                    }
+                }
+                format!("[lines {}-{} of {total}]\n{slice}", start + 1, end)
             }
         };
         Ok(ToolResult {
@@ -458,11 +490,21 @@ impl ToolRegistry {
 
     fn tool_write(&self, call: &ToolCall, workspace: &Path) -> Result<ToolResult, LocalCodeError> {
         let path = arg_path(call, workspace, "path")?;
+        // `content` is required and must be a string. Defaulting a missing or
+        // non-string value to "" would silently truncate an existing file to
+        // zero bytes and report success — a dropped `content` field (or one
+        // sent as an object/number) must fail like `edit`'s missing args do.
         let content = call
             .arguments
             .get("content")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .ok_or_else(|| {
+                LocalCodeError::new(
+                    ErrorCode::AgentToolFailed,
+                    "write requires content (a string)",
+                )
+                .with_hint("Pass the full file contents in the `content` field")
+            })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1145,6 +1187,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.output, "[lines 2-3 of 4]\ntwo\nthree");
+    }
+
+    #[tokio::test]
+    async fn write_without_content_is_rejected_and_leaves_file_intact() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("keep.txt"), "important").unwrap();
+        // A dropped `content` field must fail, not truncate the file to 0 bytes.
+        let call = ToolCall {
+            id: "1".into(),
+            name: "write".into(),
+            arguments: json!({"path": "keep.txt"}),
+        };
+        let err = reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("content"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "important");
+        // A non-string content is likewise rejected.
+        let call = ToolCall {
+            id: "2".into(),
+            name: "write".into(),
+            arguments: json!({"path": "keep.txt", "content": 42}),
+        };
+        assert!(reg
+            .execute(&call, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "important");
+    }
+
+    #[tokio::test]
+    async fn windowed_read_preserves_crlf_for_exact_edits() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("crlf.txt"), "one\r\ntwo\r\nthree\r\nfour").unwrap();
+        let read = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "crlf.txt", "start_line": 2, "max_lines": 2}),
+        };
+        let r = reg
+            .execute(&read, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap();
+        // Internal CRLF is preserved (not normalized to LF).
+        assert_eq!(r.output, "[lines 2-3 of 4]\ntwo\r\nthree");
+        // The exact two-line window then matches for an edit on the CRLF file.
+        let edit = ToolCall {
+            id: "2".into(),
+            name: "edit".into(),
+            arguments: json!({"path": "crlf.txt", "old_string": "two\r\nthree", "new_string": "2\r\n3"}),
+        };
+        reg.execute(&edit, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crlf.txt")).unwrap(),
+            "one\r\n2\r\n3\r\nfour"
+        );
+    }
+
+    #[tokio::test]
+    async fn windowed_read_rejects_out_of_range() {
+        let dir = tempdir().unwrap();
+        let reg = ToolRegistry::default_tools();
+        std::fs::write(dir.path().join("n.txt"), "a\nb\nc\nd").unwrap();
+        let past = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "n.txt", "start_line": 500}),
+        };
+        let err = reg
+            .execute(&past, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("past the end"), "{}", err.message);
+        let zero = ToolCall {
+            id: "2".into(),
+            name: "read".into(),
+            arguments: json!({"path": "n.txt", "start_line": 1, "max_lines": 0}),
+        };
+        assert!(reg
+            .execute(&zero, dir.path(), ApprovalMode::Auto, None, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
