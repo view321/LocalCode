@@ -16,9 +16,9 @@
 //! downloaded `…-colibri-int4` Hugging Face repo.
 
 use crate::{
-    capture_into_monitor, port_in_use, probe_client, resolve_colibri_bin, resolve_launch,
-    spawn_exit_watch, BackendKind, DeployTuning, DetectReport, Health, InferenceBackend,
-    ModelDeploySpec, ModelMonitors, ProcState, RunningEndpoint,
+    capture_into_monitor, colibri_build_has_cuda, port_in_use, probe_client, resolve_colibri_bin,
+    resolve_launch, spawn_exit_watch, BackendKind, DeployTuning, DetectReport, Health,
+    InferenceBackend, ModelDeploySpec, ModelMonitors, ProcState, RunningEndpoint,
 };
 use async_trait::async_trait;
 use localcode_gpu::GpuInventory;
@@ -259,19 +259,34 @@ impl InferenceBackend for ColibriBackend {
             spec.command_override.as_deref(),
         );
 
-        // Use a GPU when one is present (unless the launch already pins --gpu).
-        // The CUDA env rides alongside --auto-tier, so the planner folds the GPU
-        // tier into its plan. discover() degrades to an empty inventory (CPU
-        // only) when there's no nvidia-smi, leaving the env untouched.
+        // Use a GPU when one is present AND this build can actually use CUDA.
+        // Forcing COLI_CUDA on a CPU-only engine makes `coli serve` exit at
+        // startup — the native-Windows build has no CUDA target, and a Unix
+        // CPU-only build would crash the same way — so gate on the install's
+        // CUDA marker. A bare-PATH binary (no marker) stays CPU-safe; the user
+        // can still pin `--gpu` in extra_args to opt in. discover() degrades to
+        // an empty inventory (CPU only) when there's no nvidia-smi.
         let user_pinned_gpu = args.iter().any(|a| a == "--gpu");
+        let cuda_capable = AppPaths::resolve()
+            .ok()
+            .is_some_and(|p| colibri_build_has_cuda(&p, self.kind));
         let inventory = localcode_gpu::discover().unwrap_or_else(|_| GpuInventory {
             devices: vec![],
             detection_method: "none".into(),
             warnings: vec![],
         });
-        let gpu_env = gpu_env_for(&inventory, user_pinned_gpu);
+        let gpu_env = if cuda_capable {
+            gpu_env_for(&inventory, user_pinned_gpu)
+        } else {
+            Vec::new()
+        };
         if !gpu_env.is_empty() {
             info!(%cid, engine = self.kind.as_str(), "colibrì: GPU detected — enabling CUDA ({gpu_env:?})");
+        } else if !inventory.devices.is_empty() && !cuda_capable && !user_pinned_gpu {
+            info!(
+                %cid, engine = self.kind.as_str(),
+                "colibrì: GPU present but this build is CPU-only — reinstall on Linux/WSL with nvcc for a CUDA build"
+            );
         }
 
         // The dash card's command is click-to-copy; surface the env the launch
@@ -339,14 +354,30 @@ impl InferenceBackend for ColibriBackend {
                 }
             }
             if let Ok(Some(status)) = child.try_wait() {
+                // Attach coli's own output so diagnosis names the REAL cause
+                // (missing libgomp, SIGILL/ISA, CUDA OOM, a rejected flag…)
+                // instead of the old blanket "needs AVX2" guess.
+                let tail = colibri_log_tail(&monitor.logs_handle(), 12);
                 self.monitors.remove(&runtime_id.to_string());
-                return Err(LocalCodeError::new(
+                let mut err = LocalCodeError::new(
                     ErrorCode::BackendStartFailed,
                     format!("coli serve exited early: {status}"),
                 )
-                .with_correlation(cid)
-                .with_cause("Incomplete container, unsupported CPU (needs AVX2), or not enough RAM")
-                .retryable(true));
+                .with_correlation(cid);
+                if tail.trim().is_empty() {
+                    // No output captured — fall back to a hint that blames AVX2
+                    // only when this CPU actually lacks it (coli runs here too).
+                    err = err.with_cause(colibri_early_exit_hint());
+                } else {
+                    err = err.with_cause(tail.clone());
+                    if looks_like_arg_error(&tail) {
+                        err = err.with_hint(
+                            "This coli build may reject the --auto-tier flag LocalCode adds; \
+                             pin an explicit tier (extra_args: --ram <GB> [--vram <GB>]) to skip it",
+                        );
+                    }
+                }
+                return Err(err.retryable(true));
             }
             if last_progress.elapsed() > tokio::time::Duration::from_secs(10) {
                 last_progress = tokio::time::Instant::now();
@@ -505,6 +536,64 @@ fn gpu_env_for(inv: &GpuInventory, user_pinned_gpu: bool) -> Vec<(&'static str, 
     }
 }
 
+/// The newest `n` lines the monitor captured from `coli`'s stdout/stderr, joined
+/// for an error cause. Empty when nothing was captured (an immediate exec
+/// failure). Feeds the diagnosis engine so a real failure isn't mislabeled.
+fn colibri_log_tail(
+    logs: &std::sync::Mutex<std::collections::VecDeque<String>>,
+    n: usize,
+) -> String {
+    logs.lock()
+        .map(|b| {
+            let start = b.len().saturating_sub(n);
+            b.iter().skip(start).map(String::as_str).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// True when `coli`'s output looks like a CLI argument/usage error — the shape
+/// of a build rejecting a flag LocalCode added (e.g. `--auto-tier`).
+fn looks_like_arg_error(s: &str) -> bool {
+    let l = s.to_lowercase();
+    [
+        "unknown option",
+        "unrecognized",
+        "invalid option",
+        "unexpected argument",
+        "usage:",
+        "--auto-tier",
+    ]
+    .iter()
+    .any(|m| l.contains(m))
+}
+
+/// colibrì's AVX2 requirement is x86-only, and `coli` runs on this same CPU — so
+/// we can check the host directly instead of guessing. Always false off x86
+/// (Apple Silicon uses Metal/NEON, not AVX2).
+fn host_missing_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        !std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Fallback cause when `coli` exited with no captured output: name AVX2 only
+/// when this CPU truly lacks it, so we stop crying wolf on machines that have it.
+fn colibri_early_exit_hint() -> String {
+    if host_missing_avx2() {
+        "This x86 CPU lacks AVX2, which colibrì requires; also verify the container downloaded \
+         completely and RAM is sufficient"
+            .to_string()
+    } else {
+        "Likely an incomplete container or not enough RAM — this CPU has AVX2, so that isn't it"
+            .to_string()
+    }
+}
+
 /// The `(program, args)` a colibrì deploy would spawn — used to seed the
 /// editable deploy-command field. `model` is the local container dir when
 /// known, else the HF model id as a placeholder.
@@ -643,5 +732,38 @@ mod tests {
     fn gpu_env_empty_when_user_pinned_gpu() {
         // A user-supplied --gpu means manual control; don't inject the env.
         assert!(gpu_env_for(&inventory(vec![gpu(0, 24)]), true).is_empty());
+    }
+
+    #[test]
+    fn log_tail_joins_the_newest_lines() {
+        let logs = std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            "line1".to_string(),
+            "line2".to_string(),
+            "line3".to_string(),
+        ]));
+        assert_eq!(colibri_log_tail(&logs, 2), "line2\nline3");
+        assert_eq!(colibri_log_tail(&logs, 10), "line1\nline2\nline3");
+        let empty: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+        assert_eq!(colibri_log_tail(&empty, 5), "");
+    }
+
+    #[test]
+    fn arg_error_detection() {
+        assert!(looks_like_arg_error("coli: unknown option '--auto-tier'"));
+        assert!(looks_like_arg_error("Usage: coli serve [OPTIONS]"));
+        assert!(looks_like_arg_error("error: unexpected argument --auto-tier"));
+        // A genuine runtime failure must NOT be read as an arg error (it would
+        // suppress the real diagnosis).
+        assert!(!looks_like_arg_error("error while loading shared libraries: libgomp.so.1"));
+        assert!(!looks_like_arg_error("CUDA error: out of memory"));
+    }
+
+    #[test]
+    fn early_exit_hint_is_avx2_honest() {
+        // Never empty, and it only asserts an AVX2 deficiency when the host
+        // truly lacks it (this test box, running coli-less, reflects the host).
+        let hint = colibri_early_exit_hint();
+        assert!(!hint.is_empty());
+        assert_eq!(hint.contains("lacks AVX2"), host_missing_avx2());
     }
 }

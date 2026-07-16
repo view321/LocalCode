@@ -1163,13 +1163,25 @@ const COLIBRI_HY3_GIT: &str = "https://github.com/ErikTromp/colibri-hy3.git";
 /// Marker file written next to a managed colibrì build.
 const COLIBRI_MARKER: &str = ".colibri";
 
-fn write_colibri_marker(dest_dir: &Path, repo: &str) -> Result<(), String> {
+fn write_colibri_marker(dest_dir: &Path, repo: &str, cuda: bool) -> Result<(), String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     std::fs::write(
         dest_dir.join(COLIBRI_MARKER),
-        format!("repo={repo}\ninstalled_by=localcode\n"),
+        format!("repo={repo}\ninstalled_by=localcode\ncuda={cuda}\n"),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Whether the managed colibrì build for `kind` was compiled with CUDA, read
+/// from the `.colibri` marker's `cuda=` line. False when there's no managed
+/// marker — a bare-PATH binary, or an install predating this field — so deploy
+/// never forces `COLI_CUDA` onto an engine that can't use it (the native-Windows
+/// build is always CPU-only; forcing CUDA there makes `coli serve` exit early).
+pub fn colibri_build_has_cuda(paths: &AppPaths, kind: BackendKind) -> bool {
+    let marker = colibri_managed_dir(paths, kind).join(COLIBRI_MARKER);
+    std::fs::read_to_string(marker)
+        .map(|s| s.lines().any(|l| l.trim() == "cuda=true"))
+        .unwrap_or(false)
 }
 
 /// Spawn one build command with a working directory, streaming both pipes into
@@ -1274,6 +1286,10 @@ async fn build_colibri(
         )));
     }
 
+    // Tracks whether a CUDA build actually succeeded, so deploy only forces
+    // COLI_CUDA on an engine that can use it. The native-Windows (MinGW) path has
+    // no CUDA target, so it stays CPU-only.
+    let mut cuda_built = false;
     if cfg!(windows) {
         // Upstream's documented native-Windows path (MinGW-w64).
         let target = if kind == BackendKind::ColibriHy3 { "hy3.exe" } else { "glm.exe" };
@@ -1292,10 +1308,16 @@ async fn build_colibri(
             } else {
                 &["CUDA=1"]
             };
-            if let Err(e) = run_build_cmd("make", cuda_args, &c_dir, progress).await {
-                let _ = progress.send(format!(
-                    "CUDA build failed ({e}) — keeping the CPU build from setup.sh"
-                ));
+            match run_build_cmd("make", cuda_args, &c_dir, progress).await {
+                Ok(()) => {
+                    cuda_built = true;
+                    let _ = progress.send("CUDA build succeeded — GPU tier available".into());
+                }
+                Err(e) => {
+                    let _ = progress.send(format!(
+                        "CUDA build failed ({e}) — keeping the CPU build from setup.sh"
+                    ));
+                }
             }
         }
     }
@@ -1314,7 +1336,7 @@ async fn build_colibri(
             ))
         })?;
 
-    write_colibri_marker(dest_dir, repo).map_err(fail)?;
+    write_colibri_marker(dest_dir, repo, cuda_built).map_err(fail)?;
     let _ = progress.send(format!("colibrì ready at {}", bin.display()));
     Ok(bin.display().to_string())
 }
@@ -2050,6 +2072,26 @@ mod tests {
         let hy = resolve_colibri_bin("coli", &paths, BackendKind::ColibriHy3).unwrap();
         assert!(up.starts_with(colibri_managed_dir(&paths, BackendKind::Colibri)));
         assert!(hy.starts_with(colibri_managed_dir(&paths, BackendKind::ColibriHy3)));
+    }
+
+    #[test]
+    fn colibri_cuda_marker_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+
+        // No marker yet → treated as CPU-only, so deploy never forces COLI_CUDA.
+        assert!(!colibri_build_has_cuda(&paths, BackendKind::Colibri));
+
+        // A CPU-build marker stays false; a CUDA-build marker reads true.
+        let up = colibri_managed_dir(&paths, BackendKind::Colibri);
+        write_colibri_marker(&up, "repo", false).unwrap();
+        assert!(!colibri_build_has_cuda(&paths, BackendKind::Colibri));
+        write_colibri_marker(&up, "repo", true).unwrap();
+        assert!(colibri_build_has_cuda(&paths, BackendKind::Colibri));
+
+        // Markers are per-kind — the fork's capability is independent.
+        assert!(!colibri_build_has_cuda(&paths, BackendKind::ColibriHy3));
     }
 
     #[test]

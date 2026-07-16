@@ -35,7 +35,8 @@ pub use monitor::{
     DashSnapshot, ModelMonitor, ModelMonitors, ProcState, DASH_LOG_CAP,
 };
 pub use install::{
-    can_elevate_noninteractively, colibri_managed_dir, ensure_llamacpp_installed,
+    can_elevate_noninteractively, colibri_build_has_cuda, colibri_managed_dir,
+    ensure_llamacpp_installed,
     llamacpp_managed_dir, resolve_colibri_bin, resolve_install_plan, resolve_llamacpp_bin,
     resolve_prism_llamacpp_bin, resolve_repair, run_install, run_repair, InstallPlan, InstallStep,
     RepairPlan, Repoint,
