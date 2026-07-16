@@ -330,8 +330,12 @@ pub struct AssistantConfig {
     /// before relying only on the Fix/Retry UI.
     #[serde(default = "default_true")]
     pub auto_handle_errors: bool,
-    /// Before deploy, read the HF model card and apply recommended server flags.
-    #[serde(default = "default_true")]
+    /// Automatically apply the model card's recommended backend / context /
+    /// server flags as you browse and change quant. Off by default: the deploy
+    /// panel's "auto-config" button applies them on demand instead, so the
+    /// assistant's picks never override your selections unless you ask. Turn on
+    /// to have every model preset itself the moment it loads.
+    #[serde(default)]
     pub auto_deploy_hints: bool,
     /// Offer help when the user enters the app (transcript system line).
     #[serde(default = "default_true")]
@@ -351,7 +355,7 @@ impl Default for AssistantConfig {
             local_context: default_assistant_ctx(),
             local_gpu_layers: default_assistant_ngl(),
             auto_handle_errors: true,
-            auto_deploy_hints: true,
+            auto_deploy_hints: false,
             greet_on_startup: true,
         }
     }

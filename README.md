@@ -139,14 +139,19 @@ that runtime automatically:
 - Accept later with **`/assistant`** (or `/assistant accept`), **`/assistant install`**,
   or **Settings → Accept local assistant**.
 - When ready it becomes the **default chat runtime** — type normally in the
-  conversation view; you do not need to hunt for `/assistant`.
+  conversation view; you do not need to hunt for `/assistant`. It **loads
+  lazily on your first message**, so opening the app never spins up
+  `llama-server` on its own.
 - Tools: shell + filesystem, **Hugging Face search & model cards**, doctor
   snapshot; reads model descriptions, helps launch deploys, and fixes LocalCode
   issues. Also invoked automatically on structured errors when available.
 
 Config (`config.toml` → `[assistant]`): `prefer_local`, `local_port` (default
 `18080`), `local_context` (default `131072` — 128k; long chats auto-compact
-before it fills), `auto_handle_errors`, `auto_deploy_hints`, `greet_on_startup`.
+before it fills), `auto_handle_errors`, `auto_deploy_hints` (off by default —
+the deploy panel's **auto-config** button presets a model's backend / context /
+server flags on demand; turn on to preset every model as it loads),
+`greet_on_startup`.
 
 > Set `HF_TOKEN` if the GGUF download is gated or rate-limited. For a CUDA build
 > you need the CUDA toolkit (`nvcc` on PATH) at install time.

@@ -276,6 +276,9 @@ pub enum ClickTarget {
     ModelList,
     QuantList,
     BackendCycle,
+    /// Apply the model card's recommended backend / context / server flags to
+    /// the deploy params in one click (the manual auto-preset trigger).
+    DeployAutoConfig,
     DeployButton,
     DeployCancel,
     /// Edit an inline deploy parameter (context, port, per-backend tuning).
@@ -392,6 +395,9 @@ pub enum SettingAction {
     AcceptLocalAssistant,
     TogglePreferLocal,
     ToggleAutoHandleErrors,
+    /// Toggle whether models preset their deploy params automatically as they
+    /// load (off by default; the deploy panel's auto-config button is manual).
+    ToggleAutoDeployHints,
     ToggleTool(usize),
     ToggleSkill(usize),
     ReloadSkills,
@@ -496,6 +502,10 @@ pub struct DashCard {
     pub can_deploy: bool,
     /// Weights on disk and not currently running — offer Delete.
     pub can_delete: bool,
+    /// A curated model we surface for discovery that isn't downloaded yet —
+    /// render a "download & run" button instead of Deploy/Delete (see
+    /// [`FEATURED_MODELS`]). `command` holds a human descriptor, not a shell line.
+    pub is_featured: bool,
     /// The OpenWebUI infrastructure card (rendered specially, no fav/delete).
     pub is_openwebui: bool,
     /// A browser/endpoint URL to surface (OpenWebUI page, or runtime base_url).
@@ -526,11 +536,42 @@ impl DashCard {
             disk_bytes: None,
             can_deploy: false,
             can_delete: false,
+            is_featured: false,
             is_openwebui: false,
             url: None,
         }
     }
 }
+
+/// A pre-converted model we surface in `/dash` so it can be downloaded and run
+/// without hunting Hugging Face for the right repo. Currently the two known-good
+/// colibrì int4 containers (the engine cannot pull weights itself, so a curated
+/// pointer to a complete container is the difference between one-click and a
+/// support ticket).
+struct FeaturedModel {
+    /// Hugging Face repo id (what the deploy flow downloads).
+    id: &'static str,
+    /// Human engine/backend label shown on the card.
+    engine: &'static str,
+    /// One-line descriptor: approximate on-disk size + what it is.
+    descriptor: &'static str,
+}
+
+/// The curated download-and-run entries appended to `/dash`. Deduped against
+/// running + downloaded models, so a featured card disappears once its weights
+/// land on disk.
+const FEATURED_MODELS: &[FeaturedModel] = &[
+    FeaturedModel {
+        id: "mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp",
+        engine: "colibrì · GLM-5.2",
+        descriptor: "~370 GB · GLM-5.2 744B MoE (upstream colibrì engine)",
+    },
+    FeaturedModel {
+        id: "UnderstandLing/Hy3-colibri-int4",
+        engine: "colibrì-hy3 · Hy3",
+        descriptor: "~142 GB · Tencent Hy3 295B (colibrì-hy3 fork)",
+    },
+];
 
 /// Kinds of foreground background-work (one at a time; Esc cancels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1041,6 +1082,13 @@ pub struct App {
     pub runtime_list_state: ListState,
     /// First visible card index in the `/dash` multi-model view.
     pub dash_scroll: usize,
+    /// Highlighted card in `/dash`, indexing the full [`App::dash_cards`] list
+    /// (running + downloaded + featured), not just `all_runtimes()`. Arrows and
+    /// the wheel move this; the draw auto-scrolls to keep it visible.
+    pub dash_selected: usize,
+    /// Cards that fit on screen in `/dash`, stored during draw so PageUp/Pages
+    /// down can move by a page.
+    pub dash_view_cards: usize,
     // Sessions view (/sessions): past chats for this workspace, newest first.
     pub sessions: Vec<SessionMeta>,
     pub session_selected: usize,
@@ -1276,6 +1324,8 @@ impl App {
             runtime_selected: 0,
             runtime_list_state: ListState::default(),
             dash_scroll: 0,
+            dash_selected: 0,
+            dash_view_cards: 1,
             sessions: vec![],
             session_selected: 0,
             sessions_scroll: 0,
@@ -1411,14 +1461,15 @@ impl App {
         if should_offer_install(&app.config) {
             app.offer_local_assistant_accept();
         } else if app.local_assistant_ready && app.config.assistant.prefer_local {
-            // Already accepted in a previous session — warm-start for default chat.
-            app.warm_start_local_assistant();
+            // Already accepted in a previous session. Don't warm-start here: the
+            // assistant loads lazily on the first message (see start_coding_turn),
+            // so opening the app never spins up llama-server on its own.
             app.coding_transcript.push(TranscriptEntry::new(
                 EntryKind::System,
                 format!(
-                    "{ASSISTANT_DISPLAY_NAME} is your default chat — ask it to find, deploy, \
-                     or stop models, or to fix LocalCode. A model you deploy takes over chat \
-                     once selected on /dash."
+                    "{ASSISTANT_DISPLAY_NAME} is your default chat — it starts on your first \
+                     message. Ask it to find, deploy, or stop models, or to fix LocalCode. A \
+                     model you deploy takes over chat once selected on /dash."
                 ),
             ));
         }
@@ -1593,11 +1644,38 @@ impl App {
             running.push(card);
         }
 
-        // 3) Order: favourites first, then running before downloaded, then name.
+        // 2b) Featured download-and-run cards: curated containers not yet on disk
+        // and not already running. These offer a single "download & run" button
+        // that routes into the normal deploy flow (which fetches then serves).
+        for fm in FEATURED_MODELS {
+            let sid = sanitize_model_dir(fm.id);
+            let already = running_ids.contains(&sid)
+                || self
+                    .downloaded_models
+                    .iter()
+                    .any(|m| sanitize_model_dir(&m.model_id) == sid);
+            if already {
+                continue;
+            }
+            let mut card = DashCard::base(fm.id.to_string(), fm.engine.to_string());
+            card.glyph = "✦";
+            card.status_label = "available".into();
+            card.model_id = Some(fm.id.to_string());
+            card.is_favorite = self.config.is_favorite(fm.id);
+            card.can_deploy = true;
+            card.is_featured = true;
+            card.command = fm.descriptor.to_string();
+            card.logs = vec!["not downloaded — click download & run to fetch it".into()];
+            running.push(card);
+        }
+
+        // 3) Order: favourites first, then running before downloaded, featured
+        // (not-yet-downloaded) last, then name.
         running.sort_by(|a, b| {
             b.is_favorite
                 .cmp(&a.is_favorite)
                 .then(b.runtime_index.is_some().cmp(&a.runtime_index.is_some()))
+                .then(a.is_featured.cmp(&b.is_featured))
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
@@ -1662,6 +1740,7 @@ impl App {
             disk_bytes: None,
             can_deploy: false,
             can_delete: false,
+            is_featured: false,
             is_openwebui: false,
             url: None,
         }
@@ -1715,6 +1794,7 @@ impl App {
             disk_bytes: None,
             can_deploy: false,
             can_delete: false,
+            is_featured: false,
             is_openwebui: false,
             url: None,
         }
@@ -1749,6 +1829,7 @@ impl App {
             disk_bytes: None,
             can_deploy: false,
             can_delete: false,
+            is_featured: false,
             is_openwebui: false,
             url: None,
         }
@@ -1783,14 +1864,15 @@ impl App {
         }
     }
 
-    /// Clicking dash card `card_idx`: a running card becomes the active runtime;
-    /// a downloaded-only card offers to deploy it; the OpenWebUI card copies its
-    /// URL.
+    /// Clicking dash card `card_idx`: move the highlight there, then act — a
+    /// running card becomes the active runtime; a downloaded-only or featured
+    /// card offers to deploy/download it; the OpenWebUI card copies its URL.
     fn dash_use(&mut self, card_idx: usize) {
         let cards = self.dash_cards();
         let Some(card) = cards.get(card_idx) else {
             return;
         };
+        self.dash_selected = card_idx;
         if let Some(ri) = card.runtime_index {
             if let Some(name) = self.all_runtimes().get(ri).map(|r| r.name.clone()) {
                 self.runtime_selected = ri;
@@ -1805,21 +1887,81 @@ impl App {
         }
     }
 
-    /// Deploy the downloaded model backing dash card `card_idx` (Deploy button).
-    /// Opens the Models view seeded with that model so the user confirms the
-    /// backend/quant, matching how a normal deploy is reviewed.
-    fn dash_deploy(&mut self, card_idx: usize) {
+    /// Move the `/dash` highlight by `delta` cards over the whole list (running +
+    /// downloaded + featured) and keep `runtime_selected` in step when the new
+    /// selection is a running model, so "next request" and the live metrics
+    /// track the highlight. This is the single mover used by arrows and the wheel.
+    fn dash_move(&mut self, delta: i64) {
+        let n = self.dash_cards().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.dash_selected.min(n - 1) as i64;
+        self.dash_selected = (cur + delta).clamp(0, n as i64 - 1) as usize;
+        self.sync_runtime_from_dash();
+    }
+
+    /// If the highlighted `/dash` card is a running runtime, adopt it as the
+    /// active runtime (leaves it unchanged when browsing a downloaded/featured or
+    /// OpenWebUI card, so scrolling past them doesn't swap the active model).
+    fn sync_runtime_from_dash(&mut self) {
+        let ri = self
+            .dash_cards()
+            .get(self.dash_selected)
+            .and_then(|c| c.runtime_index);
+        if let Some(ri) = ri {
+            if ri < self.all_runtimes().len() {
+                self.runtime_selected = ri;
+            }
+        }
+    }
+
+    /// Enter / empty-omnibar on the highlighted `/dash` card: chat with a running
+    /// model, download-and-run a downloaded/featured one, or copy the OpenWebUI
+    /// URL. Mirrors [`App::dash_use`] but drops into Chat for a running model.
+    fn dash_activate(&mut self, card_idx: usize) {
         let cards = self.dash_cards();
-        let Some(model_id) = cards.get(card_idx).and_then(|c| c.model_id.clone()) else {
+        let Some(card) = cards.get(card_idx) else {
             return;
         };
+        if let Some(ri) = card.runtime_index {
+            if let Some(name) = self.all_runtimes().get(ri).map(|r| r.name.clone()) {
+                self.runtime_selected = ri;
+                self.set_status(format!("Next request uses {name}"), false);
+            }
+            self.set_mode(Mode::Chat);
+        } else if card.is_openwebui {
+            if let Some(url) = card.url.clone() {
+                self.copy_to_clipboard(&url, "OpenWebUI URL");
+            }
+        } else if card.can_deploy {
+            self.dash_deploy(card_idx);
+        }
+    }
+
+    /// Deploy the model backing dash card `card_idx` (Deploy / "download & run"
+    /// button). Opens the Models view seeded with that model so the user confirms
+    /// the backend/quant, matching how a normal deploy is reviewed. For a
+    /// featured card the weights aren't on disk yet, so Deploy there downloads
+    /// first — the confirm screen shows the size before the fetch commits.
+    fn dash_deploy(&mut self, card_idx: usize) {
+        let cards = self.dash_cards();
+        let Some(card) = cards.get(card_idx) else {
+            return;
+        };
+        let Some(model_id) = card.model_id.clone() else {
+            return;
+        };
+        let featured = card.is_featured;
         self.set_mode(Mode::Models);
         self.model_query = model_id.clone();
         self.start_load_detail_for(&model_id);
-        self.set_status(
-            format!("Loading {model_id} — pick a quant/backend, then Deploy"),
-            false,
-        );
+        let msg = if featured {
+            format!("Loading {model_id} — review the size/backend, then Deploy to download & run")
+        } else {
+            format!("Loading {model_id} — pick a quant/backend, then Deploy")
+        };
+        self.set_status(msg, false);
     }
 
     /// Toggle the favourite state of the model backing dash card `card_idx`.
@@ -2616,7 +2758,7 @@ impl App {
                 gpu_memory_fraction: self.deploy_gpu_frac,
                 tensor_parallel: self.deploy_tensor_parallel,
                 gpu_layers: self.deploy_gpu_layers,
-                // Filled by the local assistant when auto_deploy_hints is on.
+                // Filled by the auto-config button (or the opt-in auto path).
                 extra_args: self.deploy_extra_args.clone(),
             },
             command_override: self.deploy_command_override.clone(),
@@ -2624,16 +2766,11 @@ impl App {
         })
     }
 
-    /// Notes from the last auto-preset, explaining why the backend / flags /
-    /// context were chosen. Empty when the preset made no changes or is off.
+    /// Notes from the last preset, explaining why the backend / flags / context
+    /// were chosen. Empty until the auto-config button (or the opt-in auto path)
+    /// runs; drives the panel's "auto" tag and reason line.
     pub fn deploy_preset_notes(&self) -> &[String] {
         &self.deploy_hints_notes
-    }
-
-    /// Whether the assistant auto-presets deploy params (drives the panel's
-    /// "auto" tag). Mirrors `assistant.auto_deploy_hints`.
-    pub fn auto_preset_on(&self) -> bool {
-        self.config.assistant.auto_deploy_hints
     }
 
     /// Deploy parameters shown (and editable) for the current backend, in
@@ -2907,15 +3044,43 @@ impl App {
         self.spawn_deploy(req);
     }
 
-    /// Auto-preset deploy parameters from the model card: the assistant picks the
-    /// backend that matches the weight format (so a GGUF model never lands on
-    /// vLLM), a fitting context, and the card's recommended flags. Gated on
-    /// `assistant.auto_deploy_hints`; every field stays user-editable and an
-    /// explicit user edit (tracked per field) is never overwritten.
+    /// Auto-preset deploy parameters as the model / quant / backend changes.
+    /// Automatic presets are opt-in (`assistant.auto_deploy_hints`, off by
+    /// default); the manual "auto-config" button applies them on demand via
+    /// [`App::auto_configure_deploy`]. See [`App::run_deploy_preset`] for what
+    /// gets set.
     fn apply_deploy_preset(&mut self, mode: PresetMode) {
         if !self.config.assistant.auto_deploy_hints {
             return;
         }
+        self.run_deploy_preset(mode);
+    }
+
+    /// The deploy panel's "auto-config" button: derive the backend that matches
+    /// the weight format (so a GGUF model never lands on vLLM), a fitting
+    /// context, and the card's recommended flags — all in one click, regardless
+    /// of the automatic opt-in. This is the only preset trigger that runs by
+    /// default, so the assistant's picks never apply until the user asks.
+    fn auto_configure_deploy(&mut self) {
+        if self.model_detail.is_none() {
+            self.set_status(
+                "Load a model first (Enter) to auto-configure its deploy params",
+                true,
+            );
+            return;
+        }
+        self.run_deploy_preset(PresetMode::Fresh);
+        if self.deploy_hints_notes.is_empty() {
+            self.set_status("Auto-config: params already match the model card", false);
+        }
+    }
+
+    /// Core preset logic shared by the automatic path and the manual button: the
+    /// assistant picks the backend that matches the weight format, a fitting
+    /// context, and the card's recommended flags. Every field stays
+    /// user-editable and an explicit user edit (tracked per field) is never
+    /// overwritten.
+    fn run_deploy_preset(&mut self, mode: PresetMode) {
         let Some(owned) = self.gather_preset_inputs() else {
             return;
         };
@@ -5898,6 +6063,15 @@ impl App {
             self.config.assistant.auto_handle_errors,
             SettingAction::ToggleAutoHandleErrors,
         ));
+        r.push(toggle(
+            "auto-preset deploy params",
+            self.config.assistant.auto_deploy_hints,
+            SettingAction::ToggleAutoDeployHints,
+        ));
+        r.push(SettingsRow::info(
+            "",
+            "off = use the deploy panel's auto-config button on demand",
+        ));
         r.push(SettingsRow::info(
             "",
             "also: /assistant or /assistant accept · install with /assistant install",
@@ -6083,15 +6257,11 @@ impl App {
             }
             SettingAction::TogglePreferLocal => {
                 self.config.assistant.prefer_local = !self.config.assistant.prefer_local;
-                if self.config.assistant.prefer_local
-                    && self.local_assistant_ready
-                    && self.local_assistant.is_none()
-                {
-                    self.warm_start_local_assistant();
-                }
+                // A routing preference, not a "start now" switch: the local
+                // assistant still loads lazily on the next message.
                 self.set_status(
                     if self.config.assistant.prefer_local {
-                        "Prefer local Bonsai when ready"
+                        "Prefer local Bonsai when ready — starts on your next message"
                     } else {
                         "Local Bonsai not preferred for default chat"
                     },
@@ -6101,6 +6271,18 @@ impl App {
             SettingAction::ToggleAutoHandleErrors => {
                 self.config.assistant.auto_handle_errors =
                     !self.config.assistant.auto_handle_errors;
+            }
+            SettingAction::ToggleAutoDeployHints => {
+                self.config.assistant.auto_deploy_hints =
+                    !self.config.assistant.auto_deploy_hints;
+                self.set_status(
+                    if self.config.assistant.auto_deploy_hints {
+                        "Auto-preset on — models configure their deploy params as they load"
+                    } else {
+                        "Auto-preset off — use the deploy panel's auto-config button"
+                    },
+                    false,
+                );
             }
             SettingAction::ToggleTool(i) => self.toggle_tool(i),
             SettingAction::ToggleSkill(i) => self.toggle_skill(i),
@@ -6680,6 +6862,15 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         if matches!(mode, Mode::Models | Mode::Dash) {
             self.refresh_downloaded();
         }
+        // Open /dash focused on the active model's card (cards are reordered, so
+        // the active runtime isn't necessarily card 0).
+        if mode == Mode::Dash {
+            self.dash_selected = self
+                .dash_cards()
+                .iter()
+                .position(|c| c.runtime_index == Some(self.runtime_selected))
+                .unwrap_or(0);
+        }
     }
 
     /// Selection / scroll keys for the active mode (arrows, page keys, Tab).
@@ -6717,25 +6908,23 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 KeyCode::Up => self.runtime_selected = self.runtime_selected.saturating_sub(1),
                 _ => {}
             },
-            // Dash selection IS the active-model cycler: moving the highlight
-            // picks the model the next request will use. The draw auto-scrolls
-            // to keep the selection visible (PageUp/Down scroll manually).
+            // The `/dash` highlight moves over the WHOLE card list (running +
+            // downloaded + featured), not just running runtimes — otherwise the
+            // cards below the running set are unreachable. Landing on a running
+            // card also makes it the active model for the next request; the draw
+            // auto-scrolls to keep the highlight visible.
             Mode::Dash => match code {
-                KeyCode::Down => {
-                    let n = self.all_runtimes().len();
-                    if n > 0 {
-                        self.runtime_selected = (self.runtime_selected + 1).min(n - 1);
-                    }
-                }
-                KeyCode::Up => self.runtime_selected = self.runtime_selected.saturating_sub(1),
+                KeyCode::Down => self.dash_move(1),
+                KeyCode::Up => self.dash_move(-1),
                 KeyCode::Tab => {
-                    let n = self.all_runtimes().len();
+                    let n = self.dash_cards().len();
                     if n > 0 {
-                        self.runtime_selected = (self.runtime_selected + 1) % n;
+                        self.dash_selected = (self.dash_selected + 1) % n;
+                        self.sync_runtime_from_dash();
                     }
                 }
-                KeyCode::PageDown => self.dash_scroll = self.dash_scroll.saturating_add(1),
-                KeyCode::PageUp => self.dash_scroll = self.dash_scroll.saturating_sub(1),
+                KeyCode::PageDown => self.dash_move(self.dash_view_cards.max(1) as i64),
+                KeyCode::PageUp => self.dash_move(-(self.dash_view_cards.max(1) as i64)),
                 _ => {}
             },
             // Sessions selection follows the same follow-the-highlight model
@@ -6835,12 +7024,10 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 self.start_install(kind);
             }
             Mode::Settings => self.activate_selected_setting(),
-            // Empty Enter in the dashboard: adopt the highlighted model and drop
-            // into chat so the next message goes to it.
-            Mode::Dash => {
-                self.dash_use(self.runtime_selected);
-                self.set_mode(Mode::Chat);
-            }
+            // Empty Enter in the dashboard: act on the highlighted card — chat
+            // with a running model, download-and-run a downloaded/featured one,
+            // or copy the OpenWebUI URL.
+            Mode::Dash => self.dash_activate(self.dash_selected),
             Mode::Sessions => self.resume_session(self.session_selected),
             _ => {}
         }
@@ -7086,6 +7273,7 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 }
             }
             ClickTarget::BackendCycle => self.cycle_deploy_backend(),
+            ClickTarget::DeployAutoConfig => self.auto_configure_deploy(),
             ClickTarget::DeployButton => self.start_deploy(false),
             ClickTarget::DeployCancel => self.cancel_deploy(),
             ClickTarget::DeployField(field) => self.begin_deploy_edit(field),
@@ -7289,11 +7477,12 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         }
     }
 
-    /// Scroll the `/dash` card list by whole cards. Upper bound is clamped again
-    /// in the draw once the viewport height is known.
+    /// Wheel over `/dash`: move the highlight one card (the draw follows it).
+    /// Matches the wheel behaviour of every other list view (sessions, models,
+    /// runtimes) rather than a decoupled scroll offset — that decoupling was the
+    /// bug where downloaded models below the running set couldn't be reached.
     fn scroll_dash(&mut self, delta: i64) {
-        let max = self.all_runtimes().len().saturating_sub(1) as i64;
-        self.dash_scroll = (self.dash_scroll as i64 + delta.signum()).clamp(0, max.max(0)) as usize;
+        self.dash_move(delta.signum());
     }
 
     fn scroll_transcript(&mut self, delta: i64) {
@@ -7805,6 +7994,16 @@ mod tests {
         id
     }
 
+    /// `/dash` cards for the user's own running/downloaded models, dropping the
+    /// always-present featured "download & run" entries so count assertions stay
+    /// about the user's models.
+    fn own_cards(app: &App) -> Vec<DashCard> {
+        app.dash_cards()
+            .into_iter()
+            .filter(|c| !c.is_featured)
+            .collect()
+    }
+
     #[test]
     fn dash_command_switches_mode() {
         let mut app = test_app();
@@ -7830,7 +8029,7 @@ mod tests {
             .unwrap()
             .push_log("Uvicorn running on http://127.0.0.1:8000");
 
-        let cards = app.dash_cards();
+        let cards = own_cards(&app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].name, "vllm:test/model");
         assert_eq!(cards[0].backend_label, "vllm");
@@ -7852,7 +8051,7 @@ mod tests {
         mon.push_log("CUDA error: out of memory");
         mon.set_state(ProcState::Exited { code: Some(1), ok: false });
 
-        let cards = app.dash_cards();
+        let cards = own_cards(&app);
         assert_eq!(cards.len(), 1);
         assert!(cards[0].status_is_error);
         let err = cards[0].error_text.as_ref().expect("failed model has error text");
@@ -7879,13 +8078,13 @@ mod tests {
     fn dash_stop_removes_the_model_card() {
         let mut app = test_app();
         let id = add_running_model(&mut app, "m0", "a", "cmd0", ProcState::Running);
-        assert_eq!(app.dash_cards().len(), 1);
+        assert_eq!(own_cards(&app).len(), 1);
         // Stopping drops it from the registry runtimes and its monitor. (No child
         // process exists in the test, so the backend stop is a no-op; we simulate
         // the deregistration the stop path performs.)
         app.runtimes.retain(|r| r.id != id);
         app.registry.monitors().remove(&id.to_string());
-        assert!(app.dash_cards().is_empty());
+        assert!(own_cards(&app).is_empty());
     }
 
     #[test]
@@ -7909,7 +8108,7 @@ mod tests {
         ];
         app.config.add_favorite("org/zeta");
 
-        let cards = app.dash_cards();
+        let cards = own_cards(&app);
         assert_eq!(cards.len(), 2);
         // The favourite sorts first despite "zeta" > "alpha" alphabetically.
         assert_eq!(cards[0].model_id.as_deref(), Some("org/zeta"));
@@ -7939,6 +8138,86 @@ mod tests {
         app.dash_delete(0);
         assert_eq!(app.pending_delete_model.as_deref(), Some("org/alpha"));
         assert!(app.modal.is_some());
+    }
+
+    #[test]
+    fn dash_lists_featured_colibri_download_and_run_cards() {
+        // With nothing running or downloaded, /dash still surfaces the curated
+        // colibrì containers so they can be fetched straight from the dashboard.
+        let app = test_app();
+        let cards = app.dash_cards();
+        let featured: Vec<_> = cards.iter().filter(|c| c.is_featured).collect();
+        assert_eq!(featured.len(), FEATURED_MODELS.len());
+        for f in &featured {
+            assert!(f.can_deploy, "featured card offers download & run");
+            assert!(!f.can_delete, "nothing on disk to delete yet");
+            assert!(f.disk_bytes.is_none());
+            assert!(f.model_id.is_some());
+        }
+        assert!(cards.iter().any(|c| c.model_id.as_deref()
+            == Some("mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp")));
+    }
+
+    #[test]
+    fn dash_featured_card_hidden_once_downloaded() {
+        let mut app = test_app();
+        let id = FEATURED_MODELS[0].id;
+        app.downloaded_models = vec![DownloadedModel {
+            model_id: id.into(),
+            dir: std::path::PathBuf::from("/models/glm"),
+            total_bytes: 1024,
+            quants: vec![],
+            files: vec![],
+        }];
+        let cards = app.dash_cards();
+        // The downloaded copy replaces the featured pointer — exactly one card
+        // for that id, and it's a real (deletable) downloaded card now.
+        let matching: Vec<_> = cards
+            .iter()
+            .filter(|c| c.model_id.as_deref() == Some(id))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert!(!matching[0].is_featured);
+        assert!(matching[0].can_delete);
+    }
+
+    #[test]
+    fn dash_selection_reaches_cards_below_the_running_set() {
+        // Regression: the highlight used to be bound to `runtime_selected` (only
+        // running runtimes), so downloaded/featured cards below the running set
+        // were unreachable and the view snapped back to the running card. The
+        // highlight now indexes the whole card list.
+        let mut app = test_app();
+        add_running_model(&mut app, "m0", "run/model", "cmd0", ProcState::Running);
+        app.set_mode(Mode::Dash);
+        let total = app.dash_cards().len();
+        assert!(total > 1, "running model + featured cards");
+        // Drive the highlight to the bottom of the list.
+        for _ in 0..total {
+            app.dash_move(1);
+        }
+        assert_eq!(app.dash_selected, total - 1);
+        assert!(
+            app.dash_cards()[app.dash_selected].is_featured,
+            "last card is a featured one, previously unreachable"
+        );
+        // Browsing a non-running card must not swap the active model.
+        assert_eq!(app.runtime_selected, 0);
+        assert_eq!(app.active_runtime().unwrap().name, "m0");
+    }
+
+    #[test]
+    fn dash_move_syncs_active_runtime_on_running_cards() {
+        let mut app = test_app();
+        add_running_model(&mut app, "m0", "a", "cmd0", ProcState::Running);
+        add_running_model(&mut app, "m1", "b", "cmd1", ProcState::Running);
+        app.set_mode(Mode::Dash); // opens on the active card (runtime 0 → card 0)
+        assert_eq!(app.dash_selected, 0);
+        app.dash_move(1);
+        // Landing on the second running card adopts it for the next request.
+        assert_eq!(app.dash_selected, 1);
+        assert_eq!(app.runtime_selected, 1);
+        assert_eq!(app.active_runtime().unwrap().name, "m1");
     }
 
     // ---- /sessions past-chat switcher --------------------------------------
@@ -9075,7 +9354,7 @@ mod tests {
         app.deploy_backend = BackendKind::Vllm;
         app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
         app.selected_quant = Some("Q4_K_M".into());
-        app.apply_deploy_preset(PresetMode::Fresh);
+        app.run_deploy_preset(PresetMode::Fresh);
         assert_eq!(app.deploy_backend, BackendKind::LlamaCpp);
     }
 
@@ -9086,7 +9365,7 @@ mod tests {
         app.deploy_backend = BackendKind::Ollama;
         app.model_detail = Some(detail_with_quant("org/s", "FP16", "model.safetensors"));
         app.selected_quant = Some("FP16".into());
-        app.apply_deploy_preset(PresetMode::Fresh);
+        app.run_deploy_preset(PresetMode::Fresh);
         assert_eq!(app.deploy_backend, BackendKind::Vllm);
     }
 
@@ -9098,7 +9377,7 @@ mod tests {
         app.deploy_backend = BackendKind::Vllm;
         app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
         app.selected_quant = Some("Q4_K_M".into());
-        app.apply_deploy_preset(PresetMode::QuantChanged);
+        app.run_deploy_preset(PresetMode::QuantChanged);
         assert_eq!(app.deploy_backend, BackendKind::LlamaCpp);
     }
 
@@ -9110,7 +9389,7 @@ mod tests {
         app.deploy_backend = BackendKind::Vllm;
         app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
         app.selected_quant = Some("Q4_K_M".into());
-        app.apply_deploy_preset(PresetMode::BackendPinned);
+        app.run_deploy_preset(PresetMode::BackendPinned);
         assert_eq!(app.deploy_backend, BackendKind::Vllm);
     }
 
@@ -9122,11 +9401,12 @@ mod tests {
         app.selected_quant = Some("Q4_K_M".into());
         app.deploy_ctx = 5000;
         app.deploy_ctx_user_set = true;
-        app.apply_deploy_preset(PresetMode::Fresh);
+        app.run_deploy_preset(PresetMode::Fresh);
         assert_eq!(app.deploy_ctx, 5000);
     }
 
-    /// With the auto-preset disabled, the backend is left exactly as configured.
+    /// With the automatic path disabled (the default), browsing/quant changes
+    /// leave the backend exactly as configured — nothing presets on its own.
     #[test]
     fn preset_disabled_leaves_backend_untouched() {
         let mut app = test_app();
@@ -9136,6 +9416,22 @@ mod tests {
         app.selected_quant = Some("Q4_K_M".into());
         app.apply_deploy_preset(PresetMode::Fresh);
         assert_eq!(app.deploy_backend, BackendKind::Vllm);
+    }
+
+    /// The deploy panel's auto-config button applies the preset on demand even
+    /// when the automatic path is off (the default) — it's the manual trigger.
+    #[test]
+    fn auto_config_button_presets_when_auto_disabled() {
+        let mut app = test_app();
+        assert!(
+            !app.config.assistant.auto_deploy_hints,
+            "auto-preset must be off by default"
+        );
+        app.deploy_backend = BackendKind::Vllm;
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.auto_configure_deploy();
+        assert_eq!(app.deploy_backend, BackendKind::LlamaCpp);
     }
 
     /// Scrolling the results list arms the debounced auto-load; once the

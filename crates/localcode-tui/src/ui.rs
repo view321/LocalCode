@@ -1339,7 +1339,8 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     ctrl.push(Line::from(""));
 
     // backend ⟳ — click to cycle Ollama → llama.cpp → vLLM → SGLang. An "auto"
-    // tag marks that the assistant preset this backend from the model card.
+    // tag marks that a preset (auto-config button or the opt-in auto path) chose
+    // this backend from the model card.
     let backend_row = area.y + ctrl.len() as u16;
     let backend_cell = format!("{} ⟳", app.deploy_backend.as_str());
     let backend_w = ("backend ".len() + backend_cell.width()) as u16;
@@ -1347,7 +1348,7 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         Span::styled("backend ", theme::muted(&th)),
         Span::styled(backend_cell, theme::accent(&th)),
     ];
-    if app.auto_preset_on() && !app.deploy_preset_notes().is_empty() {
+    if !app.deploy_preset_notes().is_empty() {
         backend_spans.push(Span::styled("  auto", theme::faint(&th)));
     }
     ctrl.push(Line::from(backend_spans));
@@ -1378,14 +1379,12 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         );
     }
 
-    // Why the assistant chose these params (backend format match, card flags,
+    // Why the preset chose these params (backend format match, card flags,
     // native context). Truncated to width; the full set went to the status line.
-    if app.auto_preset_on() {
-        let notes = app.deploy_preset_notes();
-        if !notes.is_empty() {
-            let reason = clip(&notes.join(" · "), area.width.saturating_sub(1) as usize);
-            ctrl.push(Line::from(Span::styled(reason, theme::faint(&th))));
-        }
+    let notes = app.deploy_preset_notes();
+    if !notes.is_empty() {
+        let reason = clip(&notes.join(" · "), area.width.saturating_sub(1) as usize);
+        ctrl.push(Line::from(Span::styled(reason, theme::faint(&th))));
     }
 
     // vram fit + a wide bar.
@@ -1425,10 +1424,22 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
             ClickTarget::DeployCancel,
         );
     } else {
-        ctrl.push(Line::from(button(&th, "deploy", true)));
+        // Two buttons on one row: "auto-config" presets backend / context / card
+        // flags on demand; "deploy" launches. Each click region is measured from
+        // its own label width so they stay exact regardless of theme.
+        let autoconf_w = button_width("auto-config");
+        let mut row_spans = button(&th, "auto-config", false);
+        row_spans.push(Span::raw("  "));
+        row_spans.extend(button(&th, "deploy", true));
+        ctrl.push(Line::from(row_spans));
         click(
             app,
-            Rect { x: area.x, y: deploy_row, width: button_width("deploy"), height: 1 },
+            Rect { x: area.x, y: deploy_row, width: autoconf_w, height: 1 },
+            ClickTarget::DeployAutoConfig,
+        );
+        click(
+            app,
+            Rect { x: area.x + autoconf_w + 2, y: deploy_row, width: button_width("deploy"), height: 1 },
             ClickTarget::DeployButton,
         );
     }
@@ -1664,14 +1675,19 @@ fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // --- Scroll so the selected card is visible ---
-    // Cards are reordered (favourites first, OpenWebUI pinned, downloaded appended)
-    // so a card's position no longer equals its runtime index — locate the active
-    // runtime's card by its stored index.
-    let visible = (cards_area.height / DASH_CARD_STRIDE).max(1) as usize;
-    let sel = cards
-        .iter()
-        .position(|c| c.runtime_index == Some(app.runtime_selected))
-        .unwrap_or(0);
+    // `dash_selected` indexes this reordered list directly (running + downloaded
+    // + featured), so the highlight can reach every card — the follow-scroll
+    // below then keeps it on screen. Reserve a row for the range hint when the
+    // list overflows so the last card can't collide with it.
+    let fit = (cards_area.height / DASH_CARD_STRIDE).max(1) as usize;
+    let visible = if cards.len() > fit {
+        (cards_area.height.saturating_sub(1) / DASH_CARD_STRIDE).max(1) as usize
+    } else {
+        fit
+    };
+    app.dash_view_cards = visible;
+    let sel = app.dash_selected.min(cards.len() - 1);
+    app.dash_selected = sel;
     let max_scroll = cards.len().saturating_sub(visible);
     if app.dash_scroll > max_scroll {
         app.dash_scroll = max_scroll;
@@ -1787,21 +1803,32 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
         Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
     );
 
-    // Line 2: launch command + [ copy ] button (right).
+    // Line 2: for a runnable model, the launch command + [ copy ] button; for a
+    // featured (not-downloaded) card, `command` is a plain descriptor — show it
+    // without the `$` prompt or a copy button (there's nothing to run yet).
     let copy_label = "copy";
     let copy_w = button_width(copy_label);
-    let cmd_w = w.saturating_sub(copy_w as usize + 5);
-    let cmd_text = if card.command.is_empty() {
+    let show_copy = !card.is_featured && !card.command.is_empty();
+    let reserve = if show_copy { copy_w as usize + 5 } else { 4 };
+    let cmd_w = w.saturating_sub(reserve);
+    let cmd_text = if card.is_featured {
+        card.command.clone()
+    } else if card.command.is_empty() {
         "(command unavailable)".to_string()
     } else {
         format!("$ {}", card.command)
     };
+    let cmd_style = if card.is_featured {
+        theme::muted(&th)
+    } else {
+        theme::faint(&th)
+    };
     let l2 = Line::from(vec![
         Span::raw("  "),
-        Span::styled(clip(&cmd_text, cmd_w), theme::faint(&th)),
+        Span::styled(clip(&cmd_text, cmd_w), cmd_style),
     ]);
     f.render_widget(Paragraph::new(l2), Rect { x: rect.x, y: rect.y + 1, width: rect.width, height: 1 });
-    if !card.command.is_empty() {
+    if show_copy {
         let cx = rect.x + rect.width.saturating_sub(copy_w + 1);
         let crect = Rect { x: cx, y: rect.y + 1, width: copy_w, height: 1 };
         f.render_widget(Paragraph::new(Line::from(button(&th, copy_label, false))), crect);
@@ -1853,7 +1880,8 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
     }
 
     // Line 5: action buttons. Running: [stop] [use] [★]. Downloaded-only:
-    // [deploy] [delete] [★]. OpenWebUI: [stop] [copy url].
+    // [deploy] [delete] [★]. Featured: [download & run] [★]. OpenWebUI:
+    // [stop] [copy url].
     let row5 = Rect { x: rect.x, y: rect.y + 4, width: rect.width, height: 1 };
     let mut bx = rect.x + 2;
     let mut bspans: Vec<Span> = vec![Span::raw("  ")];
@@ -1877,6 +1905,13 @@ fn draw_dash_card(f: &mut Frame, rect: Rect, app: &mut App, idx: usize, card: &D
             push_btn(app, &mut bspans, &mut bx, "stop", false, ClickTarget::DashStop(idx));
         }
         push_btn(app, &mut bspans, &mut bx, "use", card.is_active, ClickTarget::DashUse(idx));
+        if card.model_id.is_some() {
+            let star = if card.is_favorite { "★" } else { "☆" };
+            push_btn(app, &mut bspans, &mut bx, star, card.is_favorite, ClickTarget::DashFavorite(idx));
+        }
+    } else if card.is_featured {
+        // Curated container not on disk yet — one button fetches then serves it.
+        push_btn(app, &mut bspans, &mut bx, "download & run", true, ClickTarget::DashDeploy(idx));
         if card.model_id.is_some() {
             let star = if card.is_favorite { "★" } else { "☆" };
             push_btn(app, &mut bspans, &mut bx, star, card.is_favorite, ClickTarget::DashFavorite(idx));
