@@ -8,6 +8,7 @@ mod monitor;
 mod ollama;
 mod openwebui;
 mod llamacpp;
+mod proc;
 mod smoke;
 mod vllm;
 mod sglang;

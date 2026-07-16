@@ -159,17 +159,18 @@ impl InferenceBackend for SglangBackend {
             spec.command_override.as_deref(),
         );
         let runtime_id = Uuid::new_v4();
-        let mut child = tokio::process::Command::new(&program)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
-                    .with_correlation(cid)
-            })?;
+            .stderr(std::process::Stdio::piped());
+        // Own process group so `stop()` can signal SGLang's scheduler/worker
+        // children (which hold the VRAM), not just the launcher.
+        crate::proc::spawn_in_own_group(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| {
+            LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string()).with_correlation(cid)
+        })?;
         let monitor = self.monitors.register(
             runtime_id.to_string(),
             format!("sglang:{}", spec.model_id),
@@ -185,7 +186,7 @@ impl InferenceBackend for SglangBackend {
         let mut last_progress = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() > deadline {
-                let _ = child.kill().await;
+                crate::proc::kill_tree(&mut child).await;
                 self.monitors.remove(&runtime_id.to_string());
                 return Err(LocalCodeError::new(
                     ErrorCode::BackendHealthTimeout,
@@ -249,7 +250,9 @@ impl InferenceBackend for SglangBackend {
             // block ends (it must not outlive the owned `handle`).
             let child = handle.lock().await.take();
             if let Some(mut child) = child {
-                let _ = child.kill().await;
+                // Kill the whole process group — SGLang's scheduler/worker
+                // children hold the VRAM, so killing only the launcher leaks it.
+                crate::proc::kill_tree(&mut child).await;
             }
         }
         self.monitors.remove(runtime_id);

@@ -123,20 +123,22 @@ impl InferenceBackend for VllmBackend {
         // Pre-generate the runtime id so its `/dash` monitor captures startup
         // logs before the (potentially very long) health loop.
         let runtime_id = Uuid::new_v4();
-        let mut child = tokio::process::Command::new(&program)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&args)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
-                    .with_correlation(cid)
-                    .with_cause("Failed to spawn vllm")
-                    .with_hint("Check CUDA version compatibility")
-                    .retryable(true)
-            })?;
+            .stderr(std::process::Stdio::piped());
+        // Own process group so `stop()` can signal vLLM's EngineCore/worker
+        // children (which hold the VRAM), not just the launcher.
+        crate::proc::spawn_in_own_group(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| {
+            LocalCodeError::new(ErrorCode::BackendStartFailed, e.to_string())
+                .with_correlation(cid)
+                .with_cause("Failed to spawn vllm")
+                .with_hint("Check CUDA version compatibility")
+                .retryable(true)
+        })?;
         // Capture vLLM's own output into the dashboard monitor so a failure below
         // can explain itself instead of surfacing a bare exit code, and so the
         // `/dash` card shows the newest lines live.
@@ -170,7 +172,7 @@ impl InferenceBackend for VllmBackend {
         let mut last_progress = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() > deadline {
-                let _ = child.kill().await;
+                crate::proc::kill_tree(&mut child).await;
                 self.monitors.remove(&runtime_id.to_string());
                 let mut err = LocalCodeError::new(
                     ErrorCode::BackendHealthTimeout,
@@ -264,7 +266,9 @@ impl InferenceBackend for VllmBackend {
             // block ends (it must not outlive the owned `handle`).
             let child = handle.lock().await.take();
             if let Some(mut child) = child {
-                let _ = child.kill().await;
+                // Kill the whole process group — vLLM's worker/EngineCore
+                // children hold the VRAM, so killing only the launcher leaks it.
+                crate::proc::kill_tree(&mut child).await;
             }
         }
         self.monitors.remove(runtime_id);
