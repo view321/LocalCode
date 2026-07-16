@@ -1,9 +1,11 @@
-//! Minimal markdown → styled `Line`s for terminal rendering (model cards).
+//! Minimal markdown → styled `Line`s for terminal rendering (model cards
+//! and chat replies).
 //!
-//! Renders the subset that matters for Hugging Face READMEs: headings,
-//! paragraphs, lists, code blocks, inline styles, quotes, tables, rules.
-//! Raw HTML and YAML frontmatter are dropped. Wrapping is left to the
-//! `Paragraph` widget, so lines here are logical lines.
+//! Renders the subset that matters for Hugging Face READMEs and agent
+//! answers: headings, paragraphs, lists, code blocks, inline styles, quotes,
+//! tables, rules. [`render`] (cards) drops raw HTML and YAML frontmatter;
+//! [`render_chat`] keeps HTML-ish tokens as literal text. Wrapping is left
+//! to the caller, so lines here are logical lines.
 
 use localcode_core::theme::{Theme, ThemeToken};
 use pulldown_cmark::{Event, Options, Parser, Tag};
@@ -16,13 +18,24 @@ use crate::theme;
 const MAX_LINES: usize = 1500;
 
 pub fn render(md: &str, th: &Theme) -> Vec<Line<'static>> {
-    let src = strip_frontmatter(md);
+    render_impl(strip_frontmatter(md), th, false)
+}
+
+/// Chat variant: a leading `---` is a rule, not YAML frontmatter, and raw
+/// HTML-ish tokens are kept as literal text — local models speak in
+/// `<think>`/`<answer>`-style tags, and dropping those would silently eat
+/// parts of the reply.
+pub fn render_chat(md: &str, th: &Theme) -> Vec<Line<'static>> {
+    render_impl(md, th, true)
+}
+
+fn render_impl(src: &str, th: &Theme, keep_html: bool) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
 
-    let mut r = Renderer::new(th);
+    let mut r = Renderer::new(th, keep_html);
     for ev in Parser::new_ext(src, opts) {
         if r.lines.len() > MAX_LINES {
             break;
@@ -93,12 +106,13 @@ struct Renderer {
     quote: u32,
     suppress: u32,
     code_block: bool,
+    keep_html: bool,
     list_counters: Vec<Option<u64>>,
     table: Option<TableState>,
 }
 
 impl Renderer {
-    fn new(th: &Theme) -> Self {
+    fn new(th: &Theme, keep_html: bool) -> Self {
         Self {
             fg: Style::default().fg(theme::color(th, ThemeToken::Fg)),
             accent: theme::accent(th),
@@ -114,6 +128,7 @@ impl Renderer {
             quote: 0,
             suppress: 0,
             code_block: false,
+            keep_html,
             list_counters: vec![],
             table: None,
         }
@@ -230,7 +245,20 @@ impl Renderer {
                 self.spans
                     .push(Span::styled(format!("[^{name}]"), self.muted));
             }
-            // Raw HTML (badges, center divs…) is noise in a terminal.
+            // Raw HTML is noise in model cards (badges, center divs…) but
+            // meaningful in chat, where models emit literal `<tag>` text.
+            Event::Html(t) | Event::InlineHtml(t) if self.keep_html => {
+                let mut first = true;
+                for seg in t.split('\n') {
+                    if !first {
+                        self.flush();
+                    }
+                    first = false;
+                    if !seg.is_empty() {
+                        self.push_text(seg);
+                    }
+                }
+            }
             Event::Html(_) | Event::InlineHtml(_) => {}
             _ => {}
         }
@@ -334,6 +362,10 @@ impl Renderer {
                     t.in_cell = true;
                 }
                 self.stack.push(Ctx::TableCell);
+            }
+            Tag::HtmlBlock if self.keep_html => {
+                self.flush();
+                self.stack.push(Ctx::Other);
             }
             Tag::HtmlBlock | Tag::MetadataBlock(_) => {
                 self.suppress += 1;
@@ -511,6 +543,30 @@ mod tests {
         // Pathological inputs must not panic.
         for md in ["", "``` unclosed", "> quote\n> more", "|a|\n|-|"] {
             let _ = render(md, &Theme::new(ThemeMode::Dark));
+            let _ = render_chat(md, &Theme::new(ThemeMode::Dark));
         }
+    }
+
+    #[test]
+    fn chat_bolds_and_keeps_html_tags() {
+        let md = "Call <tool>fs.read</tool> and it is **done**.";
+        let lines = render_chat(md, &Theme::new(ThemeMode::Dark));
+        let text = text_of(&lines).join("\n");
+        assert!(text.contains("<tool>"), "{text}");
+        let bold = lines.iter().flat_map(|l| &l.spans).any(|s| {
+            s.content.contains("done") && s.style.add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(bold, "{text}");
+    }
+
+    #[test]
+    fn chat_does_not_treat_leading_dashes_as_frontmatter() {
+        let md = "---\nplan: step one\n---\nthen go";
+        let chat = text_of(&render_chat(md, &Theme::new(ThemeMode::Dark))).join("\n");
+        assert!(chat.contains("plan: step one"), "{chat}");
+        assert!(chat.contains("then go"));
+        // The card renderer, by contrast, strips it as YAML.
+        let card = text_of(&render(md, &Theme::new(ThemeMode::Dark))).join("\n");
+        assert!(!card.contains("plan: step one"), "{card}");
     }
 }

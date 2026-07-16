@@ -25,7 +25,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -845,6 +845,37 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             line_entry.push(None);
         }
 
+        // Agent replies render as markdown (bold, lists, tables, code
+        // blocks); click-to-copy still copies the raw text, so styling is
+        // view-only.
+        if e.kind == EntryKind::Agent {
+            let mut body = markdown::render_chat(&e.text, &th);
+            if body.is_empty() {
+                body.push(Line::from(""));
+            }
+            if app.coding_selected == Some(idx) {
+                if let Some(bg) = theme::selected(&th).bg {
+                    for line in &mut body {
+                        for s in &mut line.spans {
+                            s.style = s.style.bg(bg);
+                        }
+                    }
+                }
+            }
+            if agent_running && e.live && !waiting {
+                if let (Some(last), Some(c)) = (body.last_mut(), spinner_frame(app)) {
+                    last.spans.push(Span::raw(" "));
+                    last.spans.push(Span::styled(c.to_string(), theme::work(&th)));
+                }
+            }
+            let clickable = e.is_model_response();
+            for line in body {
+                lines.push(line);
+                line_entry.push(clickable.then_some(idx));
+            }
+            continue;
+        }
+
         let body_style = match e.kind {
             EntryKind::You => theme::accent(&th).add_modifier(Modifier::BOLD),
             EntryKind::Agent => fg(&th),
@@ -933,20 +964,25 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Paragraph wraps long lines; mirror that to map screen rows → entries.
-    let mut wrapped_entry: Vec<Option<usize>> = Vec::new();
-    for (line, entry) in lines.iter().zip(line_entry.iter()) {
-        let cells = line.width().max(1);
-        let rows = cells.div_ceil(inner_w).max(1);
-        for _ in 0..rows {
-            wrapped_entry.push(*entry);
+    // Wrap to physical rows ourselves (word wrap, span styles preserved).
+    // The rendered rows, the scroll clamp, and the click map all come from
+    // this one list, so they cannot disagree — estimating the widget's word
+    // wrap with character math used to undercount rows and leave the tail of
+    // the transcript hidden below the viewport.
+    let mut phys: Vec<Line> = Vec::new();
+    let mut phys_entry: Vec<Option<usize>> = Vec::new();
+    for (line, entry) in lines.into_iter().zip(line_entry) {
+        for row in wrap_line(line, inner_w) {
+            phys.push(row);
+            phys_entry.push(entry);
         }
     }
 
-    let total = wrapped_entry.len();
+    let total = phys.len();
     app.coding_total_lines = total;
     app.coding_view_height = inner.height;
-    let max_scroll = total.saturating_sub(inner.height as usize);
+    let view_h = inner.height as usize;
+    let max_scroll = total.saturating_sub(view_h);
     let offset = if app.coding_follow {
         max_scroll
     } else {
@@ -954,10 +990,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     // One click region per visible screen row that belongs to a toggleable entry.
-    let view_h = inner.height as usize;
     for row in 0..view_h {
         let virt = offset + row;
-        if let Some(Some(entry_idx)) = wrapped_entry.get(virt) {
+        if let Some(Some(entry_idx)) = phys_entry.get(virt) {
             click(
                 app,
                 Rect {
@@ -971,12 +1006,76 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset as u16, 0)),
-        inner,
-    );
+    let end = (offset + view_h).min(total);
+    f.render_widget(Paragraph::new(phys[offset..end].to_vec()), inner);
+}
+
+/// Word-wrap one styled line into rows of at most `width` display columns,
+/// preserving span styles. Wrapping prefers word boundaries, hard-breaks
+/// words wider than the view, and drops the whitespace run that crosses the
+/// edge so continuation rows start flush left.
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let atoms: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| {
+            let st = s.style;
+            s.content.chars().map(move |c| (c, st))
+        })
+        .collect();
+    if atoms.is_empty() {
+        return vec![line];
+    }
+
+    fn push_atoms(cur: &mut Vec<Span<'static>>, chunk: &[(char, Style)]) {
+        for (c, st) in chunk {
+            match cur.last_mut() {
+                Some(span) if span.style == *st => span.content.to_mut().push(*c),
+                _ => cur.push(Span::styled(c.to_string(), *st)),
+            }
+        }
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let mut i = 0;
+    while i < atoms.len() {
+        let is_space = atoms[i].0.is_whitespace();
+        let mut j = i + 1;
+        while j < atoms.len() && atoms[j].0.is_whitespace() == is_space {
+            j += 1;
+        }
+        let tok = &atoms[i..j];
+        let tok_w: usize = tok.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+        if cur_w + tok_w <= width {
+            push_atoms(&mut cur, tok);
+            cur_w += tok_w;
+        } else if is_space {
+            rows.push(Line::from(std::mem::take(&mut cur)));
+            cur_w = 0;
+        } else if tok_w <= width {
+            rows.push(Line::from(std::mem::take(&mut cur)));
+            push_atoms(&mut cur, tok);
+            cur_w = tok_w;
+        } else {
+            for (c, st) in tok {
+                let cw = c.width().unwrap_or(0);
+                if cur_w + cw > width && !cur.is_empty() {
+                    rows.push(Line::from(std::mem::take(&mut cur)));
+                    cur_w = 0;
+                }
+                push_atoms(&mut cur, &[(*c, *st)]);
+                cur_w += cw;
+            }
+        }
+        i = j;
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(Line::from(cur));
+    }
+    rows
 }
 
 /// Visible text for a transcript entry, respecting expand/collapse.
@@ -2591,5 +2690,55 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &mut App) {
             click(app, row_rect, ClickTarget::Setting(action));
             act_idx += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundaries() {
+        let rows = wrap_line(Line::from("aaa bbb"), 5);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["aaa ", "bbb"]);
+    }
+
+    #[test]
+    fn wrap_counts_word_wrap_not_char_wrap() {
+        // 14 cells in width 7 is 2 rows by character math, but word wrap
+        // renders 3 — the old scroll estimate undercounted exactly this and
+        // clipped the transcript tail.
+        let rows = wrap_line(Line::from("aaaa bbbb cccc"), 7);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn wrap_hard_breaks_long_words_and_wide_chars() {
+        let rows = wrap_line(Line::from("abcdefghij"), 4);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["abcd", "efgh", "ij"]);
+
+        // CJK cells are two columns wide.
+        let rows = wrap_line(Line::from("日本語"), 4);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["日本", "語"]);
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles_and_empty_lines() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::raw("plain "), Span::styled("bold", bold)]);
+        let rows = wrap_line(line, 7);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_text(&rows[1]), "bold");
+        assert_eq!(rows[1].spans[0].style, bold);
+
+        // A blank spacer line still occupies exactly one row.
+        assert_eq!(wrap_line(Line::from(""), 10).len(), 1);
     }
 }
