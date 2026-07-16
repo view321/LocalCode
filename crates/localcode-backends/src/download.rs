@@ -252,9 +252,10 @@ pub fn expand_mirror_candidates(url: &str, hosts: &[String]) -> Vec<String> {
 
 fn download_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        // No overall timeout: a multi-GB file on a slow link must not be cut off
-        // mid-stream. The connect timeout still fails fast on an unreachable host.
+        // Fail fast on an unreachable host so the retry loop cycles quickly (and
+        // the worker's state file stays fresh between attempts). No *overall*
+        // timeout, though: a multi-GB file on a slow link must not be cut off.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default()
 }
@@ -332,51 +333,123 @@ pub async fn run_download<F: FnMut(u64, &str)>(
     Ok(primary)
 }
 
+/// How long to keep retrying a stalled download, and how to space the retries.
+/// The point of the worker is unattended completion, so a transient — or hours
+/// long — network outage is ridden out rather than failed.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// First backoff; doubles each attempt up to `cap`.
+    pub base: std::time::Duration,
+    /// Backoff ceiling. Kept below [`STALE_AFTER_SECS`] so the worker's state
+    /// file is refreshed often enough that the TUI never mistakes a retrying
+    /// worker for a dead one (which would double-spawn a second worker).
+    pub cap: std::time::Duration,
+    /// Give up (mark `Failed`) only after this long with **no new bytes**. The
+    /// clock resets whenever the download advances, so a slow-but-alive link runs
+    /// to completion while a truly dead one eventually stops.
+    pub no_progress_ceiling: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            base: std::time::Duration::from_secs(3),
+            cap: std::time::Duration::from_secs(12),
+            no_progress_ceiling: std::time::Duration::from_secs(2 * 60 * 60),
+        }
+    }
+}
+
+/// Exponential backoff for `attempt` (1-based), `base * 2^(attempt-1)` clamped to
+/// `cap`.
+fn retry_backoff(attempt: u32, base: std::time::Duration, cap: std::time::Duration) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let mult = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let secs = base.as_secs().max(1).saturating_mul(mult);
+    std::time::Duration::from_secs(secs).min(cap)
+}
+
 /// Drive one download to completion as the detached worker does: publish a
-/// `Downloading` state file (heartbeated ~1×/s from streamed progress), then run
-/// the resume engine, and finally record `Completed` (with the primary weight
-/// path) or `Failed` (with how far it got). The `Result` is returned too so a
-/// foreground/CLI caller can surface the error.
+/// `Downloading` state file (heartbeated from streamed progress), run the resume
+/// engine, and — crucially — **ride out network outages**, retrying with backoff
+/// (keeping the `.part`) until the download completes or makes no progress for a
+/// long ceiling. Records `Completed` (with the primary weight path) or `Failed`.
+/// The `Result` is returned too so a foreground/CLI caller can surface it.
 pub async fn run_worker(
     spec: &DownloadSpec,
     token: Option<&str>,
     mirror_hosts: &[String],
 ) -> Result<PathBuf, LocalCodeError> {
+    run_worker_with(spec, token, mirror_hosts, RetryPolicy::default()).await
+}
+
+async fn run_worker_with(
+    spec: &DownloadSpec,
+    token: Option<&str>,
+    mirror_hosts: &[String],
+    policy: RetryPolicy,
+) -> Result<PathBuf, LocalCodeError> {
     // Seed the state with whatever is already on disk so a resume doesn't flash
     // back to 0%.
-    let start_bytes = on_disk_bytes(spec);
-    write_progress_state(spec, start_bytes, "Starting download", DownloadStatus::Downloading, None);
+    let mut last_bytes = on_disk_bytes(spec);
+    write_progress_state(spec, last_bytes, "Starting download", DownloadStatus::Downloading, None);
+    let mut last_progress = std::time::Instant::now();
+    let mut attempt: u32 = 0;
 
-    let mut last_write = std::time::Instant::now();
-    let result = run_download(spec, token, mirror_hosts, |downloaded, msg| {
-        // Throttle disk writes to ~1/s; the engine calls back far more often.
-        if last_write.elapsed() >= std::time::Duration::from_millis(1000) {
-            last_write = std::time::Instant::now();
-            write_progress_state(spec, downloaded, msg, DownloadStatus::Downloading, None);
-            // Visible when run in a foreground terminal; discarded (stderr=null)
-            // for the TUI's detached worker.
-            eprintln!("[{}%] {msg}", pct(downloaded, spec.total_bytes));
+    loop {
+        let mut last_write = std::time::Instant::now();
+        let result = run_download(spec, token, mirror_hosts, |downloaded, msg| {
+            // Throttle disk writes to ~1/s; the engine calls back far more often.
+            if last_write.elapsed() >= std::time::Duration::from_millis(1000) {
+                last_write = std::time::Instant::now();
+                write_progress_state(spec, downloaded, msg, DownloadStatus::Downloading, None);
+                // Visible in a foreground terminal; discarded (stderr=null) for
+                // the TUI's detached worker.
+                eprintln!("[{}%] {msg}", pct(downloaded, spec.total_bytes));
+            }
+        })
+        .await;
+
+        match result {
+            Ok(primary) => {
+                write_progress_state(
+                    spec,
+                    spec.total_bytes.max(on_disk_bytes(spec)),
+                    "Download complete",
+                    DownloadStatus::Completed,
+                    Some(primary.display().to_string()),
+                );
+                return Ok(primary);
+            }
+            Err(e) => {
+                // Reset the no-progress clock if this attempt advanced the file.
+                let now_bytes = on_disk_bytes(spec);
+                if now_bytes > last_bytes {
+                    last_bytes = now_bytes;
+                    last_progress = std::time::Instant::now();
+                    attempt = 0;
+                }
+                // Stop on a definitive error (auth, 404, bad format) or after too
+                // long with no progress at all.
+                if !e.retryable || last_progress.elapsed() >= policy.no_progress_ceiling {
+                    write_progress_state(spec, now_bytes, &e.message, DownloadStatus::Failed, None);
+                    return Err(e);
+                }
+                attempt = attempt.saturating_add(1);
+                let backoff = retry_backoff(attempt, policy.base, policy.cap);
+                let msg = format!(
+                    "Connection lost — retry {attempt} in {}s ({} on disk, kept for resume)",
+                    backoff.as_secs().max(1),
+                    (now_bytes as f64 / GIB * 100.0).round() / 100.0
+                );
+                // Heartbeat with a fresh timestamp so a watching TUI keeps seeing
+                // a live worker (and doesn't spawn a duplicate) during the wait.
+                write_progress_state(spec, now_bytes, &msg, DownloadStatus::Downloading, None);
+                eprintln!("{msg}: {}", e.message);
+                tokio::time::sleep(backoff).await;
+            }
         }
-    })
-    .await;
-
-    match &result {
-        Ok(primary) => write_progress_state(
-            spec,
-            spec.total_bytes.max(on_disk_bytes(spec)),
-            "Download complete",
-            DownloadStatus::Completed,
-            Some(primary.display().to_string()),
-        ),
-        Err(e) => write_progress_state(
-            spec,
-            on_disk_bytes(spec),
-            &e.message,
-            DownloadStatus::Failed,
-            None,
-        ),
     }
-    result
 }
 
 /// Bytes currently on disk for this spec: each finished file's size, else its
@@ -479,14 +552,19 @@ async fn fetch_file_resumable<F: FnMut(u64, &str)>(
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 416 {
-            last_err = Some(
-                LocalCodeError::new(
-                    ErrorCode::DeployDownloadFailed,
-                    format!("Download failed ({status}): {filename}"),
-                )
-                .with_hint("Gated model? Set HF_TOKEN")
-                .retryable(true),
-            );
+            // 5xx / 429 / 408 are transient (worth retrying); auth and 404 are
+            // definitive, so the worker's retry loop must NOT spin on them.
+            let code = status.as_u16();
+            let transient = status.is_server_error() || code == 429 || code == 408;
+            let mut err = LocalCodeError::new(
+                ErrorCode::DeployDownloadFailed,
+                format!("Download failed ({status}): {filename}"),
+            )
+            .retryable(transient);
+            if code == 401 || code == 403 {
+                err = err.with_hint("Gated model — set HF_TOKEN (this won't be retried)");
+            }
+            last_err = Some(err);
             continue;
         }
 
@@ -634,9 +712,26 @@ pub fn spawn_detached_worker(
     }
     #[cfg(unix)]
     {
-        // Lead a new process group so a terminal-close SIGHUP to our group and
-        // our own group-targeted kills don't reach the worker.
-        cmd.process_group(0);
+        use std::os::unix::process::CommandExt;
+        // The common setup is a TUI running on a remote box over SSH: when the
+        // link drops the kernel SIGHUPs the session, killing the TUI and anything
+        // still attached to the pty. A new process *group* (setpgid) is not enough
+        // — the worker stays in the same session with the same controlling
+        // terminal. `setsid()` puts it in a *new session* with no controlling
+        // terminal, so the hangup can't reach it. Run it in the child, post-fork,
+        // pre-exec.
+        //
+        // SAFETY: `setsid(2)` is an async-signal-safe syscall with no memory
+        // effects; it's the one operation between fork and exec, so it can't
+        // deadlock on a lock the forking thread held.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let child = cmd.spawn().map_err(|e| {
@@ -840,6 +935,131 @@ mod tests {
         assert_eq!(got, body, "resumed download must reconstruct the file exactly");
         // The .part is consumed on success.
         assert!(!part.exists());
+    }
+
+    #[test]
+    fn retry_backoff_grows_then_caps() {
+        let base = std::time::Duration::from_secs(3);
+        let cap = std::time::Duration::from_secs(12);
+        assert_eq!(retry_backoff(1, base, cap).as_secs(), 3);
+        assert_eq!(retry_backoff(2, base, cap).as_secs(), 6);
+        assert_eq!(retry_backoff(3, base, cap).as_secs(), 12);
+        assert_eq!(retry_backoff(4, base, cap).as_secs(), 12); // clamped
+        assert_eq!(retry_backoff(999, base, cap).as_secs(), 12); // no shift overflow
+    }
+
+    /// A server that closes the first `fail_first` connections with no response
+    /// (a dropped/refused link), then serves normally with Range support — so the
+    /// worker's retry loop must survive the outage and complete.
+    async fn spawn_flaky_server(body: Vec<u8>, fail_first: usize) -> std::net::SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let n = conns.fetch_add(1, Ordering::SeqCst);
+                if n < fail_first {
+                    // Drop immediately → the client's request errors out.
+                    drop(sock);
+                    continue;
+                }
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    let read = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..read]).to_lowercase();
+                    let start: u64 = head
+                        .split("range: bytes=")
+                        .nth(1)
+                        .and_then(|s| s.split('-').next())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let avail = &body[start as usize..];
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n",
+                        avail.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(avail).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn worker_rides_out_transient_failures_then_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+        // First two connection attempts fail outright; the third succeeds.
+        let addr = spawn_flaky_server(body.clone(), 2).await;
+        let spec = DownloadSpec {
+            model_id: "org/flaky".into(),
+            quantization: None,
+            backend: BackendKind::LlamaCpp,
+            dir: dir.path().to_path_buf(),
+            files: vec!["m.gguf".into()],
+            download_urls: vec![format!("http://{addr}/m.gguf")],
+            total_bytes: body.len() as u64,
+        };
+        // Fast policy so the test doesn't actually wait on real backoffs.
+        let policy = RetryPolicy {
+            base: std::time::Duration::from_millis(10),
+            cap: std::time::Duration::from_millis(10),
+            no_progress_ceiling: std::time::Duration::from_secs(5),
+        };
+        let primary = run_worker_with(&spec, None, &[], policy)
+            .await
+            .expect("worker should survive the transient failures and finish");
+        assert_eq!(std::fs::read(&primary).unwrap(), body);
+        let st = read_state(dir.path()).expect("final state written");
+        assert_eq!(st.status, DownloadStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn worker_gives_up_on_a_definitive_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Port 0 nothing listening path won't give a clean 404; instead point at a
+        // server that always 404s so the error is definitive (non-retryable).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let spec = DownloadSpec {
+            model_id: "org/missing".into(),
+            quantization: None,
+            backend: BackendKind::LlamaCpp,
+            dir: dir.path().to_path_buf(),
+            files: vec!["m.gguf".into()],
+            download_urls: vec![format!("http://{addr}/m.gguf")],
+            total_bytes: 100,
+        };
+        let policy = RetryPolicy {
+            base: std::time::Duration::from_millis(5),
+            cap: std::time::Duration::from_millis(5),
+            no_progress_ceiling: std::time::Duration::from_secs(30),
+        };
+        // A 404 is definitive: the loop must NOT spin — it returns quickly Failed.
+        let res = run_worker_with(&spec, None, &[], policy).await;
+        assert!(res.is_err());
+        assert_eq!(read_state(dir.path()).unwrap().status, DownloadStatus::Failed);
     }
 
     #[test]
