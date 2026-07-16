@@ -14,6 +14,7 @@
 mod agent;
 mod constants;
 mod deploy_hints;
+mod deploy_preset;
 mod install;
 mod runtime;
 
@@ -27,6 +28,10 @@ pub use constants::{
     BONSAI_QUANT, BONSAI_REPO,
 };
 pub use deploy_hints::{extract_deploy_hints, DeployHints};
+pub use deploy_preset::{
+    backend_supports, classify_weight_format, parse_native_context, preset_for_backend,
+    recommend_backend, recommend_deploy_preset, DeployPreset, PresetInput, WeightFormat,
+};
 pub use install::{
     draft_path, install_local_assistant, install_need, install_offer_body, mark_ready,
     model_installed, model_path, resolve_llama_bin, InstallNeed,

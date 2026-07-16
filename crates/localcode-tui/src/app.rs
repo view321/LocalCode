@@ -25,9 +25,10 @@ use localcode_agent::{
 };
 use localcode_api_client::ApiClient;
 use localcode_assistant::{
-    ensure_running, extract_deploy_hints, install_local_assistant, install_need, install_offer_body,
-    is_installed, quant_compatibility_note, should_offer_install, startup_greeting, Assistant,
-    AssistantContext, DeployToolArgs, LocalAssistantRuntime, ModelActions, ASSISTANT_DISPLAY_NAME,
+    backend_supports, classify_weight_format, ensure_running, install_local_assistant,
+    install_need, install_offer_body, is_installed, preset_for_backend, quant_compatibility_note,
+    recommend_backend, should_offer_install, startup_greeting, Assistant, AssistantContext,
+    DeployToolArgs, LocalAssistantRuntime, ModelActions, PresetInput, ASSISTANT_DISPLAY_NAME,
     BONSAI_FILE, InstallNeed,
 };
 use localcode_backends::{
@@ -69,6 +70,70 @@ const MAX_INPUT_HISTORY: usize = 100;
 /// model's detail card is loaded automatically. Short enough to feel live,
 /// long enough that arrow-key/wheel scrolling doesn't fire a request per row.
 const DETAIL_AUTOLOAD_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How the assistant's auto-preset should treat the current backend selection
+/// when it re-derives deploy defaults from a model card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetMode {
+    /// A new model was opened — pick the backend that fits its weight format.
+    Fresh,
+    /// The quantization changed — keep the backend unless it can no longer serve
+    /// the new format (e.g. switched from a safetensors quant to a GGUF one).
+    QuantChanged,
+    /// The user picked the backend explicitly — never override it, just refresh
+    /// the card flags and a fitting context for that backend.
+    BackendPinned,
+}
+
+/// The largest context ≤ `desired` whose predicted VRAM fits total memory,
+/// halving down but never below the deploy default. Returns `desired` unchanged
+/// when no GPU is detected (the fit estimate is informational only there). Shared
+/// by the deploy panel and the agent-driven deploy so both land a fitting value.
+fn fit_context_to_vram(
+    gpu: &GpuInventory,
+    backend: BackendKind,
+    quant: Option<&str>,
+    desired: u32,
+    weight_bytes: u64,
+) -> u32 {
+    let mut ctx = desired.clamp(512, 1_048_576);
+    if gpu.total_vram() == 0 {
+        return ctx;
+    }
+    // Halve until the estimate fits, but never below a usable floor — and never
+    // above the model's own desired max (so a small-context model isn't raised).
+    let floor = desired.min(DEFAULT_DEPLOY_CTX);
+    while ctx > floor {
+        let fit = predict_fit(
+            gpu,
+            &FitRequest {
+                weight_bytes,
+                param_count: None,
+                quant_label: quant.map(|s| s.to_string()),
+                context_length: ctx,
+                backend: backend.as_str().into(),
+            },
+        );
+        if fit.fits_total {
+            break;
+        }
+        ctx /= 2;
+    }
+    ctx.max(floor)
+}
+
+/// Owned snapshot of the browsed model's fields, gathered from `self` so the
+/// deploy-preset computation can borrow them while `self` is mutated.
+struct PresetInputsOwned {
+    model_id: String,
+    quant: Option<String>,
+    weight_files: Vec<String>,
+    weight_bytes: u64,
+    tags: Vec<String>,
+    card: Option<String>,
+    installed: Vec<BackendKind>,
+    has_gpu: bool,
+}
 
 /// Which view fills the working area. `Chat` is home (the transcript). The rest
 /// are switched to by slash commands; a leading '/' in the omnibar transiently
@@ -699,19 +764,18 @@ struct ModelOps {
 #[async_trait]
 impl ModelActions for ModelOps {
     async fn deploy(&self, args: DeployToolArgs) -> Result<String, LocalCodeError> {
-        let backend = args
-            .backend
-            .as_deref()
-            .and_then(BackendKind::parse)
-            .unwrap_or_else(|| self.registry.default_kind(&self.config));
+        let explicit_backend = args.backend.as_deref().and_then(BackendKind::parse);
         let model_id = args.model_id.clone();
 
-        // Enrich with quant metadata (weights / urls / size) exactly like the
-        // CLI and deploy panel, so fit prediction and llama.cpp downloads work.
+        // Enrich with quant + card metadata (weights / urls / size / tags /
+        // README) exactly like the deploy panel, so fit prediction, llama.cpp
+        // downloads, and the auto-preset below all work.
         let mut quantization = args.quant.clone();
         let mut weight_bytes = 0u64;
         let mut weight_files: Vec<String> = vec![];
         let mut download_urls: Vec<String> = vec![];
+        let mut tags: Vec<String> = vec![];
+        let mut card: Option<String> = None;
         if model_id.contains('/') {
             if let Ok(hf) = HfClient::new(
                 &self.config.registry,
@@ -730,9 +794,40 @@ impl ModelActions for ModelOps {
                         download_urls =
                             weight_files.iter().map(|f| hf.download_url(&model_id, f)).collect();
                     }
+                    tags = detail.summary.tags.clone();
+                    card = detail.card_markdown.clone();
                 }
             }
         }
+
+        // Auto-preset (unless the caller was explicit): pick the backend that
+        // matches the weight format so a GGUF model never lands on vLLM, and fill
+        // a fitting context + the card's flags when the caller didn't supply them.
+        let fmt = classify_weight_format(quantization.as_deref(), &weight_files);
+        let auto_backend = explicit_backend.is_none();
+        let backend = explicit_backend
+            .unwrap_or_else(|| recommend_backend(fmt, &[], self.registry.default_kind(&self.config)));
+        let preset = preset_for_backend(
+            backend,
+            &PresetInput {
+                model_id: &model_id,
+                selected_quant: quantization.as_deref(),
+                weight_files: &weight_files,
+                tags: &tags,
+                card_markdown: card.as_deref(),
+                installed_backends: &[],
+                configured_default: backend,
+                has_gpu: self.gpu.total_vram() > 0,
+            },
+        );
+        let context_length = args.context.unwrap_or_else(|| {
+            preset
+                .desired_context
+                .map(|d| {
+                    fit_context_to_vram(&self.gpu, backend, quantization.as_deref(), d, weight_bytes)
+                })
+                .unwrap_or(DEFAULT_DEPLOY_CTX)
+        });
 
         let req = DeployRequest {
             model_id: model_id.clone(),
@@ -743,8 +838,8 @@ impl ModelActions for ModelOps {
             local_path: None,
             backend,
             port: args.port,
-            context_length: args.context.unwrap_or(DEFAULT_DEPLOY_CTX),
-            tuning: DeployTuning::default(),
+            context_length,
+            tuning: preset.tuning,
             command_override: args.command.clone(),
             // Tool-driven deploy: proceed past the VRAM soft-gate (it may spill
             // to RAM/CPU or fail loudly rather than silently blocking).
@@ -760,8 +855,10 @@ impl ModelActions for ModelOps {
         );
         svc.deploy(req).await?;
         let _ = self.tx.send(BgMsg::ModelsChanged);
+        let picked = if auto_backend { " (auto-selected for the weight format)" } else { "" };
         Ok(format!(
-            "Deployed {model_id} on {}. It is on /dash and selectable for chat.",
+            "Deployed {model_id} on {}{picked} with context {context_length}. \
+             It is on /dash and selectable for chat.",
             backend.as_str()
         ))
     }
@@ -989,6 +1086,9 @@ pub struct App {
     pub selected_quant: Option<String>,
     pub deploy_backend: BackendKind,
     pub deploy_ctx: u32,
+    /// Set once the user edits the context by hand, so the assistant's
+    /// auto-preset stops overriding it on the next model/quant/backend change.
+    deploy_ctx_user_set: bool,
     pub deploy_port: Option<u16>,
     /// Per-backend deploy tuning (VRAM fraction, tensor-parallel, GPU layers).
     /// `None` means "let the backend choose its default".
@@ -1205,6 +1305,7 @@ impl App {
             deploy_backend: BackendKind::parse(&config.backends.default.kind)
                 .unwrap_or(BackendKind::Ollama),
             deploy_ctx: DEFAULT_DEPLOY_CTX,
+            deploy_ctx_user_set: false,
             deploy_port: None,
             deploy_gpu_frac: None,
             deploy_tensor_parallel: None,
@@ -2425,10 +2526,16 @@ impl App {
         let n = detail.quants.len() as i32;
         let next = ((cur as i32 + delta) % n + n) % n;
         self.selected_quant = Some(detail.quants[next as usize].label.clone());
+        // A different quant can be a different format (e.g. a repo carrying both
+        // GGUF and safetensors): re-derive the preset, correcting the backend if
+        // the current one can no longer serve it.
+        self.apply_deploy_preset(PresetMode::QuantChanged);
         self.refresh_fit();
     }
 
     fn adjust_ctx(&mut self, up: bool) {
+        // A manual context change opts out of the assistant's context preset.
+        self.deploy_ctx_user_set = true;
         self.deploy_ctx = if up {
             (self.deploy_ctx.saturating_mul(2)).min(131_072)
         } else {
@@ -2494,6 +2601,18 @@ impl App {
             command_override: self.deploy_command_override.clone(),
             continue_despite_oversize: continue_oversize,
         })
+    }
+
+    /// Notes from the last auto-preset, explaining why the backend / flags /
+    /// context were chosen. Empty when the preset made no changes or is off.
+    pub fn deploy_preset_notes(&self) -> &[String] {
+        &self.deploy_hints_notes
+    }
+
+    /// Whether the assistant auto-presets deploy params (drives the panel's
+    /// "auto" tag). Mirrors `assistant.auto_deploy_hints`.
+    pub fn auto_preset_on(&self) -> bool {
+        self.config.assistant.auto_deploy_hints
     }
 
     /// Deploy parameters shown (and editable) for the current backend, in
@@ -2652,10 +2771,14 @@ impl App {
         let mut ok = true;
         match field {
             DeployField::Context => {
+                // A successful hand-edit (explicit value or blank "back to
+                // default") opts out of the assistant's context preset.
                 if blank {
                     self.deploy_ctx = DEFAULT_DEPLOY_CTX;
+                    self.deploy_ctx_user_set = true;
                 } else if let Ok(v) = raw.parse::<u32>() {
                     self.deploy_ctx = v.clamp(512, 1_048_576);
+                    self.deploy_ctx_user_set = true;
                 } else {
                     ok = false;
                 }
@@ -2741,65 +2864,126 @@ impl App {
     }
 
     fn start_deploy(&mut self, continue_oversize: bool) {
-        // When enabled, parse the model card for backend flags before deploy.
-        if self.config.assistant.auto_deploy_hints {
-            self.apply_card_deploy_hints();
-        }
+        // Refresh the card flags for the chosen backend right before deploy, in
+        // case the user changed backend since the model loaded. Backend stays
+        // pinned to the user's selection here (no auto-switch at deploy time).
+        self.apply_deploy_preset(PresetMode::BackendPinned);
         let Some(req) = self.build_deploy_request(continue_oversize) else {
             return;
         };
         self.spawn_deploy(req);
     }
 
-    /// Read the loaded model card and fill deploy knobs / extra_args.
-    fn apply_card_deploy_hints(&mut self) {
-        let Some(detail) = &self.model_detail else {
-            return;
-        };
-        let Some(card) = detail.card_markdown.as_deref() else {
-            return;
-        };
-        let hints = extract_deploy_hints(card, self.deploy_backend);
-        if hints.is_empty() {
+    /// Auto-preset deploy parameters from the model card: the assistant picks the
+    /// backend that matches the weight format (so a GGUF model never lands on
+    /// vLLM), a fitting context, and the card's recommended flags. Gated on
+    /// `assistant.auto_deploy_hints`; every field stays user-editable and an
+    /// explicit user edit (tracked per field) is never overwritten.
+    fn apply_deploy_preset(&mut self, mode: PresetMode) {
+        if !self.config.assistant.auto_deploy_hints {
             return;
         }
-        if self.deploy_gpu_frac.is_none() {
-            if let Some(v) = hints.gpu_memory_fraction {
-                self.deploy_gpu_frac = Some(v);
+        let Some(owned) = self.gather_preset_inputs() else {
+            return;
+        };
+        let input = PresetInput {
+            model_id: &owned.model_id,
+            selected_quant: owned.quant.as_deref(),
+            weight_files: &owned.weight_files,
+            tags: &owned.tags,
+            card_markdown: owned.card.as_deref(),
+            installed_backends: &owned.installed,
+            configured_default: self.deploy_backend,
+            has_gpu: owned.has_gpu,
+        };
+
+        // Decide the effective backend for this format under the given mode.
+        let fmt = classify_weight_format(input.selected_quant, input.weight_files);
+        let backend = match mode {
+            PresetMode::Fresh => recommend_backend(fmt, &owned.installed, self.deploy_backend),
+            PresetMode::QuantChanged if !backend_supports(self.deploy_backend, fmt) => {
+                recommend_backend(fmt, &owned.installed, self.deploy_backend)
             }
+            PresetMode::QuantChanged | PresetMode::BackendPinned => self.deploy_backend,
+        };
+        let preset = preset_for_backend(backend, &input);
+
+        // Adopt the backend if the preset changed it; its command override was
+        // built for the previous backend and is no longer valid.
+        if self.deploy_backend != preset.backend {
+            self.deploy_backend = preset.backend;
+            self.deploy_command_override = None;
+        }
+
+        // Numeric knobs: fill only what the user hasn't set. Extra CLI flags are
+        // card-owned for the chosen backend, so replace them wholesale (the old
+        // set may belong to a different backend).
+        if self.deploy_gpu_frac.is_none() {
+            self.deploy_gpu_frac = preset.tuning.gpu_memory_fraction;
         }
         if self.deploy_tensor_parallel.is_none() {
-            if let Some(v) = hints.tensor_parallel {
-                self.deploy_tensor_parallel = Some(v);
-            }
+            self.deploy_tensor_parallel = preset.tuning.tensor_parallel;
         }
         if self.deploy_gpu_layers.is_none() {
-            if let Some(v) = hints.gpu_layers {
-                self.deploy_gpu_layers = Some(v);
+            self.deploy_gpu_layers = preset.tuning.gpu_layers;
+        }
+        self.deploy_extra_args = preset.tuning.extra_args.clone();
+
+        // Context: honor an explicit user value; else use the model-native one,
+        // reduced until the VRAM estimate fits.
+        if !self.deploy_ctx_user_set {
+            if let Some(desired) = preset.desired_context {
+                self.deploy_ctx = self.fit_context(desired, owned.weight_bytes);
             }
         }
-        if let Some(ctx) = hints.context_length {
-            // Only raise context when the card recommends more than the default
-            // and the user hasn't customized (still on DEFAULT).
-            if self.deploy_ctx == DEFAULT_DEPLOY_CTX && ctx > self.deploy_ctx {
-                self.deploy_ctx = ctx.min(131_072);
-            }
-        }
-        for a in &hints.extra_args {
-            if !self.deploy_extra_args.iter().any(|e| e == a) {
-                self.deploy_extra_args.push(a.clone());
-            }
-        }
-        self.deploy_hints_notes = hints.notes.clone();
+
+        self.deploy_hints_notes = preset.notes.clone();
+        self.refresh_fit();
         if !self.deploy_hints_notes.is_empty() {
             self.set_status(
-                format!(
-                    "Deploy hints from model card: {}",
-                    self.deploy_hints_notes.join("; ")
-                ),
+                format!("Assistant preset: {}", self.deploy_hints_notes.join("; ")),
                 false,
             );
         }
+    }
+
+    /// Collect the owned inputs the pure preset needs, decoupled from `self` so
+    /// the caller can mutate deploy state afterwards without borrow conflicts.
+    fn gather_preset_inputs(&self) -> Option<PresetInputsOwned> {
+        let detail = self.model_detail.as_ref()?;
+        let group = detail
+            .quants
+            .iter()
+            .find(|q| Some(q.label.as_str()) == self.selected_quant.as_deref());
+        Some(PresetInputsOwned {
+            model_id: detail.summary.id.clone(),
+            quant: self.selected_quant.clone(),
+            weight_files: group
+                .map(|q| q.files.iter().map(|f| f.filename.clone()).collect())
+                .unwrap_or_default(),
+            weight_bytes: group.map(|q| q.total_size).unwrap_or(0),
+            tags: detail.summary.tags.clone(),
+            card: detail.card_markdown.clone(),
+            installed: self
+                .backend_reports
+                .iter()
+                .filter(|r| r.installed)
+                .map(|r| r.kind)
+                .collect(),
+            has_gpu: self.gpu.total_vram() > 0,
+        })
+    }
+
+    /// The largest context ≤ `desired` whose predicted VRAM fits total memory,
+    /// for the current backend / quant selection.
+    fn fit_context(&self, desired: u32, weight_bytes: u64) -> u32 {
+        fit_context_to_vram(
+            &self.gpu,
+            self.deploy_backend,
+            self.selected_quant.as_deref(),
+            desired,
+            weight_bytes,
+        )
     }
 
     fn spawn_deploy(&mut self, req: DeployRequest) {
@@ -4432,19 +4616,26 @@ impl App {
                             self.selected_quant = detail.quants.first().map(|q| q.label.clone());
                             self.model_detail = Some(detail);
                             self.card_scroll = 0;
-                            // Fresh model: clear previous card-derived flags, then re-parse.
+                            // Fresh model: clear all previous card-derived params so
+                            // the auto-preset re-derives cleanly (nothing bleeds in
+                            // from the last model).
                             self.deploy_extra_args.clear();
                             self.deploy_hints_notes.clear();
-                            // A command override was built for the previous model.
                             self.deploy_command_override = None;
-                            if self.config.assistant.auto_deploy_hints {
-                                self.apply_card_deploy_hints();
-                            }
+                            self.deploy_gpu_frac = None;
+                            self.deploy_tensor_parallel = None;
+                            self.deploy_gpu_layers = None;
+                            self.deploy_ctx = DEFAULT_DEPLOY_CTX;
+                            self.deploy_ctx_user_set = false;
                             self.refresh_fit();
                             self.set_status(
                                 "Model loaded — → focus card, [,/.] quant, [d] deploy",
                                 false,
                             );
+                            // Assistant reads the card and presets the backend,
+                            // context, and flags (overriding the status above with a
+                            // summary when it changes anything).
+                            self.apply_deploy_preset(PresetMode::Fresh);
                         }
                         Err(e) if auto => {
                             // Scroll-triggered load: report quietly instead of
@@ -5443,6 +5634,7 @@ impl App {
                 Some(n) => {
                     if let Ok(v) = n.parse::<u32>() {
                         self.deploy_ctx = v.clamp(512, 131_072);
+                        self.deploy_ctx_user_set = true;
                         self.refresh_fit();
                     } else {
                         self.set_status("Usage: /context <number|up|down>", true);
@@ -5461,6 +5653,8 @@ impl App {
                     if let Some(k) = BackendKind::parse(name) {
                         self.deploy_backend = k;
                         self.deploy_command_override = None;
+                        // Re-derive the card flags / context for the pinned backend.
+                        self.apply_deploy_preset(PresetMode::BackendPinned);
                         self.refresh_fit();
                     } else {
                         self.set_status(format!("Unknown backend: {name}"), true);
@@ -6812,11 +7006,15 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 }
             }
             ClickTarget::QuantList => {
-                if let Some(d) = &self.model_detail {
-                    if rel_row < d.quants.len() {
-                        self.selected_quant = Some(d.quants[rel_row].label.clone());
-                        self.refresh_fit();
-                    }
+                let picked = self
+                    .model_detail
+                    .as_ref()
+                    .and_then(|d| d.quants.get(rel_row))
+                    .map(|q| q.label.clone());
+                if let Some(label) = picked {
+                    self.selected_quant = Some(label);
+                    self.apply_deploy_preset(PresetMode::QuantChanged);
+                    self.refresh_fit();
                 }
             }
             ClickTarget::BackendCycle => self.cycle_deploy_backend(),
@@ -6957,6 +7155,8 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             BackendKind::Vllm => BackendKind::Sglang,
             BackendKind::Sglang => BackendKind::Ollama,
         };
+        // Re-derive the card flags / context for the newly-pinned backend.
+        self.apply_deploy_preset(PresetMode::BackendPinned);
         self.refresh_fit();
     }
 
@@ -8793,6 +8993,77 @@ mod tests {
                 known: true,
             }],
         }
+    }
+
+    /// A fresh GGUF model must auto-select llama.cpp even when the panel was on
+    /// vLLM — this is the "GGUF never lands on vLLM" guarantee at browse time.
+    #[test]
+    fn fresh_gguf_model_auto_selects_llamacpp() {
+        let mut app = test_app();
+        app.deploy_backend = BackendKind::Vllm;
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.apply_deploy_preset(PresetMode::Fresh);
+        assert_eq!(app.deploy_backend, BackendKind::LlamaCpp);
+    }
+
+    /// A fresh safetensors model routes to vLLM, not a GGUF backend.
+    #[test]
+    fn fresh_safetensors_model_auto_selects_vllm() {
+        let mut app = test_app();
+        app.deploy_backend = BackendKind::Ollama;
+        app.model_detail = Some(detail_with_quant("org/s", "FP16", "model.safetensors"));
+        app.selected_quant = Some("FP16".into());
+        app.apply_deploy_preset(PresetMode::Fresh);
+        assert_eq!(app.deploy_backend, BackendKind::Vllm);
+    }
+
+    /// Switching to a GGUF quant while pinned to vLLM corrects the backend, since
+    /// vLLM cannot serve GGUF.
+    #[test]
+    fn quant_change_to_gguf_corrects_incompatible_backend() {
+        let mut app = test_app();
+        app.deploy_backend = BackendKind::Vllm;
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.apply_deploy_preset(PresetMode::QuantChanged);
+        assert_eq!(app.deploy_backend, BackendKind::LlamaCpp);
+    }
+
+    /// A backend the user pinned is never auto-switched, even if it can't serve
+    /// the format — the deploy-time guard surfaces the error instead.
+    #[test]
+    fn backend_pinned_mode_never_switches() {
+        let mut app = test_app();
+        app.deploy_backend = BackendKind::Vllm;
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.apply_deploy_preset(PresetMode::BackendPinned);
+        assert_eq!(app.deploy_backend, BackendKind::Vllm);
+    }
+
+    /// A hand-edited context is not overwritten by the assistant preset.
+    #[test]
+    fn user_set_context_survives_preset() {
+        let mut app = test_app();
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.deploy_ctx = 5000;
+        app.deploy_ctx_user_set = true;
+        app.apply_deploy_preset(PresetMode::Fresh);
+        assert_eq!(app.deploy_ctx, 5000);
+    }
+
+    /// With the auto-preset disabled, the backend is left exactly as configured.
+    #[test]
+    fn preset_disabled_leaves_backend_untouched() {
+        let mut app = test_app();
+        app.config.assistant.auto_deploy_hints = false;
+        app.deploy_backend = BackendKind::Vllm;
+        app.model_detail = Some(detail_with_quant("org/g", "Q4_K_M", "g-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.apply_deploy_preset(PresetMode::Fresh);
+        assert_eq!(app.deploy_backend, BackendKind::Vllm);
     }
 
     /// Scrolling the results list arms the debounced auto-load; once the

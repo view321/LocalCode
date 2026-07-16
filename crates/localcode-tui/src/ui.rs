@@ -1338,14 +1338,19 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     }
     ctrl.push(Line::from(""));
 
-    // backend ⟳ — click to cycle Ollama → llama.cpp → vLLM → SGLang.
+    // backend ⟳ — click to cycle Ollama → llama.cpp → vLLM → SGLang. An "auto"
+    // tag marks that the assistant preset this backend from the model card.
     let backend_row = area.y + ctrl.len() as u16;
     let backend_cell = format!("{} ⟳", app.deploy_backend.as_str());
     let backend_w = ("backend ".len() + backend_cell.width()) as u16;
-    ctrl.push(Line::from(vec![
+    let mut backend_spans = vec![
         Span::styled("backend ", theme::muted(&th)),
         Span::styled(backend_cell, theme::accent(&th)),
-    ]));
+    ];
+    if app.auto_preset_on() && !app.deploy_preset_notes().is_empty() {
+        backend_spans.push(Span::styled("  auto", theme::faint(&th)));
+    }
+    ctrl.push(Line::from(backend_spans));
     click(app, Rect { x: area.x, y: backend_row, width: backend_w, height: 1 }, ClickTarget::BackendCycle);
 
     // Editable deploy parameters, filtered to what the current backend honors.
@@ -1371,6 +1376,16 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
             Rect { x: area.x, y: row, width: area.width, height: 1 },
             ClickTarget::DeployField(field),
         );
+    }
+
+    // Why the assistant chose these params (backend format match, card flags,
+    // native context). Truncated to width; the full set went to the status line.
+    if app.auto_preset_on() {
+        let notes = app.deploy_preset_notes();
+        if !notes.is_empty() {
+            let reason = clip(&notes.join(" · "), area.width.saturating_sub(1) as usize);
+            ctrl.push(Line::from(Span::styled(reason, theme::faint(&th))));
+        }
     }
 
     // vram fit + a wide bar.

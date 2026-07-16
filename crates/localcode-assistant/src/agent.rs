@@ -275,22 +275,57 @@ impl AssistantAgent {
                 LocalCodeError::new(ErrorCode::AgentToolFailed, "hf.model_card requires model_id")
             })?;
         let detail = hf.model_info(model_id).await?;
-        let card = detail
-            .card_markdown
-            .unwrap_or_else(|| "(no README on this model)".into());
-        // Cap size for context.
-        let card = truncate(&card, 24_000);
+        // Classify the weight format from the quant labels / filenames and
+        // recommend the backend that can actually serve it, so the model deploys
+        // GGUF on llama.cpp and safetensors on vLLM rather than guessing.
+        let quant = detail.quants.first().map(|q| q.label.clone());
+        let weight_files: Vec<String> = detail
+            .quants
+            .iter()
+            .flat_map(|q| q.files.iter().map(|f| f.filename.clone()))
+            .collect();
+        let fmt = crate::deploy_preset::classify_weight_format(quant.as_deref(), &weight_files);
+        // Honor an explicit backend arg; otherwise recommend from the format.
         let backend = call
             .arguments
             .get("backend")
             .and_then(|v| v.as_str())
             .and_then(BackendKind::parse)
-            .unwrap_or(BackendKind::Vllm);
-        let hints = extract_deploy_hints(&card, backend);
+            .unwrap_or_else(|| {
+                crate::deploy_preset::recommend_backend(fmt, &[], BackendKind::Vllm)
+            });
+        let card_md = detail.card_markdown.clone();
+        let preset = crate::deploy_preset::preset_for_backend(
+            backend,
+            &crate::deploy_preset::PresetInput {
+                model_id,
+                selected_quant: quant.as_deref(),
+                weight_files: &weight_files,
+                tags: &detail.summary.tags,
+                card_markdown: card_md.as_deref(),
+                installed_backends: &[],
+                configured_default: backend,
+                has_gpu: true,
+            },
+        );
+        let card = truncate(
+            &card_md.unwrap_or_else(|| "(no README on this model)".into()),
+            24_000,
+        );
         let mut out = format!("# Model card: {model_id}\n\n{card}");
-        if !hints.is_empty() {
-            out.push_str("\n\n## Parsed deploy hints\n");
-            out.push_str(&serde_json::to_string_pretty(&hints).unwrap_or_default());
+        out.push_str("\n\n## Recommended deploy settings\n");
+        out.push_str(&format!(
+            "- backend: {} (deploy_model without a backend picks this)\n",
+            preset.backend.as_str()
+        ));
+        if let Some(ctx) = preset.desired_context {
+            out.push_str(&format!("- context: {ctx}\n"));
+        }
+        if !preset.tuning.extra_args.is_empty() {
+            out.push_str(&format!("- flags: {}\n", preset.tuning.extra_args.join(" ")));
+        }
+        for note in &preset.notes {
+            out.push_str(&format!("- {note}\n"));
         }
         Ok(ToolResult {
             output: out,
