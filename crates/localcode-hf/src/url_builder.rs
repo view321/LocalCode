@@ -1,11 +1,13 @@
 //! URL construction with mirror base swapping.
 //!
 //! A [`UrlBuilder`] holds an ordered list of host bases (the configured
-//! endpoint first, then any mirrors, with `https://huggingface.co` appended as
-//! a last resort). The single-URL methods (`api`, `resolve_file`) return the
-//! primary (first) host so existing call sites are unchanged; the
-//! `*_candidates` methods return every host in order so downloaders can fall
-//! back mirror-by-mirror when one is unreachable.
+//! endpoint first, then any mirrors, then `https://huggingface.co`, and
+//! finally the public `https://hf-mirror.com` mirror as a built-in last
+//! resort — so HF stays reachable even with no mirrors configured). The
+//! single-URL methods (`api`, `resolve_file`) return the primary (first) host
+//! so existing call sites are unchanged; the `*_candidates` methods return
+//! every host in order so downloaders can fall back mirror-by-mirror when one
+//! is unreachable.
 
 /// A web+api base pair for one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,10 @@ struct HostPair {
 
 const PRIMARY_WEB: &str = "https://huggingface.co";
 const PRIMARY_API: &str = "https://huggingface.co/api";
+/// Well-known public HF mirror, appended after the canonical host so it is
+/// only consulted when `huggingface.co` (and every configured mirror) fails.
+const FALLBACK_MIRROR_WEB: &str = "https://hf-mirror.com";
+const FALLBACK_MIRROR_API: &str = "https://hf-mirror.com/api";
 
 #[derive(Debug, Clone)]
 pub struct UrlBuilder {
@@ -37,8 +43,9 @@ impl UrlBuilder {
     }
 
     /// Ordered builder: `endpoint` first, then each mirror (web roots; the api
-    /// base is derived as `{web}/api`), then the hardcoded primary HF host.
-    /// Empty entries are skipped and duplicates removed while preserving order.
+    /// base is derived as `{web}/api`), then the hardcoded primary HF host,
+    /// then the public hf-mirror.com fallback. Empty entries are skipped and
+    /// duplicates removed while preserving order.
     pub fn with_mirrors(endpoint: &str, api_endpoint: &str, mirrors: &[String]) -> Self {
         let mut hosts: Vec<HostPair> = Vec::new();
         let mut push = |web: &str, api: &str| {
@@ -61,8 +68,10 @@ impl UrlBuilder {
                 push(m, &api);
             }
         }
-        // Always keep the canonical HF host reachable as a final fallback.
+        // Always keep the canonical HF host reachable as a fallback, and the
+        // public hf-mirror.com after it for when huggingface.co is unavailable.
         push(PRIMARY_WEB, PRIMARY_API);
+        push(FALLBACK_MIRROR_WEB, FALLBACK_MIRROR_API);
 
         Self { hosts }
     }
@@ -177,11 +186,18 @@ mod tests {
 
     #[test]
     fn default_endpoint_has_no_duplicate_fallback() {
-        // When the primary already IS huggingface.co, it must appear once.
+        // When the primary already IS huggingface.co, it must appear once, with
+        // the built-in hf-mirror.com fallback after it.
         let u = UrlBuilder::new("https://huggingface.co", "https://huggingface.co/api");
         assert!(!u.is_mirror());
         let files = u.resolve_file_candidates("org/model", "m.gguf");
-        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files,
+            vec![
+                "https://huggingface.co/org/model/resolve/main/m.gguf".to_string(),
+                "https://hf-mirror.com/org/model/resolve/main/m.gguf".to_string(),
+            ]
+        );
     }
 
     #[test]

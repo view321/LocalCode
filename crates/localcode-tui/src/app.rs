@@ -32,7 +32,7 @@ use localcode_assistant::{
 };
 use localcode_backends::{
     can_elevate_noninteractively, delete_downloaded, diagnose, ensure_llamacpp_installed,
-    human_size, list_downloaded, preview_deploy_command, resolve_install_plan,
+    find_downloaded, human_size, list_downloaded, preview_deploy_command, resolve_install_plan,
     resolve_llamacpp_bin, resolve_repair, run_install, run_repair, sanitize_model_dir, smoke_test,
     BackendKind, BackendRegistry, DashSnapshot, DeployRequest, DeployService, DeployTuning,
     DetectReport, Diagnosis, DownloadedModel, InstallPlan, OpenWebUi, OpenWebUiHandle, ProcState,
@@ -48,7 +48,7 @@ use localcode_core::runtime::{ActiveRuntime, RuntimeStatus};
 use localcode_core::theme::{Theme, ThemeMode};
 use localcode_gpu::{discover, predict_fit, FitPrediction, FitRequest, GpuInventory};
 use localcode_remote::{setup_server, RemoteSession};
-use localcode_hf::{HfClient, ModelDetail, ModelSummary};
+use localcode_hf::{discover_quants, HfClient, ModelDetail, ModelFile, ModelSummary, QuantGroup};
 use localcode_upgrade::{SelfUpdater, UpdateChecker, UpdateInfo, UpdateReport};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -64,6 +64,11 @@ use tracing::info;
 use zeroize::Zeroizing;
 
 const MAX_INPUT_HISTORY: usize = 100;
+
+/// How long the results-list selection must sit still before the highlighted
+/// model's detail card is loaded automatically. Short enough to feel live,
+/// long enough that arrow-key/wheel scrolling doesn't fire a request per row.
+const DETAIL_AUTOLOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Which view fills the working area. `Chat` is home (the transcript). The rest
 /// are switched to by slash commands; a leading '/' in the omnibar transiently
@@ -571,7 +576,16 @@ pub enum DeployOutcome {
 /// Results and requests flowing from spawned tasks back to the UI loop.
 pub enum BgMsg {
     SearchDone(Result<Vec<ModelSummary>, LocalCodeError>),
-    DetailDone(Result<ModelDetail, LocalCodeError>),
+    /// A model detail card finished loading. `id` is the model that was asked
+    /// for — a result whose id no longer matches the latest request is stale
+    /// (the user scrolled on) and is dropped. `auto` marks a scroll-triggered
+    /// load, whose failures are reported quietly instead of raising the error
+    /// modal.
+    DetailDone {
+        id: String,
+        auto: bool,
+        result: Result<ModelDetail, LocalCodeError>,
+    },
     DeployEnded(DeployOutcome),
     /// Live progress from a running coding turn (streamed tokens, tools). Tagged
     /// with the session it belongs to so background turns don't corrupt whichever
@@ -960,6 +974,13 @@ pub struct App {
     pub model_selected: usize,
     pub model_list_state: ListState,
     pub model_detail: Option<ModelDetail>,
+    /// Model id of the in-flight detail request. `DetailDone` results carrying
+    /// any other id are stale (a newer request replaced them) and are dropped.
+    detail_request: Option<String>,
+    /// Deadline of the debounced follow-the-selection detail load. Scrolling
+    /// the results list re-arms it; when it expires the highlighted model's
+    /// card is loaded so the right pane switches automatically.
+    detail_autoload_at: Option<Instant>,
     pub card_cache: Option<CardCache>,
     pub card_scroll: usize,
     /// Updated during draw so scrolling knows the bounds.
@@ -1174,6 +1195,8 @@ impl App {
             model_selected: 0,
             model_list_state: ListState::default(),
             model_detail: None,
+            detail_request: None,
+            detail_autoload_at: None,
             card_cache: None,
             card_scroll: 0,
             card_view_height: 0,
@@ -1796,6 +1819,11 @@ impl App {
         }
         if let Some(b) = self.busy.take() {
             b.handle.abort();
+            if b.kind == BusyKind::Detail {
+                // No DetailDone will arrive for the aborted request; forget it
+                // so the next request for the same id isn't skipped as a dup.
+                self.detail_request = None;
+            }
             if b.kind == BusyKind::Coding {
                 // Keep whatever streamed before the cancel; just close it out.
                 self.finalize_transcript_live();
@@ -2278,21 +2306,75 @@ impl App {
     /// Load the HF detail card for an explicit model id (used by `/dash`'s Deploy
     /// button, which acts on a downloaded model that isn't in the search list).
     fn start_load_detail_for(&mut self, id: &str) {
-        if self.fg_busy() {
-            self.set_status("Busy — Esc to cancel first", false);
+        self.request_detail(id, false);
+    }
+
+    /// Spawn a detail load for `id`. An in-flight detail load is aborted and
+    /// replaced (its result would be stale); any other foreground work keeps
+    /// its claim — explicit requests report "busy", auto (scroll-triggered)
+    /// ones silently retry after the next debounce window.
+    fn request_detail(&mut self, id: &str, auto: bool) {
+        if self.busy.as_ref().is_some_and(|b| b.kind == BusyKind::Detail) {
+            if self.detail_request.as_deref() == Some(id) {
+                return; // already loading exactly this model
+            }
+            if let Some(b) = self.busy.take() {
+                b.handle.abort();
+            }
+            self.detail_request = None;
+        } else if self.fg_busy() {
+            if auto {
+                self.arm_detail_autoload();
+            } else {
+                self.set_status("Busy — Esc to cancel first", false);
+            }
             return;
         }
-        let Some(hf) = self.hf.clone() else {
-            return;
-        };
+        let hf = self.hf.clone();
+        let models_dir = self.paths.models_cache.clone();
         let id = id.to_string();
         let tx = self.bg_tx.clone();
         let label = format!("Loading {id}");
+        self.detail_request = Some(id.clone());
         let handle = tokio::spawn(async move {
-            let result = hf.model_info(&id).await;
-            let _ = tx.send(BgMsg::DetailDone(result));
+            let result = fetch_detail_or_offline(hf, &models_dir, &id).await;
+            let _ = tx.send(BgMsg::DetailDone { id, auto, result });
         });
         self.begin_busy(BusyKind::Detail, label, handle);
+    }
+
+    /// (Re)arm the debounced follow-the-selection detail load. Called on every
+    /// selection move in `/models`; the load fires from the event loop once the
+    /// highlight has sat still for [`DETAIL_AUTOLOAD_DEBOUNCE`].
+    fn arm_detail_autoload(&mut self) {
+        if self.mode == Mode::Models && !self.models.is_empty() {
+            self.detail_autoload_at = Some(Instant::now() + DETAIL_AUTOLOAD_DEBOUNCE);
+        }
+    }
+
+    /// Fire the debounced auto-load when its deadline has passed: loading the
+    /// highlighted model's card so scrolling the results list switches the
+    /// right-hand pane without an explicit Enter. Runs every event-loop tick.
+    fn maybe_autoload_detail(&mut self) {
+        let Some(at) = self.detail_autoload_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        self.detail_autoload_at = None;
+        if self.mode != Mode::Models {
+            return;
+        }
+        let Some(id) = self.models.get(self.model_selected).map(|m| m.id.clone()) else {
+            return;
+        };
+        if self.model_detail.as_ref().is_some_and(|d| d.summary.id == id)
+            || self.detail_request.as_deref() == Some(id.as_str())
+        {
+            return;
+        }
+        self.request_detail(&id, true);
     }
 
     /// Recompute the VRAM fit estimate from current selections. Cheap & sync.
@@ -2369,6 +2451,20 @@ impl App {
         } else {
             vec![]
         };
+        // Weights already on disk serve the deploy directly — llama.cpp
+        // launches from the local GGUF and Ollama falls back to
+        // create-from-GGUF when its pull fails — so a downloaded model
+        // deploys without any network. vLLM/SGLang take a local path
+        // verbatim as the model argument, which only suits directories, so
+        // they keep resolving the HF id themselves.
+        let local_path = if matches!(
+            self.deploy_backend,
+            BackendKind::LlamaCpp | BackendKind::Ollama
+        ) {
+            self.downloaded_quant_path(&detail.summary.id, &weight_files)
+        } else {
+            None
+        };
 
         Some(DeployRequest {
             model_id: detail.summary.id.clone(),
@@ -2376,7 +2472,7 @@ impl App {
             weight_bytes: weight,
             weight_files,
             download_urls,
-            local_path: None,
+            local_path,
             backend: self.deploy_backend,
             port: self.deploy_port,
             context_length: self.deploy_ctx,
@@ -2844,10 +2940,60 @@ impl App {
     /// True when a model's weights are on disk (drives the /models "downloaded"
     /// tag). Matches by the deterministic sanitized cache-directory name.
     pub fn is_downloaded(&self, model_id: &str) -> bool {
+        self.downloaded_entry(model_id).is_some()
+    }
+
+    /// The downloaded-weights entry for a model, matched by exact id or by the
+    /// deterministic sanitized cache-directory name.
+    fn downloaded_entry(&self, model_id: &str) -> Option<&DownloadedModel> {
         let dir = sanitize_model_dir(model_id);
         self.downloaded_models
             .iter()
-            .any(|m| m.model_id == model_id || sanitize_model_dir(&m.model_id) == dir)
+            .find(|m| m.model_id == model_id || sanitize_model_dir(&m.model_id) == dir)
+    }
+
+    /// True when every file of a quant group is already on disk for `model_id`.
+    /// Drives the per-quant "downloaded" tag in the model detail view. Compares
+    /// bare file names because the downloader flattens repo subdirectories.
+    pub fn quant_downloaded(&self, model_id: &str, group: &QuantGroup) -> bool {
+        let Some(m) = self.downloaded_entry(model_id) else {
+            return false;
+        };
+        !group.files.is_empty()
+            && group.files.iter().all(|f| {
+                let name = std::path::Path::new(&f.filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(f.filename.as_str());
+                m.files.iter().any(|have| have == name)
+            })
+    }
+
+    /// Absolute path to the primary on-disk weight file when every file of the
+    /// selected quant is already downloaded (first GGUF in sorted order, else
+    /// first file — mirroring the deploy downloader's pick). `None` when any
+    /// file is missing, so a partial download still goes through the normal
+    /// download path.
+    fn downloaded_quant_path(&self, model_id: &str, weight_files: &[String]) -> Option<String> {
+        if weight_files.is_empty() {
+            return None;
+        }
+        let m = self.downloaded_entry(model_id)?;
+        let mut names: Vec<&str> = Vec::with_capacity(weight_files.len());
+        for f in weight_files {
+            let name = std::path::Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f.as_str());
+            let have = m.files.iter().find(|have| have.as_str() == name)?;
+            names.push(have.as_str());
+        }
+        names.sort_unstable();
+        let primary = names
+            .iter()
+            .find(|n| n.to_lowercase().ends_with(".gguf"))
+            .or_else(|| names.first())?;
+        Some(m.dir.join(primary).display().to_string())
     }
 
     /// The model currently in focus in `/models`: the loaded detail, else the
@@ -4237,6 +4383,9 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn process_bg(&mut self) {
+        // The event loop redraws at least every 100ms, so this doubles as the
+        // debounce tick for the follow-the-selection detail load.
+        self.maybe_autoload_detail();
         while let Ok(msg) = self.bg_rx.try_recv() {
             match msg {
                 BgMsg::SearchDone(result) => {
@@ -4246,6 +4395,8 @@ impl App {
                             self.models = models;
                             self.model_selected = 0;
                             self.set_status(format!("Found {} models", self.models.len()), false);
+                            // Bring up the first result's card without an Enter.
+                            self.arm_detail_autoload();
                         }
                         Err(e) => {
                             self.last_failed_action = Some(RetryAction::SearchModels);
@@ -4253,7 +4404,14 @@ impl App {
                         }
                     }
                 }
-                BgMsg::DetailDone(result) => {
+                BgMsg::DetailDone { id, auto, result } => {
+                    // Stale: a newer request replaced this one while it was in
+                    // flight (the user scrolled on). Its busy marker — and the
+                    // eventual DetailDone — belong to the newer request.
+                    if self.detail_request.as_deref() != Some(id.as_str()) {
+                        continue;
+                    }
+                    self.detail_request = None;
                     self.finish_busy();
                     match result {
                         Ok(detail) => {
@@ -4274,6 +4432,11 @@ impl App {
                                 false,
                             );
                         }
+                        Err(e) if auto => {
+                            // Scroll-triggered load: report quietly instead of
+                            // raising the error modal over the list.
+                            self.set_status(format!("Couldn't load {id}: {}", e.message), true);
+                        }
                         Err(e) => {
                             self.last_failed_action = Some(RetryAction::LoadDetail);
                             self.raise_error(e);
@@ -4282,6 +4445,9 @@ impl App {
                 }
                 BgMsg::DeployEnded(outcome) => {
                     self.deploy_busy = None;
+                    // A finished deploy may have just downloaded weights —
+                    // rescan so "downloaded" tags and /dash reflect them.
+                    self.refresh_downloaded();
                     if let DeployOutcome::Oversize(boxed) = outcome {
                         let (req, error) = *boxed;
                         self.deploy_progress = 0;
@@ -6254,9 +6420,13 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
                 KeyCode::Down => {
                     if !self.models.is_empty() {
                         self.model_selected = (self.model_selected + 1).min(self.models.len() - 1);
+                        self.arm_detail_autoload();
                     }
                 }
-                KeyCode::Up => self.model_selected = self.model_selected.saturating_sub(1),
+                KeyCode::Up => {
+                    self.model_selected = self.model_selected.saturating_sub(1);
+                    self.arm_detail_autoload();
+                }
                 KeyCode::PageDown => self.scroll_card(self.card_view_height.max(1) as i64),
                 KeyCode::PageUp => self.scroll_card(-(self.card_view_height.max(1) as i64)),
                 _ => {}
@@ -6861,6 +7031,8 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         }
         let max = self.models.len() as i64 - 1;
         self.model_selected = (self.model_selected as i64 + delta.signum()).clamp(0, max) as usize;
+        // Wheel-scrolling the list follows with the detail card on the right.
+        self.arm_detail_autoload();
     }
 
     fn scroll_runtimes(&mut self, delta: i64) {
@@ -6872,6 +7044,67 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
         self.runtime_selected =
             (self.runtime_selected as i64 + delta.signum()).clamp(0, max) as usize;
     }
+}
+
+/// Load a model's detail card from HF, falling back to one synthesized from
+/// the weights already on disk. The fallback is what lets `/dash`'s Deploy
+/// button work with no network: the downloaded files still yield quant groups
+/// and sizes, which is everything the deploy panel needs.
+async fn fetch_detail_or_offline(
+    hf: Option<HfClient>,
+    models_dir: &std::path::Path,
+    id: &str,
+) -> Result<ModelDetail, LocalCodeError> {
+    let err = match hf {
+        Some(hf) => match hf.model_info(id).await {
+            Ok(detail) => return Ok(detail),
+            Err(e) => e,
+        },
+        None => LocalCodeError::new(ErrorCode::HfUnreachable, "HF client unavailable"),
+    };
+    offline_model_detail(models_dir, id).ok_or(err)
+}
+
+/// Synthesize a [`ModelDetail`] for a model whose weights are in the models
+/// cache: siblings are the on-disk files (with their real sizes, so VRAM fit
+/// prediction still works) and quant groups are rediscovered from the
+/// filenames. Registry-only data (likes, license, card) is absent.
+fn offline_model_detail(models_dir: &std::path::Path, id: &str) -> Option<ModelDetail> {
+    let m = find_downloaded(models_dir, id)?;
+    let siblings: Vec<ModelFile> = m
+        .files
+        .iter()
+        .map(|f| ModelFile {
+            rfilename: f.clone(),
+            size: std::fs::metadata(m.dir.join(f)).ok().map(|md| md.len()),
+        })
+        .collect();
+    let quants = discover_quants(&siblings);
+    Some(ModelDetail {
+        summary: ModelSummary {
+            id: id.to_string(),
+            author: None,
+            pipeline_tag: None,
+            tags: Vec::new(),
+            likes: None,
+            downloads: None,
+            last_modified: None,
+            private: None,
+            gated: None,
+        },
+        siblings,
+        card_data: None,
+        sha: None,
+        card_markdown: Some(format!(
+            "**Offline** — Hugging Face is unreachable, showing the weights \
+             downloaded to `{}`. Deploying uses the local files; no network is \
+             needed.",
+            m.dir.display()
+        )),
+        license: None,
+        parameter_size: None,
+        quants,
+    })
 }
 
 /// Copy `text` to the terminal's clipboard using the OSC 52 escape sequence.
@@ -8510,5 +8743,198 @@ mod tests {
         if let Some(b) = app.busy.take() {
             b.handle.abort();
         }
+    }
+
+    fn summary(id: &str) -> ModelSummary {
+        ModelSummary {
+            id: id.into(),
+            author: None,
+            pipeline_tag: None,
+            tags: vec![],
+            likes: None,
+            downloads: None,
+            last_modified: None,
+            private: None,
+            gated: None,
+        }
+    }
+
+    fn detail_with_quant(id: &str, label: &str, filename: &str) -> ModelDetail {
+        ModelDetail {
+            summary: summary(id),
+            siblings: vec![],
+            card_data: None,
+            sha: None,
+            card_markdown: None,
+            license: None,
+            parameter_size: None,
+            quants: vec![localcode_hf::QuantGroup {
+                label: label.into(),
+                files: vec![localcode_hf::QuantFile {
+                    filename: filename.into(),
+                    size: Some(2048),
+                    quant_label: label.into(),
+                }],
+                total_size: 2048,
+                known: true,
+            }],
+        }
+    }
+
+    /// Scrolling the results list arms the debounced auto-load; once the
+    /// deadline passes with the highlighted model already loaded, it disarms
+    /// without spawning anything.
+    #[test]
+    fn scrolling_models_arms_detail_autoload() {
+        let mut app = test_app();
+        app.mode = Mode::Models;
+        app.models = vec![summary("org/a"), summary("org/b")];
+
+        assert!(app.detail_autoload_at.is_none());
+        app.scroll_list_models(1);
+        assert_eq!(app.model_selected, 1);
+        assert!(
+            app.detail_autoload_at.is_some(),
+            "wheel scroll arms the follow-the-selection load"
+        );
+
+        // Deadline reached but the selected model is already on screen: the
+        // timer disarms without a request (no busy, no in-flight id).
+        app.model_detail = Some(detail_with_quant("org/b", "Q4_K_M", "b-Q4_K_M.gguf"));
+        app.detail_autoload_at = Some(Instant::now());
+        app.maybe_autoload_detail();
+        assert!(app.detail_autoload_at.is_none());
+        assert!(app.busy.is_none());
+        assert!(app.detail_request.is_none());
+    }
+
+    /// A DetailDone for anything but the latest requested id is stale (the
+    /// user scrolled on) and must not replace the pane or clear the in-flight
+    /// marker; the matching id applies normally.
+    #[test]
+    fn stale_detail_results_are_dropped() {
+        let mut app = test_app();
+        app.detail_request = Some("org/current".into());
+
+        app.bg_tx
+            .send(BgMsg::DetailDone {
+                id: "org/old".into(),
+                auto: true,
+                result: Ok(detail_with_quant("org/old", "Q4_K_M", "old.gguf")),
+            })
+            .unwrap();
+        app.process_bg();
+        assert!(app.model_detail.is_none(), "stale result must be dropped");
+        assert_eq!(app.detail_request.as_deref(), Some("org/current"));
+
+        app.bg_tx
+            .send(BgMsg::DetailDone {
+                id: "org/current".into(),
+                auto: true,
+                result: Ok(detail_with_quant("org/current", "Q4_K_M", "cur-Q4_K_M.gguf")),
+            })
+            .unwrap();
+        app.process_bg();
+        assert_eq!(
+            app.model_detail.as_ref().map(|d| d.summary.id.as_str()),
+            Some("org/current")
+        );
+        assert!(app.detail_request.is_none());
+        assert_eq!(app.selected_quant.as_deref(), Some("Q4_K_M"));
+    }
+
+    /// With HF unreachable (no client), the detail card is synthesized from
+    /// the weights on disk: same quant labels and real file sizes, so the
+    /// deploy panel keeps working offline.
+    #[test]
+    fn offline_detail_synthesized_from_downloaded_weights() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path();
+        let dir = models.join(sanitize_model_dir("org/coder-7b"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("coder-Q4_K_M.gguf"), vec![0u8; 2048]).unwrap();
+
+        let detail = rt
+            .block_on(fetch_detail_or_offline(None, models, "org/coder-7b"))
+            .expect("offline synthesis from downloaded weights");
+        assert_eq!(detail.summary.id, "org/coder-7b");
+        assert_eq!(detail.quants.len(), 1);
+        assert_eq!(detail.quants[0].label, "Q4_K_M");
+        assert_eq!(detail.quants[0].total_size, 2048);
+        assert!(detail.card_markdown.unwrap_or_default().contains("Offline"));
+
+        // Nothing on disk for an unknown model: the original error surfaces.
+        assert!(rt
+            .block_on(fetch_detail_or_offline(None, models, "org/absent"))
+            .is_err());
+    }
+
+    /// A quant group is tagged downloaded only when every one of its files is
+    /// on disk; repo subdirectories are matched by bare file name.
+    #[test]
+    fn quant_downloaded_requires_every_file() {
+        let mut app = test_app();
+        app.downloaded_models = vec![DownloadedModel {
+            model_id: "org/coder-7b".into(),
+            dir: PathBuf::from("/models/org_coder-7b"),
+            total_bytes: 2048,
+            quants: vec!["Q4_K_M".into()],
+            files: vec!["coder-Q4_K_M.gguf".into()],
+        }];
+
+        let complete = detail_with_quant("org/coder-7b", "Q4_K_M", "sub/coder-Q4_K_M.gguf");
+        assert!(app.quant_downloaded("org/coder-7b", &complete.quants[0]));
+
+        let mut sharded = detail_with_quant("org/coder-7b", "Q6_K", "coder-Q6_K-00001-of-00002.gguf");
+        sharded.quants[0].files.push(localcode_hf::QuantFile {
+            filename: "coder-Q6_K-00002-of-00002.gguf".into(),
+            size: Some(2048),
+            quant_label: "Q6_K".into(),
+        });
+        assert!(
+            !app.quant_downloaded("org/coder-7b", &sharded.quants[0]),
+            "missing shard means not downloaded"
+        );
+        assert!(!app.quant_downloaded("org/other", &complete.quants[0]));
+    }
+
+    /// When the selected quant's weights are on disk, the deploy request pins
+    /// `local_path` for GGUF-capable backends so no network is touched; vLLM
+    /// keeps resolving the HF id itself.
+    #[test]
+    fn deploy_request_pins_local_path_for_downloaded_quant() {
+        let mut app = test_app();
+        let dir = app.paths.models_cache.join(sanitize_model_dir("org/coder-7b"));
+        app.model_detail = Some(detail_with_quant("org/coder-7b", "Q4_K_M", "coder-Q4_K_M.gguf"));
+        app.selected_quant = Some("Q4_K_M".into());
+        app.downloaded_models = vec![DownloadedModel {
+            model_id: "org/coder-7b".into(),
+            dir: dir.clone(),
+            total_bytes: 2048,
+            quants: vec!["Q4_K_M".into()],
+            files: vec!["coder-Q4_K_M.gguf".into()],
+        }];
+
+        app.deploy_backend = BackendKind::LlamaCpp;
+        let req = app.build_deploy_request(false).expect("deploy request");
+        assert_eq!(
+            req.local_path.as_deref(),
+            Some(dir.join("coder-Q4_K_M.gguf").display().to_string().as_str()),
+            "downloaded quant deploys from the local file"
+        );
+
+        app.deploy_backend = BackendKind::Vllm;
+        let req = app.build_deploy_request(false).expect("deploy request");
+        assert!(req.local_path.is_none(), "vLLM resolves the HF id itself");
+
+        // A quant that is not on disk keeps the download path.
+        app.deploy_backend = BackendKind::LlamaCpp;
+        app.downloaded_models.clear();
+        let req = app.build_deploy_request(false).expect("deploy request");
+        assert!(req.local_path.is_none());
     }
 }

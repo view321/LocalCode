@@ -932,12 +932,15 @@ impl Config {
 
     /// Ordered, de-duplicated HuggingFace web roots to try for weight
     /// downloads: the primary endpoint (honoring the env override) first, then
-    /// configured mirrors, then canonical `huggingface.co` as a last resort.
+    /// configured mirrors, then canonical `huggingface.co`, then the public
+    /// `hf-mirror.com` as a built-in last resort for when huggingface.co is
+    /// unavailable.
     pub fn hf_mirror_hosts(&self) -> Vec<String> {
         let (endpoint, _api) = self.hf_endpoints();
         let mut hosts = vec![endpoint];
         hosts.extend(self.registry.mirrors.iter().cloned());
         hosts.push("https://huggingface.co".to_string());
+        hosts.push("https://hf-mirror.com".to_string());
         let mut seen = std::collections::HashSet::new();
         hosts
             .into_iter()
@@ -1045,11 +1048,27 @@ mod tests {
         assert_eq!(s.tunnel_base_url(), "http://127.0.0.1:21434");
         assert_eq!(s.mirrors.hf_endpoint, "https://hf-mirror.com");
 
-        // Mirror host list is ordered (endpoint first) with HF appended last.
+        // Mirror host list is ordered (endpoint first); the endpoint already
+        // being hf-mirror.com, the built-in fallback dedups away and HF is last.
         let hosts = loaded.hf_mirror_hosts();
         assert_eq!(hosts[0], "https://hf-mirror.com");
         assert_eq!(hosts[1], "https://hf-mirror-2.com");
         assert_eq!(hosts.last().unwrap(), "https://huggingface.co");
+    }
+
+    #[test]
+    fn default_mirror_hosts_fall_back_to_hf_mirror() {
+        // Out of the box (endpoint = huggingface.co, no mirrors configured),
+        // downloads must still have hf-mirror.com to fall back to when
+        // huggingface.co is unreachable.
+        let hosts = Config::default().hf_mirror_hosts();
+        assert_eq!(
+            hosts,
+            vec![
+                "https://huggingface.co".to_string(),
+                "https://hf-mirror.com".to_string(),
+            ]
+        );
     }
 
     #[test]

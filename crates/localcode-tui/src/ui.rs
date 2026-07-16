@@ -1150,7 +1150,7 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(d) = app.model_detail.clone() else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "select a model on the left — Enter loads it",
+                "select a model on the left — it loads as you scroll",
                 theme::muted(&th),
             )))
             .wrap(Wrap { trim: true }),
@@ -1222,6 +1222,12 @@ fn draw_models_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ];
         spans.extend(meter(&th, ratio, 10));
         spans.push(Span::styled(format!(" {fit}"), theme::muted(&th)));
+        if app.quant_downloaded(&d.summary.id, q) {
+            spans.push(Span::styled(
+                " · downloaded",
+                theme::accent(&th).add_modifier(Modifier::BOLD),
+            ));
+        }
         ctrl.push(sel_line(&th, spans, area.width, selected));
     }
     if shown > 0 {
