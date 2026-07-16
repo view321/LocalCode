@@ -38,6 +38,11 @@ pub enum WeightFormat {
     /// Hugging Face transformers checkpoint (safetensors/bin), including AWQ and
     /// GPTQ — served by vLLM / SGLang.
     Transformers,
+    /// Pre-converted colibrì int4 container (`out-*.safetensors` shards, `.qs`
+    /// scales) — served only by the colibrì engines. Checked before the generic
+    /// safetensors rule: these shards ARE .safetensors files, and sending one
+    /// to vLLM crashes at load exactly like GGUF would.
+    ColibriInt4,
     /// Couldn't tell from the label or filenames.
     Unknown,
 }
@@ -47,6 +52,15 @@ pub enum WeightFormat {
 /// metadata. The GGUF label test mirrors `deploy::is_gguf_on_transformers_backend`
 /// so browsing and the deploy-time guard agree on what "GGUF" means.
 pub fn classify_weight_format(quant_label: Option<&str>, weight_files: &[String]) -> WeightFormat {
+    // colibrì shard names first — they end in .safetensors and would otherwise
+    // fall through to Transformers (and from there to a vLLM crash).
+    if weight_files.iter().any(|f| {
+        let l = f.to_lowercase();
+        let name = l.rsplit(['/', '\\']).next().unwrap_or(&l);
+        l.ends_with(".qs") || (name.starts_with("out-") && name.ends_with(".safetensors"))
+    }) {
+        return WeightFormat::ColibriInt4;
+    }
     if weight_files
         .iter()
         .any(|f| f.to_lowercase().ends_with(".gguf"))
@@ -65,10 +79,15 @@ pub fn classify_weight_format(quant_label: Option<&str>, weight_files: &[String]
     match quant_label {
         Some(q) => {
             let u = q.to_uppercase();
+            // "COLIBRI" beats the generic INT4/Q tests below — a colibrì label
+            // like "colibri-int4" contains both.
+            if u.contains("COLIBRI") {
+                WeightFormat::ColibriInt4
+            }
             // GGUF K-quants (Q4_K_M, Q8_0, …) and I-quants (IQ4_XS, …). AWQ/GPTQ/
             // EXL2/FP16/INT8 are transformers-servable labels and don't start
             // with Q/IQ.
-            if u.contains("GGUF") || u.starts_with("IQ") || u.starts_with('Q') {
+            else if u.contains("GGUF") || u.starts_with("IQ") || u.starts_with('Q') {
                 WeightFormat::Gguf
             } else if u.contains("AWQ")
                 || u.contains("GPTQ")
@@ -95,6 +114,10 @@ fn compatible_backends(fmt: WeightFormat) -> &'static [BackendKind] {
     match fmt {
         WeightFormat::Gguf => &[BackendKind::LlamaCpp, BackendKind::Ollama],
         WeightFormat::Transformers => &[BackendKind::Vllm, BackendKind::Sglang],
+        // Upstream is canonical; the Hy3 fork also loads GLM-5.2 containers.
+        // Which engine a specific model needs is decided by
+        // [`recommend_backend_for`] (Hy3 containers only run on the fork).
+        WeightFormat::ColibriInt4 => &[BackendKind::Colibri, BackendKind::ColibriHy3],
         WeightFormat::Unknown => &[],
     }
 }
@@ -125,6 +148,69 @@ pub fn recommend_backend(
             .find(|b| installed.contains(b))
             .copied()
             .unwrap_or(canonical),
+    }
+}
+
+/// Classify with the model id as a fallback signal: a colibrì container
+/// deployed by bare id (no file metadata, no quant label) still routes to the
+/// colibrì engines when the id carries "colibri" plus a family marker
+/// (int4/GLM/Hy3/Hunyuan — so a model merely *named* colibri isn't captured).
+/// Mirrors `deploy::colibri_format_conflict` so browsing and the deploy-time
+/// guard agree.
+pub fn classify_weight_format_for(
+    model_id: &str,
+    quant_label: Option<&str>,
+    weight_files: &[String],
+) -> WeightFormat {
+    let fmt = classify_weight_format(quant_label, weight_files);
+    if fmt == WeightFormat::Unknown && colibri_marked(model_id) {
+        return WeightFormat::ColibriInt4;
+    }
+    fmt
+}
+
+fn colibri_marked(s: &str) -> bool {
+    let l = s.to_lowercase();
+    l.contains("colibri")
+        && (l.contains("int4") || l.contains("glm") || l.contains("hy3") || l.contains("hunyuan"))
+}
+
+/// True when the model is a Tencent Hy3 (`model_type: hy_v3`) container —
+/// those run ONLY on the fork; upstream colibrì has no Hy3 engine.
+fn is_hy3_model(model_id: &str, tags: &[String], card: Option<&str>) -> bool {
+    let hit = |s: &str| {
+        let l = s.to_lowercase();
+        l.contains("hy3") || l.contains("hy_v3") || l.contains("hy-3") || l.contains("hunyuan")
+    };
+    hit(model_id)
+        || tags.iter().any(|t| hit(t))
+        || card.map(hit).unwrap_or(false)
+}
+
+/// [`recommend_backend`] plus the colibrì family split it can't see from the
+/// format alone: Hy3 containers pin the fork; GLM containers prefer upstream
+/// but settle for an installed fork (which serves GLM too) before demanding a
+/// fresh install.
+pub fn recommend_backend_for(
+    fmt: WeightFormat,
+    model_id: &str,
+    tags: &[String],
+    card: Option<&str>,
+    installed: &[BackendKind],
+    fallback: BackendKind,
+) -> BackendKind {
+    if fmt != WeightFormat::ColibriInt4 {
+        return recommend_backend(fmt, installed, fallback);
+    }
+    if is_hy3_model(model_id, tags, card) {
+        return BackendKind::ColibriHy3;
+    }
+    if installed.contains(&BackendKind::Colibri) {
+        BackendKind::Colibri
+    } else if installed.contains(&BackendKind::ColibriHy3) {
+        BackendKind::ColibriHy3
+    } else {
+        BackendKind::Colibri
     }
 }
 
@@ -163,8 +249,16 @@ pub struct DeployPreset {
 /// Derive adequate deploy defaults for a browsed model: the right backend for
 /// its weight format, a fitting context, and the card's recommended flags.
 pub fn recommend_deploy_preset(input: &PresetInput) -> DeployPreset {
-    let fmt = classify_weight_format(input.selected_quant, input.weight_files);
-    let backend = recommend_backend(fmt, input.installed_backends, input.configured_default);
+    let fmt =
+        classify_weight_format_for(input.model_id, input.selected_quant, input.weight_files);
+    let backend = recommend_backend_for(
+        fmt,
+        input.model_id,
+        input.tags,
+        input.card_markdown,
+        input.installed_backends,
+        input.configured_default,
+    );
     preset_for_backend(backend, input)
 }
 
@@ -172,7 +266,8 @@ pub fn recommend_deploy_preset(input: &PresetInput) -> DeployPreset {
 /// skipping the backend recommendation. Used when the user has explicitly picked
 /// a backend but we still want the card's flags and a fitting context for it.
 pub fn preset_for_backend(backend: BackendKind, input: &PresetInput) -> DeployPreset {
-    let fmt = classify_weight_format(input.selected_quant, input.weight_files);
+    let fmt =
+        classify_weight_format_for(input.model_id, input.selected_quant, input.weight_files);
 
     let mut notes = Vec::new();
     match fmt {
@@ -182,6 +277,12 @@ pub fn preset_for_backend(backend: BackendKind, input: &PresetInput) -> DeployPr
         WeightFormat::Transformers => {
             notes.push(format!(
                 "safetensors checkpoint → {} backend",
+                backend.as_str()
+            ));
+        }
+        WeightFormat::ColibriInt4 => {
+            notes.push(format!(
+                "colibrì int4 container → {} backend",
                 backend.as_str()
             ));
         }
@@ -211,11 +312,17 @@ pub fn preset_for_backend(backend: BackendKind, input: &PresetInput) -> DeployPr
     // Context: card recommendation (already in hints) → native context stated in
     // the card prose or the model name → leave the default alone. Only the upper
     // bound is clamped: an explicit small max (e.g. a 4k model) must be respected,
-    // not raised past the model's real limit.
-    let desired_context = hints
-        .context_length
-        .or_else(|| parse_native_context(input.card_markdown, input.model_id, input.tags))
-        .map(|c| c.clamp(512, MAX_PRESET_CTX));
+    // not raised past the model's real limit. colibrì sizes its own KV slots and
+    // takes no context flag, so no context is presented for it.
+    let desired_context = if matches!(backend, BackendKind::Colibri | BackendKind::ColibriHy3) {
+        notes.push("colibrì manages its own KV slots (no context flag)".into());
+        None
+    } else {
+        hints
+            .context_length
+            .or_else(|| parse_native_context(input.card_markdown, input.model_id, input.tags))
+            .map(|c| c.clamp(512, MAX_PRESET_CTX))
+    };
     if let Some(c) = desired_context {
         if !notes.iter().any(|n| n.contains("context")) {
             notes.push(format!("context {c} (model native)"));
@@ -483,6 +590,133 @@ vllm serve org/m --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remo
         };
         let p = recommend_deploy_preset(&input);
         assert_eq!(p.desired_context, Some(4096));
+    }
+
+    #[test]
+    fn colibri_container_classified_from_shard_names() {
+        // out-*.safetensors is a colibrì shard, NOT a transformers checkpoint —
+        // misreading it sends a 744B container to vLLM.
+        assert_eq!(
+            classify_weight_format(None, &s(&["out-00001.safetensors", "out-mtp-0.safetensors"])),
+            WeightFormat::ColibriInt4
+        );
+        assert_eq!(
+            classify_weight_format(None, &s(&["out-00001.safetensors", "scales.qs"])),
+            WeightFormat::ColibriInt4
+        );
+        // Regular sharded checkpoints stay Transformers.
+        assert_eq!(
+            classify_weight_format(None, &s(&["model-00001-of-00002.safetensors"])),
+            WeightFormat::Transformers
+        );
+    }
+
+    #[test]
+    fn colibri_label_beats_int4_and_q_rules() {
+        assert_eq!(
+            classify_weight_format(Some("colibri-int4"), &[]),
+            WeightFormat::ColibriInt4
+        );
+        // Plain INT4 (no colibri) is still a transformers label.
+        assert_eq!(classify_weight_format(Some("INT4"), &[]), WeightFormat::Transformers);
+    }
+
+    #[test]
+    fn colibri_model_id_fallback_needs_family_marker() {
+        // Bare id deploy (no files, no label): a marked id routes to colibrì…
+        assert_eq!(
+            classify_weight_format_for("mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp", None, &[]),
+            WeightFormat::ColibriInt4
+        );
+        // …but a model merely named colibri does not.
+        assert_eq!(
+            classify_weight_format_for("someone/colibri-7b-instruct", None, &[]),
+            WeightFormat::Unknown
+        );
+        // File metadata always wins over the id.
+        assert_eq!(
+            classify_weight_format_for("someone/colibri-glm-thing", Some("Q4_K_M"), &s(&["m.gguf"])),
+            WeightFormat::Gguf
+        );
+    }
+
+    #[test]
+    fn hy3_containers_pin_the_fork() {
+        // Hy3 runs ONLY on colibri-hy3 — even when upstream is the one installed.
+        assert_eq!(
+            recommend_backend_for(
+                WeightFormat::ColibriInt4,
+                "UnderstandLing/Hy3-colibri-int4",
+                &[],
+                None,
+                &[BackendKind::Colibri],
+                BackendKind::Ollama,
+            ),
+            BackendKind::ColibriHy3
+        );
+    }
+
+    #[test]
+    fn glm_containers_prefer_upstream_but_accept_installed_fork() {
+        let glm = "mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp";
+        // Nothing installed → canonical upstream (drives the install prompt).
+        assert_eq!(
+            recommend_backend_for(WeightFormat::ColibriInt4, glm, &[], None, &[], BackendKind::Ollama),
+            BackendKind::Colibri
+        );
+        // Only the fork installed → use it (it serves GLM-5.2 too).
+        assert_eq!(
+            recommend_backend_for(
+                WeightFormat::ColibriInt4,
+                glm,
+                &[],
+                None,
+                &[BackendKind::ColibriHy3],
+                BackendKind::Ollama,
+            ),
+            BackendKind::ColibriHy3
+        );
+    }
+
+    #[test]
+    fn colibri_preset_routes_and_reads_tier_flags_from_card() {
+        let card = r#"
+# Hy3 colibrì
+```bash
+COLI_MODEL=/path/to/hy3_i4 ./coli serve --ram 12 --gpu 0 --vram 14 --host 127.0.0.1 --port 8000
+```
+"#;
+        let files = s(&["out-00001.safetensors"]);
+        let input = PresetInput {
+            model_id: "UnderstandLing/Hy3-colibri-int4",
+            selected_quant: None,
+            weight_files: &files,
+            tags: &[],
+            card_markdown: Some(card),
+            installed_backends: &[BackendKind::ColibriHy3],
+            configured_default: BackendKind::Ollama,
+            has_gpu: true,
+        };
+        let p = recommend_deploy_preset(&input);
+        assert_eq!(p.backend, BackendKind::ColibriHy3);
+        // coli sizes its own KV slots; no context is presented.
+        assert_eq!(p.desired_context, None);
+        // The card's tier flags ride through extra_args.
+        let ram_pos = p.tuning.extra_args.iter().position(|a| a == "--ram");
+        assert!(ram_pos.is_some(), "extra_args: {:?}", p.tuning.extra_args);
+        assert_eq!(p.tuning.extra_args[ram_pos.unwrap() + 1], "12");
+        // llama.cpp's offload-all default must not leak onto colibrì.
+        assert_eq!(p.tuning.gpu_layers, None);
+    }
+
+    #[test]
+    fn backend_supports_colibri_matrix() {
+        assert!(backend_supports(BackendKind::Colibri, WeightFormat::ColibriInt4));
+        assert!(backend_supports(BackendKind::ColibriHy3, WeightFormat::ColibriInt4));
+        assert!(!backend_supports(BackendKind::Vllm, WeightFormat::ColibriInt4));
+        assert!(!backend_supports(BackendKind::LlamaCpp, WeightFormat::ColibriInt4));
+        assert!(!backend_supports(BackendKind::Colibri, WeightFormat::Gguf));
+        assert!(!backend_supports(BackendKind::ColibriHy3, WeightFormat::Transformers));
     }
 
     #[test]

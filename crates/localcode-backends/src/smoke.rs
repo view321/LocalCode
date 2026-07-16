@@ -69,6 +69,12 @@ pub async fn smoke_test(report: &DetectReport, cfg: &Config) -> SmokeReport {
         }
         BackendKind::Ollama => ollama_probe(cfg).await,
         BackendKind::LlamaCpp => llamacpp_probe(report, cfg).await,
+        BackendKind::Colibri => {
+            colibri_probe(report, &cfg.backends.colibri.bin, BackendKind::Colibri).await
+        }
+        BackendKind::ColibriHy3 => {
+            colibri_probe(report, &cfg.backends.colibri_hy3.bin, BackendKind::ColibriHy3).await
+        }
     }
 }
 
@@ -148,6 +154,34 @@ async fn llamacpp_probe(report: &DetectReport, cfg: &Config) -> SmokeReport {
         }
         Ok(Err(e)) => SmokeReport::fail(BackendKind::LlamaCpp, checked, e.to_string()),
         Err(_) => SmokeReport::fail(BackendKind::LlamaCpp, checked, "process timed out".into()),
+    }
+}
+
+/// `coli --help` proves the binary runs at all — catching a missing libgomp
+/// (OpenMP) or an AVX build on a non-AVX CPU (SIGILL) without loading a model.
+async fn colibri_probe(report: &DetectReport, cfg_bin: &str, kind: BackendKind) -> SmokeReport {
+    let bin = report
+        .binary_path
+        .clone()
+        .unwrap_or_else(|| cfg_bin.to_string());
+    let checked = format!("{bin} --help");
+    let run = tokio::process::Command::new(&bin)
+        .arg("--help")
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match tokio::time::timeout(PROBE_TIMEOUT, run).await {
+        Ok(Ok(out)) if out.status.success() => SmokeReport::ok(kind, checked),
+        Ok(Ok(out)) => {
+            // Loader errors and SIGILL notes land on either stream.
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            SmokeReport::fail(kind, checked, tail_of(&combined, 40))
+        }
+        Ok(Err(e)) => SmokeReport::fail(kind, checked, e.to_string()),
+        Err(_) => SmokeReport::fail(kind, checked, "process timed out".into()),
     }
 }
 

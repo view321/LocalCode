@@ -45,6 +45,10 @@ impl RemoteSession {
     }
 
     pub async fn close(self) {
+        // Free the remote GPU first: unload the models the remote Ollama still
+        // holds in VRAM. Closing the tunnel alone leaves them resident on the
+        // remote box — the remote analog of killing only the local launcher.
+        provision::free_gpu_memory(&self.ssh).await;
         self.ssh.close().await;
     }
 }

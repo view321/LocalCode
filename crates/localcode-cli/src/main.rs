@@ -1,15 +1,19 @@
 //! LocalCode CLI entrypoint.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use localcode_agent::{AgentEvent, AgentSession, CodingAgent};
 use localcode_backends::{BackendKind, BackendRegistry, DeployRequest, DeployService};
-use localcode_core::config::Config;
+use localcode_core::config::{ApprovalMode, Config};
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_core::events::EventBus;
 use localcode_core::paths::AppPaths;
+use localcode_core::runtime::{ActiveRuntime, RuntimeKind, RuntimeStatus};
 use localcode_gpu::discover;
 use localcode_hf::HfClient;
 use localcode_tui::{run_doctor, run_tui};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -23,6 +27,11 @@ struct Cli {
 enum Commands {
     /// Launch the terminal UI (default)
     Tui,
+    /// Coding-agent commands (headless, non-interactive)
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// Run environment diagnostics
     Doctor {
         /// Emit JSON
@@ -116,6 +125,76 @@ enum BenchCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AgentCmd {
+    /// Run the coding agent for one turn: a prompt in, the answer out.
+    ///
+    /// Streams the model's reply to stdout and tool activity to stderr, so
+    /// `localcode agent run "…" > out.txt` captures just the answer. Exits
+    /// non-zero if the turn fails.
+    #[command(visible_alias = "exec")]
+    Run {
+        /// Prompt for the agent. Omit (or pass "-") to read it from stdin.
+        prompt: Option<String>,
+        /// Workspace root the agent operates in
+        /// (default: agent.workspace_root, else the current directory).
+        #[arg(long, short = 'C')]
+        workspace: Option<String>,
+        /// OpenAI-compatible base URL to run against — e.g. a running vLLM,
+        /// Ollama, or llama.cpp server (http://host:port/v1). Skips runtime
+        /// auto-resolution (local assistant / cloud fallback).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Model id to request. Required with --base-url when the server does
+        /// not have a single default model (Ollama, vLLM multi-model, …).
+        #[arg(long)]
+        model: Option<String>,
+        /// Bearer API key for --base-url (defaults to the assistant provider key).
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Approval ceiling for tool calls. With no interactive prompt available,
+        /// any call this mode would ask about is declined instead. Pass
+        /// `--approvals always` for fully unattended runs.
+        #[arg(long, visible_alias = "approval", value_enum)]
+        approvals: Option<ApprovalArg>,
+        /// Auto-approve every tool call (same as --approvals always). Lets the
+        /// agent write files and run shell commands unattended — use with care.
+        #[arg(long)]
+        yes: bool,
+        /// Emit newline-delimited JSON events (deltas, tool calls, final) on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Print only the final answer — suppress streamed tokens and tool activity.
+        #[arg(long, short = 'q')]
+        quiet: bool,
+    },
+}
+
+/// Approval ceiling for a headless run. Mirrors [`ApprovalMode`]; with no
+/// interactive approver present, calls the mode would prompt for are declined.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ApprovalArg {
+    /// Never ask — run every tool call, destructive shell included.
+    Always,
+    /// Decline only destructive shell commands; reads, writes, and safe shell run.
+    Auto,
+    /// Decline every workspace mutation (writes, edits, shell); reads run.
+    Edits,
+    /// Decline every tool call — the agent answers from the prompt alone.
+    Ask,
+}
+
+impl From<ApprovalArg> for ApprovalMode {
+    fn from(a: ApprovalArg) -> Self {
+        match a {
+            ApprovalArg::Always => ApprovalMode::AlwaysApprove,
+            ApprovalArg::Auto => ApprovalMode::Auto,
+            ApprovalArg::Edits => ApprovalMode::ApproveEdits,
+            ApprovalArg::Ask => ApprovalMode::AskPermission,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = real_main().await {
@@ -140,16 +219,43 @@ async fn real_main() -> Result<(), LocalCodeError> {
     let config = Config::load(&paths)?;
 
     let command = cli.command.unwrap_or(Commands::Tui);
-    // In TUI mode logs go to file only — a stderr layer would write straight
-    // over the raw-mode alternate screen and corrupt the display.
-    let is_tui = matches!(command, Commands::Tui);
-    let _log_guard = localcode_log::init(&paths, &config.logging, !is_tui)?;
+    // The TUI and headless `agent run` keep the terminal for their own output —
+    // a stderr log layer would corrupt the TUI's alternate screen and pollute
+    // the headless answer/JSON stream, so both log to file only.
+    let clean_output = matches!(command, Commands::Tui | Commands::Agent { .. });
+    let _log_guard = localcode_log::init(&paths, &config.logging, !clean_output)?;
 
     match command {
         Commands::Tui => {
             info!("launching TUI");
             run_tui(paths, config).await
         }
+        Commands::Agent { cmd } => match cmd {
+            AgentCmd::Run {
+                prompt,
+                workspace,
+                base_url,
+                model,
+                api_key,
+                approvals,
+                yes,
+                json,
+                quiet,
+            } => {
+                let args = RunArgs {
+                    prompt,
+                    workspace,
+                    base_url,
+                    model,
+                    api_key,
+                    approval: approvals,
+                    yes,
+                    json,
+                    quiet,
+                };
+                run_headless(paths, config, args).await
+            }
+        },
         Commands::Doctor { json } => {
             let report = run_doctor(&paths, &config).await;
             if json {
@@ -332,6 +438,239 @@ async fn real_main() -> Result<(), LocalCodeError> {
         },
         Commands::Update { check } => run_update(&config, check).await,
         Commands::Setup { skip_llama } => run_setup(paths, config, skip_llama).await,
+    }
+}
+
+/// Parsed flags for [`run_headless`].
+struct RunArgs {
+    prompt: Option<String>,
+    workspace: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    approval: Option<ApprovalArg>,
+    yes: bool,
+    json: bool,
+    quiet: bool,
+}
+
+/// Run the coding agent for a single turn without the TUI.
+///
+/// Resolves a runtime (explicit `--base-url` → local Bonsai assistant → cloud
+/// fallback), runs one turn, streams tokens to stdout and tool activity to
+/// stderr (or newline-delimited JSON to stdout with `--json`), and returns the
+/// turn's error as the process exit status.
+async fn run_headless(
+    paths: AppPaths,
+    config: Config,
+    args: RunArgs,
+) -> Result<(), LocalCodeError> {
+    // Prompt: positional argument, or stdin when omitted / given as "-".
+    let prompt = match args.prompt.as_deref() {
+        Some(p) if p != "-" => p.to_string(),
+        _ => std::io::read_to_string(std::io::stdin()).map_err(|e| {
+            LocalCodeError::new(ErrorCode::Internal, format!("Failed to read prompt from stdin: {e}"))
+        })?,
+    };
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err(LocalCodeError::new(
+            ErrorCode::AgentToolFailed,
+            "No prompt provided",
+        )
+        .with_hint("Pass a prompt argument (localcode agent run \"…\") or pipe one on stdin"));
+    }
+
+    // Workspace: flag → config → current directory (matches the TUI).
+    let workspace = args
+        .workspace
+        .clone()
+        .map(PathBuf::from)
+        .or_else(|| config.agent.workspace_root.clone().map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // Approval mode: --yes wins, else the explicit --approvals, else inherit config.
+    let mut agent_cfg = config.agent.clone();
+    let mode = if args.yes {
+        Some(ApprovalMode::AlwaysApprove)
+    } else {
+        args.approval.map(ApprovalMode::from)
+    };
+    if let Some(m) = mode {
+        agent_cfg.approval_mode = m;
+        // Keep the legacy "confirm_destructive_tools=false" override from
+        // silently forcing AlwaysApprove past an explicit choice here.
+        agent_cfg.confirm_destructive_tools = m != ApprovalMode::AlwaysApprove;
+    }
+
+    let runtime = resolve_headless_runtime(&config, &paths, &args).await?;
+
+    // No model-management tools in headless (they need the TUI's live registry);
+    // wire HF so the model-catalogue tools still work.
+    let mut agent = CodingAgent::new(agent_cfg);
+    if let Ok(hf) = HfClient::new(&config.registry, config.hf_token(), paths.models_cache.clone()) {
+        agent = agent.with_hf(Arc::new(hf));
+    }
+
+    let mut session = AgentSession::new(workspace);
+
+    // Live events flow through their own channel to a printer task so tokens
+    // stream as they arrive; the task exits when the turn drops the sender.
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let json = args.json;
+    let quiet = args.quiet;
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = ev_rx.recv().await {
+            print_event(&ev, json, quiet);
+        }
+    });
+
+    let api_key = runtime.api_key.clone();
+    let result = agent
+        .run_turn(
+            &mut session,
+            &prompt,
+            &runtime,
+            api_key.as_deref(),
+            None, // no interactive approver: gated calls are declined
+            Some(&ev_tx),
+        )
+        .await;
+    drop(ev_tx);
+    let _ = printer.await;
+
+    match result {
+        Ok(final_text) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "type": "final", "text": final_text })
+                );
+            } else if quiet {
+                println!("{final_text}");
+            } else {
+                // Tokens already streamed to stdout; end with a newline.
+                println!();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "error",
+                        "code": e.code.to_string(),
+                        "message": e.message,
+                    })
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Pick the runtime a headless run talks to. Priority: an explicit
+/// `--base-url` endpoint, then the installed local Bonsai assistant, then the
+/// configured cloud assistant provider.
+async fn resolve_headless_runtime(
+    config: &Config,
+    paths: &AppPaths,
+    args: &RunArgs,
+) -> Result<ActiveRuntime, LocalCodeError> {
+    // 1. Explicit OpenAI-compatible endpoint.
+    if let Some(base) = &args.base_url {
+        let mut r =
+            ActiveRuntime::new("headless-endpoint", RuntimeKind::OpenAiCompatible, base.clone());
+        r.model_id = args.model.clone();
+        r.api_key = args.api_key.clone().or_else(|| config.assistant_api_key());
+        r.status = RuntimeStatus::Healthy;
+        return Ok(r);
+    }
+
+    // 2. Local Bonsai assistant, when its weights are installed. `ensure_running`
+    //    reuses a healthy server or spawns one; on failure we fall through.
+    if localcode_assistant::model_installed(paths) {
+        match localcode_assistant::ensure_running(config, paths).await {
+            Ok(rt) => {
+                let mut r = rt.as_active_runtime();
+                if let Some(m) = &args.model {
+                    r.model_id = Some(m.clone());
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e.message, "local assistant unavailable; trying cloud fallback");
+            }
+        }
+    }
+
+    // 3. Cloud assistant provider (needs an API key).
+    if let Some(key) = config.assistant_api_key() {
+        let mut r = ActiveRuntime::new(
+            "assistant-provider",
+            RuntimeKind::OpenAiCompatible,
+            config.assistant.base_url.clone(),
+        );
+        r.model_id = Some(args.model.clone().unwrap_or_else(|| {
+            if config.assistant.model.is_empty() {
+                "openai/gpt-4o-mini".into()
+            } else {
+                config.assistant.model.clone()
+            }
+        }));
+        r.api_key = Some(key);
+        r.status = RuntimeStatus::Healthy;
+        return Ok(r);
+    }
+
+    Err(
+        LocalCodeError::new(ErrorCode::BackendNotReady, "No runtime available for a headless run")
+            .with_hint("Pass --base-url <endpoint> to target a running vLLM/Ollama/llama.cpp server")
+            .with_hint("or install the local assistant (localcode setup, then /assistant install in the TUI)")
+            .with_hint("or set the assistant provider API key for a cloud fallback"),
+    )
+}
+
+/// Render one [`AgentEvent`] for a headless run. In `json` mode every event is
+/// a JSON line on stdout; otherwise model text streams to stdout and tool
+/// activity goes to stderr (so a redirected stdout captures only the answer).
+/// `quiet` suppresses everything but the final answer (printed by the caller).
+fn print_event(ev: &AgentEvent, json: bool, quiet: bool) {
+    use std::io::Write;
+    if json {
+        let v = match ev {
+            AgentEvent::Delta(t) => serde_json::json!({ "type": "delta", "text": t }),
+            AgentEvent::ThinkingDelta(t) => serde_json::json!({ "type": "thinking", "text": t }),
+            AgentEvent::MessageComplete => serde_json::json!({ "type": "message_complete" }),
+            AgentEvent::ToolStarted { name, args_preview } => {
+                serde_json::json!({ "type": "tool_started", "name": name, "args": args_preview })
+            }
+            AgentEvent::ToolFinished { name, ok, summary, .. } => serde_json::json!({
+                "type": "tool_finished", "name": name, "ok": ok, "summary": summary,
+            }),
+        };
+        println!("{v}");
+        return;
+    }
+    if quiet {
+        return;
+    }
+    match ev {
+        AgentEvent::Delta(t) => {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{t}");
+            let _ = out.flush();
+        }
+        // Reasoning and message boundaries are noise on a plain stream.
+        AgentEvent::ThinkingDelta(_) | AgentEvent::MessageComplete => {}
+        AgentEvent::ToolStarted { name, args_preview } => {
+            eprintln!("  ▶ {name} {args_preview}");
+        }
+        AgentEvent::ToolFinished { name, ok, summary, .. } => {
+            let mark = if *ok { "✓" } else { "✗" };
+            eprintln!("  {mark} {name} — {summary}");
+        }
     }
 }
 

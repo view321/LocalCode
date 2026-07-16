@@ -1,5 +1,6 @@
 //! Local inference backend adapters.
 
+mod colibri;
 mod deploy;
 mod diagnose;
 mod install;
@@ -28,12 +29,14 @@ pub use monitor::{
     DashSnapshot, ModelMonitor, ModelMonitors, ProcState, DASH_LOG_CAP,
 };
 pub use install::{
-    can_elevate_noninteractively, ensure_llamacpp_installed, llamacpp_managed_dir,
-    resolve_install_plan, resolve_llamacpp_bin, resolve_prism_llamacpp_bin, resolve_repair,
-    run_install, run_repair, InstallPlan, InstallStep, RepairPlan, Repoint,
+    can_elevate_noninteractively, colibri_managed_dir, ensure_llamacpp_installed,
+    llamacpp_managed_dir, resolve_colibri_bin, resolve_install_plan, resolve_llamacpp_bin,
+    resolve_prism_llamacpp_bin, resolve_repair, run_install, run_repair, InstallPlan, InstallStep,
+    RepairPlan, Repoint,
 };
 pub use registry::BackendRegistry;
 pub use smoke::{smoke_test, SmokeReport};
+pub use colibri::ColibriBackend;
 pub use ollama::OllamaBackend;
 pub use llamacpp::LlamaCppBackend;
 pub use vllm::VllmBackend;
@@ -57,6 +60,11 @@ pub enum BackendKind {
     LlamaCpp,
     Vllm,
     Sglang,
+    /// Colibrì — GLM-5.2 expert-streaming engine (github.com/JustVugg/colibri).
+    Colibri,
+    /// Colibrì × Hy3 fork (github.com/ErikTromp/colibri-hy3) — Tencent Hy3
+    /// (`model_type: hy_v3`); also serves GLM-5.2 containers.
+    ColibriHy3,
 }
 
 impl BackendKind {
@@ -66,6 +74,8 @@ impl BackendKind {
             Self::LlamaCpp => "llamacpp",
             Self::Vllm => "vllm",
             Self::Sglang => "sglang",
+            Self::Colibri => "colibri",
+            Self::ColibriHy3 => "colibri-hy3",
         }
     }
 
@@ -75,6 +85,8 @@ impl BackendKind {
             "llamacpp" | "llama.cpp" | "llama_cpp" => Some(Self::LlamaCpp),
             "vllm" => Some(Self::Vllm),
             "sglang" => Some(Self::Sglang),
+            "colibri" | "coli" => Some(Self::Colibri),
+            "colibri-hy3" | "colibri_hy3" | "colibrihy3" | "hy3" => Some(Self::ColibriHy3),
             _ => None,
         }
     }
@@ -85,6 +97,8 @@ impl BackendKind {
             Self::LlamaCpp => RuntimeKind::LlamaCpp,
             Self::Vllm => RuntimeKind::Vllm,
             Self::Sglang => RuntimeKind::Sglang,
+            Self::Colibri => RuntimeKind::Colibri,
+            Self::ColibriHy3 => RuntimeKind::ColibriHy3,
         }
     }
 
@@ -94,6 +108,8 @@ impl BackendKind {
             RuntimeKind::LlamaCpp => Some(Self::LlamaCpp),
             RuntimeKind::Vllm => Some(Self::Vllm),
             RuntimeKind::Sglang => Some(Self::Sglang),
+            RuntimeKind::Colibri => Some(Self::Colibri),
+            RuntimeKind::ColibriHy3 => Some(Self::ColibriHy3),
             _ => None,
         }
     }

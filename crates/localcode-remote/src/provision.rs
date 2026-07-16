@@ -4,6 +4,7 @@
 use localcode_core::config::RemoteServer;
 use localcode_core::error::{ErrorCode, LocalCodeError};
 use localcode_gpu::{parse_nvidia_smi_csv, GpuInventory, NVIDIA_SMI_QUERY_ARGS};
+use tracing::debug;
 
 use crate::ssh::SshClient;
 
@@ -55,6 +56,13 @@ pub fn ollama_serve_command(hf_endpoint: &str, port: u16) -> String {
     }
     // Detach so the serve outlives our exec channel.
     format!("sh -lc 'nohup env {env}ollama serve >/tmp/localcode-ollama.log 2>&1 & echo started'")
+}
+
+/// Command that evicts a single model from the remote Ollama's memory, freeing
+/// the VRAM it held. `ollama serve` stays up (it's a shared service) — only the
+/// model is unloaded.
+pub fn ollama_stop_command(model: &str) -> String {
+    format!("ollama stop {}", shell_single_quote(model))
 }
 
 /// Single-quote a string for POSIX `sh` (wrap in quotes, escape embedded ').
@@ -124,6 +132,13 @@ fn parse_ollama_list(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse `ollama ps` (models currently resident in memory) into their tags.
+/// Same table shape as `ollama list` — a header row then one model per line with
+/// the tag in the first column — so it shares the parser.
+fn parse_ollama_ps(stdout: &str) -> Vec<String> {
+    parse_ollama_list(stdout)
+}
+
 /// Ensure Ollama is installed and serving on the remote. `log` receives
 /// human-readable progress lines. Installs from the first working mirror.
 pub async fn ensure_ollama(
@@ -160,6 +175,23 @@ pub async fn ensure_ollama(
     }
     log("Ollama is serving".into());
     Ok(())
+}
+
+/// Best-effort: unload every model the remote Ollama currently holds in VRAM so
+/// stopping/disconnecting actually frees the remote GPU. `ollama ps` lists only
+/// models resident in memory, so an idle box is a no-op. This is the remote
+/// analog of the local stop path — closing the tunnel alone leaves the model
+/// loaded on the remote GPU. Errors are swallowed: a stop must never hang or
+/// fail on a flaky remote.
+pub async fn free_gpu_memory(ssh: &SshClient) {
+    let loaded = match ssh.exec("ollama ps").await {
+        Ok(o) if o.ok() => parse_ollama_ps(&o.stdout),
+        _ => return,
+    };
+    for model in loaded {
+        debug!(%model, "unloading remote Ollama model to free VRAM");
+        let _ = ssh.exec(&ollama_stop_command(&model)).await;
+    }
 }
 
 /// Try each configured installer mirror until one succeeds.
@@ -262,6 +294,30 @@ mod tests {
     fn parse_ollama_list_skips_header() {
         let out = "NAME\tID\tSIZE\nqwen2.5-coder:7b\tabc\t4GB\nllama3:8b\tdef\t5GB\n";
         assert_eq!(parse_ollama_list(out), vec!["qwen2.5-coder:7b", "llama3:8b"]);
+    }
+
+    #[test]
+    fn parse_ollama_ps_takes_the_name_column() {
+        // `ollama ps` has extra columns (PROCESSOR "100% GPU", UNTIL); the model
+        // tag must come from the first column, not a later token.
+        let out = "NAME                ID      SIZE      PROCESSOR    UNTIL\n\
+                   qwen2.5-coder:7b    abc123  6.0 GB    100% GPU     4 minutes from now\n";
+        assert_eq!(parse_ollama_ps(out), vec!["qwen2.5-coder:7b"]);
+    }
+
+    #[test]
+    fn parse_ollama_ps_empty_when_nothing_loaded() {
+        // Header only (or nothing) → no models to unload.
+        assert!(parse_ollama_ps("NAME    ID    SIZE    PROCESSOR    UNTIL\n").is_empty());
+        assert!(parse_ollama_ps("").is_empty());
+    }
+
+    #[test]
+    fn ollama_stop_command_quotes_the_model() {
+        assert_eq!(
+            ollama_stop_command("qwen2.5-coder:7b"),
+            "ollama stop 'qwen2.5-coder:7b'"
+        );
     }
 
     #[test]

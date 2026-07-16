@@ -9,6 +9,8 @@ pub enum RuntimeKind {
     LlamaCpp,
     Vllm,
     Sglang,
+    Colibri,
+    ColibriHy3,
     CloudRunpod,
     CloudVast,
     CloudAkash,

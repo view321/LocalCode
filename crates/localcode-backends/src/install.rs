@@ -50,6 +50,15 @@ pub enum InstallStep {
     /// Bonsai model card (`git clone` → `cmake -B build [-DGGML_CUDA=ON]` →
     /// `cmake --build build -j`). Preferred when `git` and `cmake` are on PATH.
     BuildPrismLlamaCpp { dest_dir: PathBuf, display: String },
+    /// Clone + build a colibrì engine from source (`git clone` → `cd c` →
+    /// `setup.sh` / `make`), then repoint the backend at the built `coli`
+    /// binary. `kind` picks the repo: upstream colibrì (GLM-5.2) or the Hy3
+    /// fork.
+    BuildColibri {
+        kind: BackendKind,
+        dest_dir: PathBuf,
+        display: String,
+    },
 }
 
 impl InstallStep {
@@ -93,6 +102,7 @@ impl InstallStep {
             InstallStep::Sudo { display, .. } => display.clone(),
             InstallStep::FetchLlamaCpp { display, .. } => display.clone(),
             InstallStep::BuildPrismLlamaCpp { display, .. } => display.clone(),
+            InstallStep::BuildColibri { display, .. } => display.clone(),
         }
     }
 }
@@ -138,18 +148,23 @@ impl InstallPlan {
 
 /// Resolve an install plan. Pure: OS, tool availability (`has`), and whether
 /// Python is already present are injected, so it's fully unit-testable.
+/// `managed_dir` is the app-managed install tree for the backend being planned
+/// (llama.cpp fetch/build and colibrì source builds land there).
 pub fn install_plan(
     kind: BackendKind,
     os: &str,
     has: &dyn Fn(&str) -> bool,
     has_python: bool,
-    llamacpp_dir: &Path,
+    managed_dir: &Path,
 ) -> InstallPlan {
     match kind {
         BackendKind::Ollama => ollama_plan(os, has),
-        BackendKind::LlamaCpp => llamacpp_plan(os, has, llamacpp_dir),
+        BackendKind::LlamaCpp => llamacpp_plan(os, has, managed_dir),
         BackendKind::Vllm => pip_backend_plan("vllm", os, has, has_python),
         BackendKind::Sglang => pip_backend_plan("sglang[all]", os, has, has_python),
+        BackendKind::Colibri | BackendKind::ColibriHy3 => {
+            colibri_plan(kind, os, has, managed_dir)
+        }
     }
 }
 
@@ -286,6 +301,85 @@ fn llamacpp_plan(os: &str, has: &dyn Fn(&str) -> bool, dest_dir: &Path) -> Insta
     }
 }
 
+/// Colibrì engines install by source build only — no releases, no packages.
+/// Upstream (GLM-5.2) documents Linux, macOS, and native Windows via MinGW;
+/// the Hy3 fork documents Linux/WSL. Where the toolchain (or the platform)
+/// isn't there, the plan is honest copy-paste steps.
+fn colibri_plan(
+    kind: BackendKind,
+    os: &str,
+    has: &dyn Fn(&str) -> bool,
+    dest_dir: &Path,
+) -> InstallPlan {
+    let (repo, engine) = match kind {
+        BackendKind::ColibriHy3 => ("https://github.com/ErikTromp/colibri-hy3", "Hy3"),
+        _ => ("https://github.com/JustVugg/colibri", "GLM-5.2"),
+    };
+    let has_cc = has("gcc") || has("cc") || has("clang");
+    let build_step = |cuda: bool| {
+        InstallStep::BuildColibri {
+            kind,
+            dest_dir: dest_dir.to_path_buf(),
+            display: format!(
+                "Build colibrì ({engine} engine) from {repo}{} → {}",
+                if cuda { " with CUDA" } else { "" },
+                dest_dir.display()
+            ),
+        }
+    };
+
+    match os {
+        // Fork README: Linux (native ext4) / WSL. Build = clone + `cd c && setup.sh`.
+        "linux" if has("git") && has_cc => {
+            InstallPlan::automated(vec![build_step(has("nvcc"))])
+        }
+        // Upstream additionally documents macOS (Metal) and native Windows
+        // (MinGW-w64: gcc + make). The fork doesn't — keep those manual for it.
+        "macos" if kind == BackendKind::Colibri && has("git") && has_cc => {
+            InstallPlan::automated(vec![build_step(false)])
+        }
+        "windows" if kind == BackendKind::Colibri && has("git") && has("gcc") && has("make") => {
+            InstallPlan::automated(vec![build_step(false)])
+        }
+        "windows" if kind == BackendKind::Colibri => InstallPlan::Manual {
+            summary: "Building colibrì on Windows needs git plus MinGW-w64 (gcc + make).".into(),
+            steps: vec![
+                "Install MinGW-w64 (winlibs.com or MSYS2) so `gcc` and `make` are on PATH".into(),
+                format!("git clone {repo} && cd colibri/c"),
+                "make glm.exe   # add ARCH=native for AVX-VNNI".into(),
+                "Point backends.colibri.bin at the built binary — or use WSL2".into(),
+            ],
+            url: repo.into(),
+        },
+        "windows" | "macos" if kind == BackendKind::ColibriHy3 => InstallPlan::Manual {
+            summary: "The colibrì Hy3 fork documents Linux / WSL only.".into(),
+            steps: vec![
+                "In WSL2 (or a Linux host):".into(),
+                format!("git clone {repo} && cd colibri-hy3/c"),
+                "./setup.sh   # checks gcc/OpenMP, builds, self-tests".into(),
+                "make hy3 CUDA=1   # optional GPU build (needs nvcc)".into(),
+                "Point backends.colibri_hy3.bin at the built `coli`".into(),
+            ],
+            url: repo.into(),
+        },
+        _ => InstallPlan::Manual {
+            summary: format!(
+                "Building colibrì ({engine}) needs git and a C toolchain (gcc/clang with OpenMP)."
+            ),
+            steps: vec![
+                "Install git and gcc (with OpenMP support)".into(),
+                format!("git clone {repo}"),
+                "cd <clone>/c && ./setup.sh   # builds and self-tests".into(),
+                format!(
+                    "Point backends.{}.bin at the built `coli`",
+                    if kind == BackendKind::ColibriHy3 { "colibri_hy3" } else { "colibri" }
+                ),
+            ],
+            url: repo.into(),
+        },
+    }
+}
+
 /// vLLM / SGLang: install Python first if it's missing and auto-installable,
 /// then pip-install the package (interpreter resolved at run time).
 fn pip_backend_plan(
@@ -319,6 +413,51 @@ fn pip_backend_plan(
 /// The app-managed directory a fetched llama.cpp release is extracted into.
 pub fn llamacpp_managed_dir(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("backends").join("llamacpp")
+}
+
+/// The app-managed source/build tree for a colibrì engine. One tree per kind
+/// ("colibri" / "colibri-hy3") so both engines can be installed side by side.
+pub fn colibri_managed_dir(paths: &AppPaths, kind: BackendKind) -> PathBuf {
+    paths.data_dir.join("backends").join(kind.as_str())
+}
+
+/// Locate a colibrì `coli` binary: explicit path → configured name on PATH →
+/// managed build tree. The **upstream** kind additionally accepts a bare
+/// `coli` found on PATH; the Hy3 fork does NOT — a PATH `coli` is almost
+/// always the upstream engine, which cannot serve Hy3, so the fork resolves
+/// managed-first and takes PATH only for an explicitly configured name.
+pub fn resolve_colibri_bin(configured: &str, paths: &AppPaths, kind: BackendKind) -> Option<PathBuf> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return resolve_colibri_bin("coli", paths, kind);
+    }
+    let as_path = Path::new(configured);
+    if as_path.is_file() {
+        return Some(as_path.to_path_buf());
+    }
+    // A non-default configured name is the user pointing at a specific build.
+    if configured != "coli" && configured != "coli.exe" {
+        if let Ok(p) = which::which(configured) {
+            return Some(p);
+        }
+    }
+
+    let managed = colibri_managed_dir(paths, kind);
+    // setup.sh produces `coli`; the Windows MinGW target is `glm.exe`, and the
+    // fork's make target is `hy3` — accept the engine binary when no wrapper
+    // was built (it speaks the same `serve` CLI).
+    let candidates: &[&str] = match kind {
+        BackendKind::ColibriHy3 => &["coli.exe", "coli", "hy3.exe", "hy3"],
+        _ => &["coli.exe", "coli", "glm.exe", "glm"],
+    };
+    let managed_bin = candidates.iter().find_map(|n| find_file(&managed, n));
+
+    if kind == BackendKind::Colibri {
+        if let Ok(p) = which::which("coli") {
+            return Some(p);
+        }
+    }
+    managed_bin
 }
 
 /// Locate `llama-server`: explicit path → configured name on PATH →
@@ -472,7 +611,10 @@ fn write_prism_marker(dest_dir: &Path) -> Result<(), String> {
 /// Resolve an install plan against the real environment.
 pub fn resolve_install_plan(kind: BackendKind, paths: &AppPaths) -> InstallPlan {
     let has = |b: &str| which::which(b).is_ok();
-    let llamacpp_dir = llamacpp_managed_dir(paths);
+    let managed_dir = match kind {
+        BackendKind::Colibri | BackendKind::ColibriHy3 => colibri_managed_dir(paths, kind),
+        _ => llamacpp_managed_dir(paths),
+    };
     // The Ollama-on-Linux plan now emits an elevated (`Sudo`) step instead of
     // being downgraded to manual copy-paste here: the runner elevates with
     // `sudo -n` when that works and `sudo -S` (password from the masked prompt)
@@ -482,7 +624,7 @@ pub fn resolve_install_plan(kind: BackendKind, paths: &AppPaths) -> InstallPlan 
         std::env::consts::OS,
         &has,
         discover_python().is_some(),
-        &llamacpp_dir,
+        &managed_dir,
     )
 }
 
@@ -586,6 +728,10 @@ pub async fn run_install(
                     bin,
                 });
             }
+            InstallStep::BuildColibri { kind, dest_dir, .. } => {
+                let bin = build_colibri(*kind, dest_dir, &progress, cid).await?;
+                repoint = Some(Repoint { kind: *kind, bin });
+            }
             InstallStep::Sudo {
                 program,
                 args,
@@ -644,10 +790,11 @@ async fn run_step(
         }
         // Handled by `run_install` directly (it needs to capture the repoint).
         InstallStep::FetchLlamaCpp { display, .. }
-        | InstallStep::BuildPrismLlamaCpp { display, .. } => {
+        | InstallStep::BuildPrismLlamaCpp { display, .. }
+        | InstallStep::BuildColibri { display, .. } => {
             return Err(LocalCodeError::new(
                 ErrorCode::BackendInstallFailed,
-                "Internal: a managed llama.cpp step reached the generic step runner",
+                "Internal: a managed build step reached the generic step runner",
             )
             .with_correlation(cid)
             .with_cause(format!("step: {display}")));
@@ -1004,6 +1151,173 @@ async fn build_prism_llamacpp(
         bin.display(),
         if want_cuda { "CUDA" } else { "CPU/Metal" }
     ));
+    Ok(bin.display().to_string())
+}
+
+// ----------------------------------------------------------------------------
+// Colibrì engines — source build (no binary releases exist)
+// ----------------------------------------------------------------------------
+
+/// Upstream colibrì (GLM-5.2 expert-streaming engine).
+const COLIBRI_GIT: &str = "https://github.com/JustVugg/colibri.git";
+/// Colibrì × Hy3 fork (Tencent Hy3; also serves GLM-5.2 containers).
+const COLIBRI_HY3_GIT: &str = "https://github.com/ErikTromp/colibri-hy3.git";
+/// Marker file written next to a managed colibrì build.
+const COLIBRI_MARKER: &str = ".colibri";
+
+fn write_colibri_marker(dest_dir: &Path, repo: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dest_dir.join(COLIBRI_MARKER),
+        format!("repo={repo}\ninstalled_by=localcode\n"),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Spawn one build command with a working directory, streaming both pipes into
+/// `progress`. Errors are strings; callers wrap them with backend context.
+async fn run_build_cmd(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    progress: &UnboundedSender<String>,
+) -> Result<(), String> {
+    let _ = progress.send(format!("$ {program} {}", args.join(" ")));
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{program} failed to start: {e}"))?;
+    forward_lines(child.stdout.take(), progress.clone());
+    forward_lines(child.stderr.take(), progress.clone());
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("{program} wait: {e}"))?;
+    if !status.success() {
+        return Err(format!("{program} {} failed ({status})", args.join(" ")));
+    }
+    Ok(())
+}
+
+/// Clone and build a colibrì engine (README quickstart):
+///
+/// ```text
+/// git clone <repo>
+/// cd c && ./setup.sh          # checks gcc/OpenMP, builds, self-tests
+/// make [hy3] CUDA=1           # optional GPU rebuild when nvcc is present
+/// ```
+///
+/// On native Windows (upstream only) the documented path is MinGW-w64:
+/// `make glm.exe` inside `c/`. Returns the built binary's absolute path.
+async fn build_colibri(
+    kind: BackendKind,
+    dest_dir: &Path,
+    progress: &UnboundedSender<String>,
+    cid: localcode_core::CorrelationId,
+) -> Result<String, LocalCodeError> {
+    let (repo, cfg_key) = match kind {
+        BackendKind::ColibriHy3 => (COLIBRI_HY3_GIT, "colibri_hy3"),
+        _ => (COLIBRI_GIT, "colibri"),
+    };
+    let fail = move |msg: String| {
+        LocalCodeError::new(ErrorCode::BackendInstallFailed, msg)
+            .with_correlation(cid)
+            .with_hint(format!("Manual build: git clone {repo} && cd c && ./setup.sh"))
+            .with_hint(format!("Then set backends.{cfg_key}.bin to the built `coli`"))
+            .retryable(true)
+    };
+
+    if which::which("git").is_err() {
+        return Err(fail("`git` not found on PATH".into()));
+    }
+
+    let src_dir = dest_dir.join("src");
+    std::fs::create_dir_all(dest_dir).map_err(|e| fail(e.to_string()))?;
+    let src_str = src_dir.display().to_string();
+
+    // Clone or refresh the engine repo (shallow), same rules as the PrismML
+    // llama.cpp build: a failed pull keeps the existing tree (may be offline).
+    if src_dir.join(".git").is_dir() {
+        if let Err(e) = run_build_cmd(
+            "git",
+            &["-C", &src_str, "pull", "--ff-only"],
+            dest_dir,
+            progress,
+        )
+        .await
+        {
+            let _ = progress.send(format!("{e} — continuing with the existing tree"));
+        }
+    } else {
+        // Remove a partial non-git tree so clone can succeed.
+        if src_dir.exists() {
+            let _ = std::fs::remove_dir_all(&src_dir);
+        }
+        run_build_cmd(
+            "git",
+            &["clone", "--depth", "1", repo, &src_str],
+            dest_dir,
+            progress,
+        )
+        .await
+        .map_err(fail)?;
+    }
+
+    let c_dir = src_dir.join("c");
+    if !c_dir.is_dir() {
+        return Err(fail(format!(
+            "unexpected repo layout: {} has no c/ directory",
+            src_dir.display()
+        )));
+    }
+
+    if cfg!(windows) {
+        // Upstream's documented native-Windows path (MinGW-w64).
+        let target = if kind == BackendKind::ColibriHy3 { "hy3.exe" } else { "glm.exe" };
+        run_build_cmd("make", &[target], &c_dir, progress)
+            .await
+            .map_err(fail)?;
+    } else {
+        // Through `sh` so a lost exec bit on setup.sh can't break the build.
+        run_build_cmd("sh", &["setup.sh"], &c_dir, progress)
+            .await
+            .map_err(fail)?;
+        // Optional CUDA rebuild; a failure here keeps the working CPU build.
+        if which::which("nvcc").is_ok() && which::which("make").is_ok() {
+            let cuda_args: &[&str] = if kind == BackendKind::ColibriHy3 {
+                &["hy3", "CUDA=1"]
+            } else {
+                &["CUDA=1"]
+            };
+            if let Err(e) = run_build_cmd("make", cuda_args, &c_dir, progress).await {
+                let _ = progress.send(format!(
+                    "CUDA build failed ({e}) — keeping the CPU build from setup.sh"
+                ));
+            }
+        }
+    }
+
+    let candidates: &[&str] = match kind {
+        BackendKind::ColibriHy3 => &["coli.exe", "coli", "hy3.exe", "hy3"],
+        _ => &["coli.exe", "coli", "glm.exe", "glm"],
+    };
+    let bin = candidates
+        .iter()
+        .find_map(|n| find_file(dest_dir, n))
+        .ok_or_else(|| {
+            fail(format!(
+                "no coli binary was produced under {}",
+                dest_dir.display()
+            ))
+        })?;
+
+    write_colibri_marker(dest_dir, repo).map_err(fail)?;
+    let _ = progress.send(format!("colibrì ready at {}", bin.display()));
     Ok(bin.display().to_string())
 }
 
@@ -1669,6 +1983,87 @@ mod tests {
         let steps = automated(ip(BackendKind::LlamaCpp, "linux", &no, false));
         assert!(matches!(&steps[0], InstallStep::FetchLlamaCpp { .. }));
         assert!(steps[0].display().contains("PrismML"));
+    }
+
+    #[test]
+    fn colibri_linux_with_toolchain_builds_from_source() {
+        let has = |b: &str| matches!(b, "git" | "gcc");
+        for kind in [BackendKind::Colibri, BackendKind::ColibriHy3] {
+            let steps = automated(ip(kind, "linux", &has, false));
+            assert!(
+                matches!(&steps[0], InstallStep::BuildColibri { kind: k, .. } if *k == kind),
+                "linux + git + gcc must source-build {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn colibri_without_toolchain_is_manual() {
+        // No binary releases exist; without git + a C compiler the only honest
+        // plan is copy-paste steps pointing at the repo.
+        let plan = ip(BackendKind::Colibri, "linux", &no, false);
+        assert!(matches!(plan, InstallPlan::Manual { .. }));
+    }
+
+    #[test]
+    fn colibri_windows_needs_mingw_else_manual() {
+        // Upstream documents native Windows via MinGW-w64 (gcc + make).
+        let mingw = |b: &str| matches!(b, "git" | "gcc" | "make");
+        let steps = automated(ip(BackendKind::Colibri, "windows", &mingw, false));
+        assert!(matches!(&steps[0], InstallStep::BuildColibri { .. }));
+
+        let git_only = |b: &str| b == "git";
+        let plan = ip(BackendKind::Colibri, "windows", &git_only, false);
+        match plan {
+            InstallPlan::Manual { steps, .. } => {
+                assert!(steps.iter().any(|s| s.contains("MinGW")));
+            }
+            other => panic!("expected manual plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colibri_hy3_is_manual_off_linux() {
+        // The fork documents Linux/WSL only — never auto-build it on
+        // Windows/macOS even with a full toolchain present.
+        let all = |_: &str| true;
+        for os in ["windows", "macos"] {
+            let plan = ip(BackendKind::ColibriHy3, os, &all, false);
+            match plan {
+                InstallPlan::Manual { url, .. } => assert!(url.contains("colibri-hy3")),
+                other => panic!("expected manual plan on {os}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_colibri_finds_managed_binary_per_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_home(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let bin_name = if cfg!(windows) { "coli.exe" } else { "coli" };
+        for kind in [BackendKind::Colibri, BackendKind::ColibriHy3] {
+            let managed = colibri_managed_dir(&paths, kind).join("src/c");
+            std::fs::create_dir_all(&managed).unwrap();
+            std::fs::write(managed.join(bin_name), b"x").unwrap();
+        }
+        // Each kind resolves its own tree — the fork never picks up upstream's.
+        let up = resolve_colibri_bin("coli", &paths, BackendKind::Colibri).unwrap();
+        let hy = resolve_colibri_bin("coli", &paths, BackendKind::ColibriHy3).unwrap();
+        assert!(up.starts_with(colibri_managed_dir(&paths, BackendKind::Colibri)));
+        assert!(hy.starts_with(colibri_managed_dir(&paths, BackendKind::ColibriHy3)));
+    }
+
+    #[test]
+    fn resolve_colibri_prefers_explicit_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("my-coli");
+        std::fs::write(&custom, b"x").unwrap();
+        let paths = AppPaths::from_home(dir.path().join("home"));
+        paths.ensure_dirs().unwrap();
+        let found =
+            resolve_colibri_bin(custom.to_str().unwrap(), &paths, BackendKind::ColibriHy3).unwrap();
+        assert_eq!(found, custom);
     }
 
     #[test]

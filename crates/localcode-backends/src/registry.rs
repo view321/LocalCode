@@ -1,6 +1,6 @@
 use crate::{
-    BackendKind, DetectReport, InferenceBackend, LlamaCppBackend, ModelMonitors, OllamaBackend,
-    SglangBackend, VllmBackend,
+    BackendKind, ColibriBackend, DetectReport, InferenceBackend, LlamaCppBackend, ModelMonitors,
+    OllamaBackend, SglangBackend, VllmBackend,
 };
 use localcode_core::config::Config;
 use localcode_core::error::{ErrorCode, LocalCodeError};
@@ -41,6 +41,20 @@ impl BackendRegistry {
             BackendKind::Sglang,
             Arc::new(SglangBackend::new(cfg.backends.sglang.clone()).with_monitors(monitors.clone())),
         );
+        backends.insert(
+            BackendKind::Colibri,
+            Arc::new(
+                ColibriBackend::new(BackendKind::Colibri, cfg.backends.colibri.clone())
+                    .with_monitors(monitors.clone()),
+            ),
+        );
+        backends.insert(
+            BackendKind::ColibriHy3,
+            Arc::new(
+                ColibriBackend::new(BackendKind::ColibriHy3, cfg.backends.colibri_hy3.clone())
+                    .with_monitors(monitors.clone()),
+            ),
+        );
         Self {
             backends,
             runtimes: RwLock::new(Vec::new()),
@@ -71,6 +85,8 @@ impl BackendRegistry {
             BackendKind::LlamaCpp,
             BackendKind::Vllm,
             BackendKind::Sglang,
+            BackendKind::Colibri,
+            BackendKind::ColibriHy3,
         ] {
             if let Ok(b) = self.get(kind) {
                 out.push(b.detect().await);

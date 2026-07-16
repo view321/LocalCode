@@ -165,16 +165,26 @@ impl DeployService {
             .with_hint("Deploy this GGUF model with the llama.cpp or Ollama backend (/backend)")
             .with_hint("For vLLM, pick a full-precision or AWQ/GPTQ (safetensors) model"));
         }
+        // Same fail-fast for colibrì containers: they are engine-specific int4
+        // shards no other backend can parse, and the colibrì engines in turn
+        // can't load GGUF or plain transformers checkpoints.
+        if let Some(err) = colibri_format_conflict(req) {
+            return Err(err.with_correlation(*cid));
+        }
 
         self.emit_progress(job_id, cid, 10, "Ensuring backend ready");
         let backend = self.registry.get(req.backend)?;
         backend.ensure_ready().await?;
 
-        // llama.cpp consumes a local GGUF; download weights if we only have
-        // registry URLs. Ollama pulls by itself; vLLM/SGLang resolve HF ids
-        // through their own hub caches.
+        // llama.cpp consumes a local GGUF and colibrì a local int4 container;
+        // download weights if we only have registry URLs. Ollama pulls by
+        // itself; vLLM/SGLang resolve HF ids through their own hub caches.
         let mut local_path = req.local_path.clone();
-        if req.backend == BackendKind::LlamaCpp && local_path.is_none() {
+        if matches!(
+            req.backend,
+            BackendKind::LlamaCpp | BackendKind::Colibri | BackendKind::ColibriHy3
+        ) && local_path.is_none()
+        {
             local_path = Some(self.download_weights(req, job_id, cid).await?);
         }
 
@@ -230,14 +240,23 @@ impl DeployService {
         cid: &CorrelationId,
     ) -> Result<String, LocalCodeError> {
         if req.download_urls.is_empty() {
-            return Err(LocalCodeError::new(
+            let err = LocalCodeError::new(
                 ErrorCode::DeployDownloadFailed,
                 "No downloadable weight files for this quantization",
             )
-            .with_correlation(*cid)
-            .with_cause("Model detail has no resolvable GGUF files")
-            .with_hint("Pick a quantization with GGUF files, or use Ollama")
-            .with_hint("Or download manually and pass a local path"));
+            .with_correlation(*cid);
+            let err = if matches!(req.backend, BackendKind::Colibri | BackendKind::ColibriHy3) {
+                err.with_cause("colibrì needs the full pre-converted container on local disk")
+                    .with_hint(format!(
+                        "Fetch it manually: hf download {} --local-dir <dir>, then deploy again",
+                        req.model_id
+                    ))
+            } else {
+                err.with_cause("Model detail has no resolvable GGUF files")
+                    .with_hint("Pick a quantization with GGUF files, or use Ollama")
+                    .with_hint("Or download manually and pass a local path")
+            };
+            return Err(err);
         }
 
         let dir = self.models_dir.join(sanitize_dir(&req.model_id));
@@ -483,6 +502,78 @@ fn is_gguf_on_transformers_backend(req: &DeployRequest) -> bool {
     file_is_gguf || label_is_gguf
 }
 
+/// True when this deploy's weights look like a colibrì int4 container:
+/// `out-*.safetensors` shards / `.qs` per-row scale files (definitive), or —
+/// when file metadata is missing — a quant label or model id that names
+/// colibrì together with an engine family marker (int4/GLM/Hy3/Hunyuan).
+/// The extra marker keeps an unrelated model that merely has "colibri" in its
+/// name from being blocked on vLLM.
+fn looks_like_colibri_container(req: &DeployRequest) -> bool {
+    let file_hit = req.weight_files.iter().any(|f| {
+        let l = f.to_lowercase();
+        let name = l.rsplit(['/', '\\']).next().unwrap_or(&l);
+        l.ends_with(".qs") || (name.starts_with("out-") && name.ends_with(".safetensors"))
+    });
+    let marked = |s: &str| {
+        let l = s.to_lowercase();
+        l.contains("colibri")
+            && (l.contains("int4") || l.contains("glm") || l.contains("hy3") || l.contains("hunyuan"))
+    };
+    file_hit
+        || req.quantization.as_deref().is_some_and(marked)
+        || marked(&req.model_id)
+}
+
+/// Fail-fast check for colibrì-format mismatches in either direction. Returns
+/// the ready-made error (minus correlation) when the deploy can't work.
+fn colibri_format_conflict(req: &DeployRequest) -> Option<LocalCodeError> {
+    let on_colibri = matches!(req.backend, BackendKind::Colibri | BackendKind::ColibriHy3);
+    let looks_colibri = looks_like_colibri_container(req);
+
+    if !on_colibri && looks_colibri {
+        return Some(
+            LocalCodeError::new(
+                ErrorCode::DeployUnsupportedFormat,
+                format!("{} can't serve a colibrì int4 container", req.backend.as_str()),
+            )
+            .with_cause("colibrì containers (out-*.safetensors shards + .qs scales) are engine-specific")
+            .with_hint("Deploy GLM-5.2 containers with the colibri backend, Hy3 with colibri-hy3"),
+        );
+    }
+    if on_colibri && !looks_colibri {
+        // Block only when the metadata affirmatively says another format; a
+        // deploy with no file metadata may still be a valid local container
+        // (the backend validates config.json before spawning).
+        let is_gguf = req
+            .weight_files
+            .iter()
+            .any(|f| f.to_lowercase().ends_with(".gguf"))
+            || req.quantization.as_deref().is_some_and(|q| {
+                let u = q.to_uppercase();
+                u.contains("GGUF") || u.starts_with("IQ") || u.starts_with('Q')
+            });
+        let is_plain_checkpoint = req.weight_files.iter().any(|f| {
+            let l = f.to_lowercase();
+            l.ends_with(".safetensors") || l.ends_with(".bin") || l.ends_with(".pt")
+        });
+        if is_gguf || is_plain_checkpoint {
+            return Some(
+                LocalCodeError::new(
+                    ErrorCode::DeployUnsupportedFormat,
+                    format!(
+                        "{} serves only pre-converted colibrì int4 containers",
+                        req.backend.as_str()
+                    ),
+                )
+                .with_cause("GGUF belongs on llama.cpp/Ollama; safetensors checkpoints on vLLM/SGLang")
+                .with_hint("Pick a pre-converted repo (e.g. mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp, UnderstandLing/Hy3-colibri-int4)")
+                .with_hint("Or convert once with `coli convert` and deploy the output directory"),
+            );
+        }
+    }
+    None
+}
+
 fn sanitize_dir(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -521,6 +612,15 @@ pub fn preview_deploy_command(
         BackendKind::Sglang => {
             let p = port.unwrap_or(cfg.sglang.port);
             crate::sglang::plan_command(&cfg.sglang, model, p, context_length, tuning)
+        }
+        // No context flag: coli sizes its own KV slots.
+        BackendKind::Colibri => {
+            let p = port.unwrap_or(cfg.colibri.port);
+            crate::colibri::plan_command(&cfg.colibri, BackendKind::Colibri, model, p, tuning)
+        }
+        BackendKind::ColibriHy3 => {
+            let p = port.unwrap_or(cfg.colibri_hy3.port);
+            crate::colibri::plan_command(&cfg.colibri_hy3, BackendKind::ColibriHy3, model, p, tuning)
         }
         BackendKind::Ollama => return String::new(),
     };
@@ -618,5 +718,49 @@ mod tests {
             &["a.gguf"],
             Some("Q4_K_M"),
         )));
+    }
+
+    #[test]
+    fn colibri_container_blocked_off_colibri_backends() {
+        // Shard names are definitive, whatever the label says.
+        let r = req(BackendKind::Vllm, &["out-00001.safetensors", "out-mtp-0.safetensors"], None);
+        assert!(colibri_format_conflict(&r).is_some());
+        // Without files, the id must carry colibri + a family marker.
+        let mut r = req(BackendKind::LlamaCpp, &[], None);
+        r.model_id = "mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp".into();
+        assert!(colibri_format_conflict(&r).is_some());
+        // A model that merely mentions colibri is NOT blocked (no marker).
+        let mut r = req(BackendKind::Vllm, &["model.safetensors"], Some("FP16"));
+        r.model_id = "someone/colibri-7b-instruct".into();
+        assert!(colibri_format_conflict(&r).is_none());
+    }
+
+    #[test]
+    fn foreign_formats_blocked_on_colibri() {
+        assert!(colibri_format_conflict(&req(
+            BackendKind::Colibri,
+            &["m-Q4_K_M.gguf"],
+            Some("Q4_K_M"),
+        ))
+        .is_some());
+        assert!(colibri_format_conflict(&req(
+            BackendKind::ColibriHy3,
+            &["model-00001-of-00002.safetensors"],
+            Some("BF16"),
+        ))
+        .is_some());
+    }
+
+    #[test]
+    fn colibri_container_and_bare_local_deploys_allowed_on_colibri() {
+        let mut r = req(
+            BackendKind::ColibriHy3,
+            &["out-00001.safetensors", "scales.qs"],
+            None,
+        );
+        r.model_id = "UnderstandLing/Hy3-colibri-int4".into();
+        assert!(colibri_format_conflict(&r).is_none());
+        // No metadata at all (local dir deploy): let the backend validate.
+        assert!(colibri_format_conflict(&req(BackendKind::Colibri, &[], None)).is_none());
     }
 }

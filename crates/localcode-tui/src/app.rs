@@ -25,9 +25,9 @@ use localcode_agent::{
 };
 use localcode_api_client::ApiClient;
 use localcode_assistant::{
-    backend_supports, classify_weight_format, ensure_running, install_local_assistant,
+    backend_supports, classify_weight_format_for, ensure_running, install_local_assistant,
     install_need, install_offer_body, is_installed, preset_for_backend, quant_compatibility_note,
-    recommend_backend, should_offer_install, startup_greeting, Assistant, AssistantContext,
+    recommend_backend_for, should_offer_install, startup_greeting, Assistant, AssistantContext,
     DeployToolArgs, LocalAssistantRuntime, ModelActions, PresetInput, ASSISTANT_DISPLAY_NAME,
     BONSAI_FILE, InstallNeed,
 };
@@ -801,12 +801,21 @@ impl ModelActions for ModelOps {
         }
 
         // Auto-preset (unless the caller was explicit): pick the backend that
-        // matches the weight format so a GGUF model never lands on vLLM, and fill
-        // a fitting context + the card's flags when the caller didn't supply them.
-        let fmt = classify_weight_format(quantization.as_deref(), &weight_files);
+        // matches the weight format so a GGUF model never lands on vLLM (and a
+        // colibrì container always lands on its engine), and fill a fitting
+        // context + the card's flags when the caller didn't supply them.
+        let fmt = classify_weight_format_for(&model_id, quantization.as_deref(), &weight_files);
         let auto_backend = explicit_backend.is_none();
-        let backend = explicit_backend
-            .unwrap_or_else(|| recommend_backend(fmt, &[], self.registry.default_kind(&self.config)));
+        let backend = explicit_backend.unwrap_or_else(|| {
+            recommend_backend_for(
+                fmt,
+                &model_id,
+                &tags,
+                card.as_deref(),
+                &[],
+                self.registry.default_kind(&self.config),
+            )
+        });
         let preset = preset_for_backend(
             backend,
             &PresetInput {
@@ -2577,6 +2586,18 @@ impl App {
             BackendKind::LlamaCpp | BackendKind::Ollama
         ) {
             self.downloaded_quant_path(&detail.summary.id, &weight_files)
+        } else if matches!(
+            self.deploy_backend,
+            BackendKind::Colibri | BackendKind::ColibriHy3
+        ) {
+            // colibrì consumes the container DIRECTORY (COLI_MODEL); pin the
+            // model dir when every listed shard is already on disk.
+            self.downloaded_quant_path(&detail.summary.id, &weight_files)
+                .and_then(|p| {
+                    std::path::Path::new(&p)
+                        .parent()
+                        .map(|d| d.display().to_string())
+                })
         } else {
             None
         };
@@ -2636,6 +2657,11 @@ impl App {
                 DeployField::GpuLayers,
                 DeployField::Command,
             ],
+            // coli sizes its own KV slots (no context flag) and its memory
+            // tiers (--ram/--vram/--gpu) ride the editable command line.
+            BackendKind::Colibri | BackendKind::ColibriHy3 => {
+                vec![DeployField::Port, DeployField::Command]
+            }
             // Ollama is a shared server we don't spawn — no launch command to edit.
             BackendKind::Ollama => vec![DeployField::Context, DeployField::GpuLayers],
         }
@@ -2646,9 +2672,10 @@ impl App {
     /// "no edit" reproduces the built command. Empty for Ollama.
     pub fn deploy_command_seed(&self) -> String {
         let model_id = self.current_model_id().unwrap_or_default();
-        let model_str = if self.deploy_backend == BackendKind::LlamaCpp {
+        let model_str = match self.deploy_backend {
             // Prefer a downloaded local GGUF path when we already have one.
-            self.downloaded_models
+            BackendKind::LlamaCpp => self
+                .downloaded_models
                 .iter()
                 .find(|m| sanitize_model_dir(&m.model_id) == sanitize_model_dir(&model_id))
                 .and_then(|m| {
@@ -2657,9 +2684,15 @@ impl App {
                         .find(|f| f.ends_with(".gguf"))
                         .map(|f| m.dir.join(f).display().to_string())
                 })
-                .unwrap_or_else(|| model_id.clone())
-        } else {
-            model_id.clone()
+                .unwrap_or_else(|| model_id.clone()),
+            // colibrì takes the downloaded container directory (COLI_MODEL).
+            BackendKind::Colibri | BackendKind::ColibriHy3 => self
+                .downloaded_models
+                .iter()
+                .find(|m| sanitize_model_dir(&m.model_id) == sanitize_model_dir(&model_id))
+                .map(|m| m.dir.display().to_string())
+                .unwrap_or_else(|| model_id.clone()),
+            _ => model_id.clone(),
         };
         preview_deploy_command(
             &self.config.backends,
@@ -2898,11 +2931,26 @@ impl App {
         };
 
         // Decide the effective backend for this format under the given mode.
-        let fmt = classify_weight_format(input.selected_quant, input.weight_files);
+        let fmt =
+            classify_weight_format_for(&owned.model_id, input.selected_quant, input.weight_files);
         let backend = match mode {
-            PresetMode::Fresh => recommend_backend(fmt, &owned.installed, self.deploy_backend),
+            PresetMode::Fresh => recommend_backend_for(
+                fmt,
+                &owned.model_id,
+                &owned.tags,
+                owned.card.as_deref(),
+                &owned.installed,
+                self.deploy_backend,
+            ),
             PresetMode::QuantChanged if !backend_supports(self.deploy_backend, fmt) => {
-                recommend_backend(fmt, &owned.installed, self.deploy_backend)
+                recommend_backend_for(
+                    fmt,
+                    &owned.model_id,
+                    &owned.tags,
+                    owned.card.as_deref(),
+                    &owned.installed,
+                    self.deploy_backend,
+                )
             }
             PresetMode::QuantChanged | PresetMode::BackendPinned => self.deploy_backend,
         };
@@ -3934,8 +3982,11 @@ impl App {
             {
                 Some(cfg_idx) => self.disconnect_remote(cfg_idx),
                 None => {
-                    self.remote_sessions.remove(remote_idx);
-                    self.set_status(format!("Disconnected from {name}"), false);
+                    Self::spawn_remote_close(self.remote_sessions.remove(remote_idx));
+                    self.set_status(
+                        format!("Disconnected from {name} — freeing remote GPU"),
+                        false,
+                    );
                 }
             }
         }
@@ -4142,6 +4193,8 @@ impl App {
             BackendKind::Vllm => self.config.backends.vllm.bin = rp.bin,
             BackendKind::Sglang => self.config.backends.sglang.bin = rp.bin,
             BackendKind::LlamaCpp => self.config.backends.llamacpp.bin = rp.bin,
+            BackendKind::Colibri => self.config.backends.colibri.bin = rp.bin,
+            BackendKind::ColibriHy3 => self.config.backends.colibri_hy3.bin = rp.bin,
             // Ollama repairs restart a service; there's no binary to repoint.
             BackendKind::Ollama => {}
         }
@@ -4457,11 +4510,17 @@ impl App {
         else {
             return;
         };
-        let before = self.remote_sessions.len();
-        self.remote_sessions.retain(|s| s.server_name != name);
-        if self.remote_sessions.len() == before {
+        // Take the session OUT and close it on a task: freeing the remote GPU
+        // (unloading its resident models) is async, and Drop can't await — a
+        // plain `retain`/drop would leave the model loaded on the remote box.
+        let Some(pos) = self
+            .remote_sessions
+            .iter()
+            .position(|s| s.server_name == name)
+        else {
             return; // wasn't connected
-        }
+        };
+        Self::spawn_remote_close(self.remote_sessions.remove(pos));
         // Restore the local Ollama URL if no remote sessions remain.
         if self.remote_sessions.is_empty() {
             if let Some(url) = self.pre_remote_ollama_url.take() {
@@ -4474,7 +4533,16 @@ impl App {
             });
         }
         self.runtime_selected = 0;
-        self.set_status(format!("Disconnected from {name}"), false);
+        self.set_status(format!("Disconnected from {name} — freeing remote GPU"), false);
+    }
+
+    /// Move a remote session onto a background task that unloads its resident
+    /// models (freeing the remote GPU) and then closes the SSH session + tunnel.
+    /// Drop alone can't do this — the unload is async.
+    fn spawn_remote_close(session: RemoteSession) {
+        tokio::spawn(async move {
+            session.close().await;
+        });
     }
 
     // ------------------------------------------------------------------
@@ -7153,7 +7221,9 @@ its backend logs, or stop it. Remote: click a field to edit, then connect."
             BackendKind::Ollama => BackendKind::LlamaCpp,
             BackendKind::LlamaCpp => BackendKind::Vllm,
             BackendKind::Vllm => BackendKind::Sglang,
-            BackendKind::Sglang => BackendKind::Ollama,
+            BackendKind::Sglang => BackendKind::Colibri,
+            BackendKind::Colibri => BackendKind::ColibriHy3,
+            BackendKind::ColibriHy3 => BackendKind::Ollama,
         };
         // Re-derive the card flags / context for the newly-pinned backend.
         self.apply_deploy_preset(PresetMode::BackendPinned);
@@ -7336,11 +7406,13 @@ fn osc52_copy(text: &str) {
 }
 
 /// Fixed display order of backends in the manager overlay.
-pub(crate) const BACKEND_ORDER: [BackendKind; 4] = [
+pub(crate) const BACKEND_ORDER: [BackendKind; 6] = [
     BackendKind::Ollama,
     BackendKind::LlamaCpp,
     BackendKind::Vllm,
     BackendKind::Sglang,
+    BackendKind::Colibri,
+    BackendKind::ColibriHy3,
 ];
 
 /// Load the latest session for this workspace when persistence is on, or

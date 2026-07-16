@@ -1,6 +1,6 @@
 # LocalCode
 
-**Local-first Rust TUI coding agent** for developers who prefer local LLMs — with Hugging Face model discovery, GPU VRAM fit warnings, one-click deploy (Ollama / llama.cpp / vLLM / SGLang), **one-click remote GPU servers over SSH**, download **mirror fallbacks** for air-gapped networks, benchmarks, optional cloud (RunPod / Vast.ai / Akash), USDC top-up on **Base**, and an in-app assistant that helps fix LocalCode itself.
+**Local-first Rust TUI coding agent** for developers who prefer local LLMs — with Hugging Face model discovery, GPU VRAM fit warnings, one-click deploy (Ollama / llama.cpp / vLLM / SGLang / colibrì for GLM-5.2 & Hy3 expert-streaming), **one-click remote GPU servers over SSH**, download **mirror fallbacks** for air-gapped networks, benchmarks, optional cloud (RunPod / Vast.ai / Akash), USDC top-up on **Base**, and an in-app assistant that helps fix LocalCode itself.
 
 The interface is a single **omnibar**: type to chat with the agent, or press `/` for commands. Everything else (models, backends, remote servers, settings) opens as a popup above the bar — inspired by OpenCode and Pi.
 
@@ -296,7 +296,7 @@ crates/
   localcode-log/        tracing + redaction
   localcode-gpu/        GPU discover + VRAM fit
   localcode-hf/         HF client, mirrors, quants, cache
-  localcode-backends/   Ollama, llama.cpp, vLLM, SGLang
+  localcode-backends/   Ollama, llama.cpp, vLLM, SGLang, colibrì (GLM-5.2 / Hy3)
   localcode-remote/     SSH remote GPU servers (russh: connect, provision, tunnel)
   localcode-cloud/      RunPod, Vast, Akash adapters
   localcode-payments/   USDC balance client

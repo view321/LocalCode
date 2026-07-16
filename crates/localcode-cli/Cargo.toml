@@ -18,6 +18,7 @@ localcode-hf = { workspace = true }
 localcode-backends = { workspace = true }
 localcode-bench = { workspace = true }
 localcode-agent = { workspace = true }
+localcode-assistant = { workspace = true }
 localcode-tui = { workspace = true }
 localcode-api-client = { workspace = true }
 localcode-upgrade = { workspace = true }

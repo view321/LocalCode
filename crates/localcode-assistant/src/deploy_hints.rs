@@ -188,6 +188,12 @@ fn parse_flags(text: &str, backend: BackendKind, hints: &mut DeployHints) {
         ][..],
         BackendKind::Sglang => &["--trust-remote-code", "--disable-radix-cache", "--enable-torch-compile"][..],
         BackendKind::LlamaCpp => &["--flash-attn", "--mlock", "--no-mmap", "--cont-batching"][..],
+        // coli serve's memory-tier knobs, e.g. a card's
+        // `./coli serve --ram 12 --gpu 0 --vram 14` — numeric values are
+        // captured into extra_args and passed straight through by the backend.
+        BackendKind::Colibri | BackendKind::ColibriHy3 => {
+            &["--ram", "--vram", "--gpu", "--kv-slots", "--max-queue"][..]
+        }
         BackendKind::Ollama => &[][..],
     };
 

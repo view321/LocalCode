@@ -30,6 +30,9 @@ pub enum FailureClass {
     ModuleNotFound(String),
     /// GPU driver too old / no kernel image for this GPU architecture.
     DriverMismatch,
+    /// The binary died on an illegal instruction — built for SIMD this CPU
+    /// doesn't have (colibrì needs AVX2; ARCH=native builds can overshoot).
+    CpuIsaUnsupported,
     /// The server process wasn't reachable / refused the connection.
     ConnectionRefused,
     /// A GGUF / model file couldn't be parsed or loaded.
@@ -144,6 +147,13 @@ pub fn classify(text: &str) -> FailureClass {
         ],
     ) {
         return FailureClass::DriverMismatch;
+    }
+    // An instant SIGILL is a wrong-ISA binary, not a model problem.
+    if any(
+        &low,
+        &["illegal instruction", "illegal hardware instruction", "sigill"],
+    ) {
+        return FailureClass::CpuIsaUnsupported;
     }
     if any(
         &low,
@@ -359,6 +369,47 @@ fn build_diagnosis(kind: BackendKind, class: FailureClass) -> Option<Diagnosis> 
             ],
         ),
 
+        // ---- colibrì (source-built C engines) ----
+        (Colibri | ColibriHy3, FailureClass::CpuIsaUnsupported) => d(
+            "This coli build uses CPU instructions this machine doesn't have",
+            "The engine died on an illegal instruction. colibrì requires AVX2, and a \
+             binary built elsewhere (or with ARCH=native) can demand newer SIMD than \
+             this CPU provides. This is a build/host mismatch, not a model problem.",
+            Confidence::High,
+            None,
+            &[
+                "Rebuild on this machine: cd <clone>/c && ./setup.sh",
+                "Check CPU support: grep -o avx2 /proc/cpuinfo | head -1",
+            ],
+        ),
+        (Colibri | ColibriHy3, FailureClass::MissingSharedLib(lib)) => d(
+            &if lib.is_empty() {
+                "A required shared library is missing".to_string()
+            } else {
+                format!("Missing shared library: {lib}")
+            },
+            "coli couldn't load a native dependency — usually libgomp (OpenMP) on a \
+             minimal system, or the CUDA runtime for a CUDA=1 build.",
+            Confidence::Medium,
+            None,
+            &[
+                "Install OpenMP (libgomp) via your package manager",
+                "For CUDA builds, install the CUDA runtime — or rebuild CPU-only with setup.sh",
+            ],
+        ),
+        (Colibri | ColibriHy3, FailureClass::CudaOom) => d(
+            "Out of memory while loading",
+            "colibrì streams experts from disk, but the dense weights and the expert \
+             cache still need RAM (and VRAM when a GPU tier is enabled). This is a \
+             sizing choice, not a broken install.",
+            Confidence::Medium,
+            None,
+            &[
+                "Lower the cache tiers with extra args: --ram <GiB> [--vram <GiB>]",
+                "Close other RAM/VRAM-heavy processes",
+            ],
+        ),
+
         // ---- Any backend: a taken port is self-explanatory but worth naming. ----
         (_, FailureClass::PortInUse) => d(
             "Port already in use",
@@ -475,5 +526,31 @@ mod tests {
     fn unknown_backend_class_pairs_return_none() {
         // A GGUF parse error isn't meaningful for vLLM (guarded earlier).
         assert!(build_diagnosis(BackendKind::Ollama, FailureClass::InvalidGguf).is_none());
+    }
+
+    #[test]
+    fn colibri_sigill_is_a_build_host_mismatch() {
+        // A wrong-ISA coli build dies instantly; that must read as a build
+        // problem (rebuild here), never as a bad model or container.
+        assert_eq!(
+            classify("coli: Illegal instruction (core dumped)"),
+            FailureClass::CpuIsaUnsupported
+        );
+        let err = LocalCodeError::new(ErrorCode::BackendStartFailed, "coli serve exited early")
+            .with_cause("Illegal instruction (core dumped)");
+        let dg = diagnose(BackendKind::Colibri, &err).expect("a diagnosis");
+        assert_eq!(dg.confidence, Confidence::High);
+        assert!(dg.repair.is_none());
+        assert!(dg.summary.to_lowercase().contains("cpu"));
+    }
+
+    #[test]
+    fn colibri_missing_libgomp_names_the_lib() {
+        let err = LocalCodeError::new(ErrorCode::BackendStartFailed, "boot failed").with_cause(
+            "coli: error while loading shared libraries: libgomp.so.1: cannot open shared object file",
+        );
+        let dg = diagnose(BackendKind::ColibriHy3, &err).expect("a diagnosis");
+        assert!(dg.summary.contains("libgomp.so"));
+        assert!(dg.explanation.contains("OpenMP"));
     }
 }

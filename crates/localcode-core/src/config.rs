@@ -151,6 +151,14 @@ pub struct BackendsConfig {
     pub vllm: VllmConfig,
     #[serde(default)]
     pub sglang: SglangConfig,
+    /// Colibrì — GLM-5.2 expert-streaming engine (github.com/JustVugg/colibri).
+    #[serde(default)]
+    pub colibri: ColibriConfig,
+    /// Colibrì × Hy3 fork (github.com/ErikTromp/colibri-hy3). Same `coli` CLI,
+    /// but a separate binary/install tree and default port so it can run next
+    /// to the upstream engine.
+    #[serde(default = "default_colibri_hy3_cfg")]
+    pub colibri_hy3: ColibriConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +246,36 @@ impl Default for SglangConfig {
             host: default_host(),
             port: default_sglang_port(),
         }
+    }
+}
+
+/// One colibrì engine (`coli` binary). Used twice: `backends.colibri` for the
+/// upstream GLM-5.2 engine and `backends.colibri_hy3` for the Hy3 fork.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColibriConfig {
+    #[serde(default = "default_colibri_bin")]
+    pub bin: String,
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_colibri_port")]
+    pub port: u16,
+}
+
+impl Default for ColibriConfig {
+    fn default() -> Self {
+        Self {
+            bin: default_colibri_bin(),
+            host: default_host(),
+            port: default_colibri_port(),
+        }
+    }
+}
+
+/// The Hy3 fork's field default: same shape, its own port.
+fn default_colibri_hy3_cfg() -> ColibriConfig {
+    ColibriConfig {
+        port: default_colibri_hy3_port(),
+        ..ColibriConfig::default()
     }
 }
 
@@ -748,6 +786,17 @@ fn default_sglang_bin() -> String {
 }
 fn default_sglang_port() -> u16 {
     30000
+}
+fn default_colibri_bin() -> String {
+    "coli".into()
+}
+// colibrì's own README default is 8000, which collides with vLLM's; pick free
+// neighbours so every backend can listen at once.
+fn default_colibri_port() -> u16 {
+    8091
+}
+fn default_colibri_hy3_port() -> u16 {
+    8092
 }
 fn default_assistant_provider() -> String {
     // Prefer local Bonsai when installed; hosted providers remain available.

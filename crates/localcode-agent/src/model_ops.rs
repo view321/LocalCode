@@ -60,11 +60,12 @@ pub fn model_tools_schema() -> Vec<Value> {
         tool_schema(
             "deploy_model",
             "Deploy a Hugging Face model to a local backend and wait until it is serving. \
-             backend is ollama|llamacpp|vllm|sglang — OMIT it to auto-select the correct \
-             backend for the model's weight format (GGUF→llama.cpp, safetensors/AWQ/GPTQ→vLLM), \
-             which also auto-fills a fitting context and the card's recommended flags. Only set \
-             backend to override that choice. Public models need no HF token. Optionally set \
-             quant, port, context, or a full command override.",
+             backend is ollama|llamacpp|vllm|sglang|colibri|colibri-hy3 — OMIT it to auto-select \
+             the correct backend for the model's weight format (GGUF→llama.cpp, \
+             safetensors/AWQ/GPTQ→vLLM, colibrì int4 containers→colibri for GLM-5.2 / \
+             colibri-hy3 for Tencent Hy3), which also auto-fills a fitting context and the \
+             card's recommended flags. Only set backend to override that choice. Public models \
+             need no HF token. Optionally set quant, port, context, or a full command override.",
             json!({
                 "type": "object",
                 "properties": {

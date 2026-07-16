@@ -29,8 +29,9 @@ pub use constants::{
 };
 pub use deploy_hints::{extract_deploy_hints, DeployHints};
 pub use deploy_preset::{
-    backend_supports, classify_weight_format, parse_native_context, preset_for_backend,
-    recommend_backend, recommend_deploy_preset, DeployPreset, PresetInput, WeightFormat,
+    backend_supports, classify_weight_format, classify_weight_format_for, parse_native_context,
+    preset_for_backend, recommend_backend, recommend_backend_for, recommend_deploy_preset,
+    DeployPreset, PresetInput, WeightFormat,
 };
 pub use install::{
     draft_path, install_local_assistant, install_need, install_offer_body, mark_ready,

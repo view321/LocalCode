@@ -273,7 +273,17 @@ pub fn predict_fit(inventory: &GpuInventory, req: &FitRequest) -> FitPrediction 
     let total = inventory.total_vram();
 
     let dtype_factor = quant_dtype_factor(req.quant_label.as_deref());
-    let weight = if req.weight_bytes > 0 {
+    // colibrì streams expert weights from disk on demand — the container size
+    // (hundreds of GiB) is a DISK number, not a resident one, and its GPU tier
+    // is optional and off unless the user passes --vram. Counting weight_bytes
+    // as VRAM would flag every colibrì deploy as oversize.
+    let streams_from_disk = matches!(
+        req.backend.to_lowercase().as_str(),
+        "colibri" | "colibri-hy3" | "colibri_hy3"
+    );
+    let weight = if streams_from_disk {
+        0
+    } else if req.weight_bytes > 0 {
         (req.weight_bytes as f64 * dtype_factor) as u64
     } else if let Some(params) = req.param_count {
         let bytes_per = quant_bytes_per_param(req.quant_label.as_deref());
@@ -299,6 +309,9 @@ pub fn predict_fit(inventory: &GpuInventory, req: &FitRequest) -> FitPrediction 
         "kv_dtype=fp16".into(),
         format!("dtype_factor={dtype_factor:.2}"),
     ];
+    if streams_from_disk {
+        assumptions.push("experts stream from disk; weights not VRAM-resident".into());
+    }
     if let Some(q) = &req.quant_label {
         assumptions.push(format!("quant={q}"));
     }
@@ -378,6 +391,9 @@ fn backend_overhead_bytes(backend: &str) -> u64 {
         "llamacpp" | "llama.cpp" => 256 * 1024 * 1024,
         "vllm" => 1024 * 1024 * 1024,
         "sglang" => 1024 * 1024 * 1024,
+        // Dense weights + expert cache live mostly in RAM; VRAM only hosts the
+        // optional GPU tier. Keep a modest floor for CUDA-build scratch.
+        "colibri" | "colibri-hy3" | "colibri_hy3" => 1024 * 1024 * 1024,
         _ => 512 * 1024 * 1024,
     }
 }
